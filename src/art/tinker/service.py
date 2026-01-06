@@ -195,7 +195,8 @@ class TinkerService:
         return asyncio.create_task(self._get_state())
 
     async def _get_state(self) -> "TinkerState":
-        config = self.config.get("tinker_args") or {"renderer_name": "qwen3_instruct"}
+        config = self.config.get("tinker_args")
+        assert config is not None, "Tinker args are required"
         service_client = tinker.ServiceClient()
         rest_client = service_client.create_rest_client()
         checkpoint_dir = self._get_last_checkpoint_dir()
@@ -204,9 +205,7 @@ class TinkerService:
             with log_timing("Creating Tinker training client from checkpoint"):
                 training_client = await service_client.create_training_client_from_state_with_optimizer_async(
                     path=info["state_with_optimizer_path"],
-                    user_metadata=(self.config.get("tinker_args") or {}).get(
-                        "user_metadata", None
-                    ),
+                    user_metadata=config.get("user_metadata", None),
                 )
             with log_timing("Creating Tinker sampling client from checkpoint"):
                 sampler_client = await training_client.create_sampling_client_async(
@@ -229,7 +228,7 @@ class TinkerService:
             training_client=training_client,
             sampler_client=sampler_client,
             renderer=renderers.get_renderer(
-                name=config.get("renderer_name"),
+                name=config["renderer_name"],
                 tokenizer=tokenizer_utils.get_tokenizer(self.base_model),
             ),
         )

@@ -3,8 +3,9 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict
 import torch
 
-from art import dev
 from art.utils.group_aggregate import group_aggregate
+
+from . import dev
 
 if TYPE_CHECKING:
     from art.unsloth.service import TrainInputs

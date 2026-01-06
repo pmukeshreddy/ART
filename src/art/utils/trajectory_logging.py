@@ -15,7 +15,7 @@ from litellm.types.utils import Choices
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 
-from art import Trajectory, TrajectoryGroup
+from art.trajectories import Trajectory, TrajectoryGroup
 
 
 def _flatten_message(msg: dict) -> dict:

@@ -5133,7 +5133,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.15.2" },
     { name = "unsloth", marker = "extra == 'backend'", specifier = "==2025.12.9" },
     { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2025.12.7" },
-    { name = "vllm", marker = "extra == 'backend'", specifier = ">=0.11.0" },
+    { name = "vllm", marker = "extra == 'backend'", specifier = "==0.13.0" },
     { name = "wandb", marker = "extra == 'backend'", specifier = "==0.22.1" },
     { name = "weave", specifier = ">=0.51.51" },
 ]

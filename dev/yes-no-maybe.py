@@ -40,27 +40,27 @@ def with_quotes(w: str) -> str:
 async def main():
     load_dotenv()
 
-    backend = LocalBackend(in_process=True)
+    backend = art.TinkerBackend()
     global model
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     model = art.TrainableModel(
         name=os.environ.get("MODEL_NAME", "012"),
         project="yes-no-maybe",
         base_model=base_model,
-        _internal_config=art.dev.InternalModelConfig(
-            # engine_args=art.dev.EngineArgs(
-            #     max_lora_rank=1,
-            # ),
-            # peft_args=art.dev.PeftArgs(
-            #     r=1,
-            # ),
-            tinker_args=art.dev.TinkerArgs(
-                renderer_name="qwen3_instruct",
-                training_client_args=art.dev.TinkerTrainingClientArgs(
-                    rank=1,
-                ),
-            ),
-        ),
+        # _internal_config=art.dev.InternalModelConfig(
+        #     # engine_args=art.dev.EngineArgs(
+        #     #     max_lora_rank=1,
+        #     # ),
+        #     # peft_args=art.dev.PeftArgs(
+        #     #     r=1,
+        #     # ),
+        #     tinker_args=art.dev.TinkerArgs(
+        #         renderer_name="qwen3_instruct",
+        #         training_client_args=art.dev.TinkerTrainingClientArgs(
+        #             rank=1,
+        #         ),
+        #     ),
+        # ),
     )
     await model.register(backend)
 

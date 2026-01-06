@@ -45,6 +45,7 @@ from .batches import trajectory_group_batches
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .serverless import ServerlessBackend
+from .tinker import TinkerBackend
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import Messages, MessagesAndChoices, Tools, TrainConfig
 from .utils import retry
@@ -66,6 +67,7 @@ __all__ = [
     "TrainableModel",
     "retry",
     "TrainConfig",
+    "TinkerBackend",
     "Trajectory",
     "TrajectoryGroup",
     "capture_yielded_trajectory",

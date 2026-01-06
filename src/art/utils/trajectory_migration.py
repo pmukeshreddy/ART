@@ -17,8 +17,7 @@ from typing import Any, Callable, Iterator, cast
 
 import yaml
 
-from art import Trajectory, TrajectoryGroup
-from art.trajectories import History
+from art.trajectories import History, Trajectory, TrajectoryGroup
 from art.types import Choice, Message, MessageOrChoice
 
 # ============================================================================
