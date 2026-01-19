@@ -1,8 +1,7 @@
-name: Code Quality Checks
+name: Prek
 
 on:
   pull_request:
-    branches: [ main ]
   push:
     branches: [ main ]
 
@@ -28,17 +27,10 @@ jobs:
       run: |
         uv sync --all-extras
     
-    - name: Run code quality checks
+    - name: Run prek hooks (lint, format, typecheck, uv.lock, tests)
       run: |
-        ./scripts/run_checks.sh --verbose-test-failure || {
-          echo ""
-          echo "❌ Code quality checks failed!"
-          echo ""
-          echo "To fix these issues locally, run:"
-          echo "  ./scripts/run_checks.sh --fix"
-          echo ""
-          echo "Then commit and push the changes."
-          echo ""
-          echo "For more details, see CONTRIBUTING.md"
-          exit 1
-        }
+        uv run prek run --all-files
+
+    - name: Run unit tests (via prek)
+      run: |
+        uv run prek run pytest

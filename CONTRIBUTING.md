@@ -10,28 +10,32 @@ cd ART
 Install the dependencies:
 
 ```bash
-uv sync
+uv sync --group dev
 ```
 
-### Code Formatting and Linting
+### Code Quality Checks (prek)
 
-This project uses [ruff](https://github.com/astral-sh/ruff) for both code formatting and linting. Before submitting a pull request, please ensure your code passes all quality checks:
+This project uses [prek](https://github.com/j178/prek) to run local checks (ruff, pyright, uv.lock sync, and unit tests). Before submitting a pull request, please ensure your code passes all quality checks:
 
 ```bash
-# Run all code quality checks (formatting, linting, and dependency sync)
-./scripts/run_checks.sh
+# Install git hooks (optional but recommended)
+uv run prek install
 
-# Automatically fix any issues that can be fixed
-./scripts/run_checks.sh --fix
+# Run all checks against all files (formatting, linting, typecheck, uv.lock, tests)
+uv run prek run --all-files
 ```
 
-The `run_checks.sh` script will:
+You can also run individual hooks:
 
-1. Check code formatting with ruff
-2. Check for linting issues with ruff
-3. Verify that `uv.lock` is in sync with `pyproject.toml`
+```bash
+uv run prek run ruff
+uv run prek run ruff-format
+uv run prek run pyright
+uv run prek run uv-lock-check
+uv run prek run pytest
+```
 
-These checks are automatically run in CI for all pull requests. If your PR fails these checks, simply run `./scripts/run_checks.sh --fix` locally and commit the changes.
+These checks are automatically run in CI for all pull requests. If your PR fails these checks, re-run the corresponding `prek` hook locally and commit any fixes.
 
 ### Release Process
 
