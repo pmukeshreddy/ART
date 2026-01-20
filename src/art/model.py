@@ -2,6 +2,7 @@ from datetime import datetime
 import json
 import os
 from typing import TYPE_CHECKING, Generic, Iterable, Optional, TypeVar, cast, overload
+import warnings
 
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
@@ -233,14 +234,23 @@ class Model(
     def get_inference_name(self, step: int | None = None) -> str:
         """Return the name that should be sent to the inference endpoint.
 
-        If `inference_model_name` is provided we use that, otherwise we fall
-        back to the model's own `name`.
-
         Args:
-            step: If provided, returns name for specific checkpoint using
-                  the `name@step` convention. If None, returns name for
-                  latest checkpoint (default, backwards compatible).
+            step: If provided, returns name for specific checkpoint.
+                  If None, returns name for latest/default checkpoint.
+
+        Note:
+            For TrainableModel with LocalBackend, vLLM serves LoRA adapters
+            as `model.name@step`, so this always includes the step suffix.
+            For ServerlessBackend, it uses W&B artifact naming conventions.
         """
+        # If we have a registered backend with _model_inference_name, use it
+        # This ensures proper step handling for each backend type
+        if self._backend is not None and hasattr(
+            self._backend, "_model_inference_name"
+        ):
+            return self._backend._model_inference_name(self, step=step)
+
+        # Fallback for non-registered models or backends without the method
         base_name = self.inference_model_name or self.name
         if step is not None:
             return f"{base_name}@{step}"
@@ -313,16 +323,40 @@ class Model(
 
     async def log(
         self,
-        trajectories: Iterable[Trajectory | BaseException] | Iterable[TrajectoryGroup],
+        trajectories: (
+            Iterable[Trajectory | BaseException] | Iterable[TrajectoryGroup] | None
+        ) = None,
         split: str = "val",
+        *,
+        metrics: dict[str, float] | None = None,
+        step: int | None = None,
     ) -> None:
         """
-        Log the model's performance for an evaluation batch of trajectories or trajectory groups.
+        Log trajectories and/or metrics.
+
+        Can be used in two ways:
+        1. Log trajectories: `await model.log(trajectory_groups, split="train")`
+        2. Log raw metrics: `await model.log(metrics={"loss": 0.5}, step=1)`
+        3. Both: `await model.log(trajectory_groups, metrics=extra_metrics)`
 
         Args:
-            trajectories: A batch of trajectories or trajectory groups.
+            trajectories: A batch of trajectories or trajectory groups. Optional if
+                logging only metrics.
             split: The evaluation's split. Defaults to "val".
+            metrics: Optional dict of metrics to log directly (e.g., training metrics
+                from backend.train()).
+            step: Optional step number for metrics. If not provided, uses current step.
         """
+        # Determine the step to use
+        if step is None:
+            step = await self.get_step() if self.trainable else 0
+
+        # If only metrics provided (no trajectories), just log them and return
+        if trajectories is None:
+            if metrics is not None:
+                self._log_metrics(metrics, split, step)
+            return
+
         # Convert to list[TrajectoryGroup]
         if any(isinstance(t, Trajectory) for t in trajectories) or any(
             isinstance(t, BaseException) for t in trajectories
@@ -334,9 +368,6 @@ class Model(
             ]
         else:
             trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
-
-        # Get the current step
-        step = await self.get_step() if self.trainable else 0
 
         # Ensure output directories exist
         output_dir = self._get_output_dir()
@@ -376,6 +407,10 @@ class Model(
 
         # Calculate average standard deviation of rewards within groups
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
+
+        # Merge in any additional metrics passed directly
+        if metrics is not None:
+            averages.update(metrics)
 
         # 3. Log metrics (writes to history.jsonl and wandb)
         self._log_metrics(averages, split, step)
@@ -546,12 +581,31 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
         """
         Reinforce fine-tune the model with a batch of trajectory groups.
 
+        .. deprecated::
+            Use ``backend.train(model, trajectory_groups, ...)`` instead.
+            This method will be removed in a future version.
+
         Args:
             trajectory_groups: A batch of trajectory groups.
             config: Fine-tuning specific configuration
             _config: Additional configuration that is subject to change and
                 not yet part of the public API. Use at your own risk.
         """
+        warnings.warn(
+            "model.train() is deprecated. Use backend.train(model, ...) instead.\n\n"
+            "Migration guide:\n"
+            "  # Before (deprecated):\n"
+            "  await model.train(trajectory_groups, config=TrainConfig(learning_rate=5e-6))\n\n"
+            "  # After (recommended):\n"
+            "  result = await backend.train(model, trajectory_groups, learning_rate=5e-6)\n"
+            "  await model.log(trajectory_groups, metrics=result.metrics, step=result.step, split='train')\n\n"
+            "Key differences:\n"
+            "  - backend.train() does NOT automatically log trajectories or metrics\n"
+            "  - backend.train() returns a TrainResult with step, metrics, and checkpoint info\n"
+            "  - Each backend has its own type-checked parameters (no more generic config objects)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         groups_list = list(trajectory_groups)
         _config = _config or {}
 

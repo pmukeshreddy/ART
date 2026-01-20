@@ -15,6 +15,7 @@ Environment variables:
 
 import os
 import tempfile
+from typing import Union
 import uuid
 
 import openai
@@ -22,6 +23,7 @@ import pytest
 
 import art
 from art.local import LocalBackend
+from art.types import LocalTrainResult, ServerlessTrainResult, TrainResult
 
 # Use a small model for fast testing
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-0.6B"
@@ -59,27 +61,19 @@ async def simple_rollout(
 
 async def run_training_loop(
     model: art.TrainableModel,
+    backend: Union[LocalBackend, art.ServerlessBackend, art.TinkerBackend],
     num_steps: int = 1,
     rollouts_per_step: int = 4,
-) -> list[int]:
-    """Run a simple training loop and return the step numbers after each train call."""
+) -> list[TrainResult]:
+    """Run a simple training loop and return the TrainResults from each train call."""
     openai_client = model.openai_client()
     prompts = ["Say yes", "Say no", "Say maybe", "Say hello"]
-    steps_completed = []
-
-    async def resolve_model_name(preferred: str, fallback: str) -> str:
-        try:
-            available = [m.id async for m in openai_client.models.list()]
-        except Exception:
-            return preferred
-        return preferred if preferred in available else fallback
+    results: list[TrainResult] = []
 
     for _ in range(num_steps):
         current_step = await model.get_step()
-        preferred_name = model.get_inference_name(step=current_step)
-        model_name = await resolve_model_name(
-            preferred_name, model.get_inference_name(step=0)
-        )
+        # Use get_inference_name(step=current_step) to target the current checkpoint
+        model_name = model.get_inference_name(step=current_step)
         train_groups = await art.gather_trajectory_groups(
             [
                 art.TrajectoryGroup(
@@ -91,13 +85,13 @@ async def run_training_loop(
                 for prompt in prompts
             ]
         )
-        await model.train(
-            train_groups,
-            config=art.TrainConfig(learning_rate=1e-5),
+        result = await backend.train(model, train_groups, learning_rate=1e-5)
+        await model.log(
+            train_groups, metrics=result.metrics, step=result.step, split="train"
         )
-        steps_completed.append(await model.get_step())
+        results.append(result)
 
-    return steps_completed
+    return results
 
 
 async def _run_inference_on_step(
@@ -130,8 +124,14 @@ async def test_tinker_backend():
         )
         try:
             await model.register(backend)
-            steps = await run_training_loop(model, num_steps=1, rollouts_per_step=2)
-            await _run_inference_on_step(model, step=steps[-1])
+            results = await run_training_loop(
+                model, backend, num_steps=1, rollouts_per_step=2
+            )
+            # Verify TrainResult structure
+            assert len(results) == 1
+            assert isinstance(results[0], LocalTrainResult)
+            assert results[0].step > 0
+            await _run_inference_on_step(model, step=results[-1].step)
             await _run_inference_on_step(model, step=0)
         finally:
             await backend.close()
@@ -153,8 +153,15 @@ async def test_local_backend():
         )
         try:
             await model.register(backend)
-            steps = await run_training_loop(model, num_steps=1, rollouts_per_step=2)
-            await _run_inference_on_step(model, step=steps[-1])
+            results = await run_training_loop(
+                model, backend, num_steps=1, rollouts_per_step=2
+            )
+            # Verify TrainResult structure
+            assert len(results) == 1
+            assert isinstance(results[0], LocalTrainResult)
+            assert results[0].step > 0
+            assert results[0].checkpoint_path is not None
+            await _run_inference_on_step(model, step=results[-1].step)
             await _run_inference_on_step(model, step=0)
         finally:
             await backend.close()
@@ -175,8 +182,15 @@ async def test_serverless_backend():
     )
     try:
         await model.register(backend)
-        steps = await run_training_loop(model, num_steps=1, rollouts_per_step=2)
-        await _run_inference_on_step(model, step=steps[-1])
+        results = await run_training_loop(
+            model, backend, num_steps=1, rollouts_per_step=2
+        )
+        # Verify TrainResult structure
+        assert len(results) == 1
+        assert isinstance(results[0], ServerlessTrainResult)
+        assert results[0].step > 0
+        assert results[0].artifact_name is not None
+        await _run_inference_on_step(model, step=results[-1].step)
         await _run_inference_on_step(model, step=0)
     finally:
         try:

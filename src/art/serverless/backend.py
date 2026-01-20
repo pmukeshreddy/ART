@@ -1,5 +1,5 @@
 import asyncio
-from typing import TYPE_CHECKING, AsyncIterator, Literal
+from typing import TYPE_CHECKING, AsyncIterator, Iterable, Literal
 import warnings
 
 from openai._types import NOT_GIVEN
@@ -10,7 +10,7 @@ from art.serverless.client import Client, ExperimentalTrainingConfig
 from .. import dev
 from ..backend import Backend
 from ..trajectories import TrajectoryGroup
-from ..types import TrainConfig
+from ..types import ServerlessTrainResult, TrainConfig
 
 if TYPE_CHECKING:
     from ..model import Model, TrainableModel
@@ -74,13 +74,11 @@ class ServerlessBackend(Backend):
         assert model.id is not None, "Model ID is required"
         await self._client.models.delete(model_id=model.id)
 
-    def _model_inference_name(
-        self, model: "TrainableModel", step: int | None = None
-    ) -> str:
+    def _model_inference_name(self, model: "Model", step: int | None = None) -> str:
         """Return the inference name for a model checkpoint.
 
         Args:
-            model: The trainable model.
+            model: The model.
             step: If provided, returns name for specific checkpoint using
                   W&B artifact versioning (e.g., :step5). If None, returns
                   name for latest checkpoint (default, backwards compatible).
@@ -128,6 +126,126 @@ class ServerlessBackend(Backend):
 
     # Note: _log() method has been moved to the Model class (frontend)
     # Trajectories are now saved locally by the Model.log() method
+
+    async def train(  # type: ignore[override]
+        self,
+        model: "TrainableModel",
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        # Core training parameters
+        learning_rate: float = 5e-6,
+        beta: float = 0.0,
+        # RL algorithm settings
+        ppo: bool = False,
+        epsilon: float | None = None,
+        epsilon_high: float | None = None,
+        # Advantage computation
+        advantage_balance: float = 0.0,
+        scale_rewards: bool = True,
+        # Importance sampling
+        importance_sampling_level: Literal[
+            "token", "sequence", "average", "geometric_average"
+        ] = "token",
+        max_negative_advantage_importance_sampling_weight: float | None = None,
+        mask_prob_ratio: bool = False,
+        # Experimental parameters
+        kimi_k2_tau: float | None = None,
+        precalculate_logprobs: bool = False,
+        # Verbosity
+        verbose: bool = False,
+    ) -> ServerlessTrainResult:
+        """Train the model on the given trajectory groups.
+
+        This is the recommended way to train models. Unlike model.train(), this
+        method does NOT automatically log trajectories or metrics. Call model.log()
+        explicitly before and/or after training if you want to log data.
+
+        Args:
+            model: The trainable model to train.
+            trajectory_groups: Batches of trajectories to train on.
+            learning_rate: Learning rate for training. Defaults to 5e-6.
+            beta: KL penalty coefficient. Defaults to 0.0.
+            ppo: Whether to use PPO clipping. Defaults to False.
+            epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
+            epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
+            advantage_balance: Balance between negative and positive advantages
+                in range [-1.0, 1.0]. Defaults to 0.0 (balanced).
+            scale_rewards: Whether to scale rewards by standard deviation.
+                Defaults to True.
+            importance_sampling_level: Level at which to compute importance
+                sampling weights. Defaults to "token".
+            max_negative_advantage_importance_sampling_weight: Maximum weight
+                for negative advantage samples.
+            mask_prob_ratio: Whether to mask probability ratios. Defaults to False.
+            kimi_k2_tau: Tau parameter for Kimi K2 algorithm.
+            precalculate_logprobs: Whether to precalculate logprobs.
+            verbose: Whether to print verbose output. Defaults to False.
+
+        Returns:
+            ServerlessTrainResult with step number, training metrics, and artifact name.
+
+        Example:
+            # Before (deprecated):
+            await model.train(trajectory_groups, config=TrainConfig(learning_rate=5e-6))
+
+            # After (recommended):
+            await model.log(trajectory_groups, split="train")
+            result = await backend.train(model, trajectory_groups, learning_rate=5e-6)
+            # Optionally log training metrics:
+            # await model.log(metrics=result.metrics, step=result.step)
+        """
+        groups_list = list(trajectory_groups)
+
+        # Build config objects from explicit kwargs
+        config = TrainConfig(learning_rate=learning_rate, beta=beta)
+        dev_config: dev.TrainConfig = {
+            "advantage_balance": advantage_balance,
+            "importance_sampling_level": importance_sampling_level,
+            "mask_prob_ratio": mask_prob_ratio,
+            "ppo": ppo,
+            "precalculate_logprobs": precalculate_logprobs,
+            "scale_rewards": scale_rewards,
+        }
+        # Only include optional fields if they're set
+        if epsilon is not None:
+            dev_config["epsilon"] = epsilon
+        if epsilon_high is not None:
+            dev_config["epsilon_high"] = epsilon_high
+        if max_negative_advantage_importance_sampling_weight is not None:
+            dev_config["max_negative_advantage_importance_sampling_weight"] = (
+                max_negative_advantage_importance_sampling_weight
+            )
+        if kimi_k2_tau is not None:
+            dev_config["kimi_k2_tau"] = kimi_k2_tau
+
+        # Collect metrics from training
+        training_metrics: list[dict[str, float]] = []
+        async for metrics in self._train_model(
+            model, groups_list, config, dev_config, verbose
+        ):
+            training_metrics.append(metrics)
+
+        # Aggregate metrics
+        avg_metrics: dict[str, float] = {}
+        if training_metrics:
+            avg_metrics = {
+                k: sum(d.get(k, 0) for d in training_metrics)
+                / sum(1 for d in training_metrics if k in d)
+                for k in {k for d in training_metrics for k in d}
+                if k != "num_gradient_steps"
+            }
+
+        # Get step and artifact name
+        step = await self._get_step(model)
+        artifact_name: str | None = None
+        if model.entity is not None:
+            artifact_name = f"{model.entity}/{model.project}/{model.name}:step{step}"
+
+        return ServerlessTrainResult(
+            step=step,
+            metrics=avg_metrics,
+            artifact_name=artifact_name,
+        )
 
     async def _train_model(
         self,

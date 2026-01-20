@@ -325,9 +325,11 @@ async def main():
             )
             continue
 
-        await model.train(
-            valid_train_groups,
-            config=art.TrainConfig(learning_rate=LEARNING_RATE),
+        result = await backend.train(
+            model, valid_train_groups, learning_rate=LEARNING_RATE
+        )
+        await model.log(
+            valid_train_groups, metrics=result.metrics, step=result.step, split="train"
         )
 
         if batch.step > 0 and batch.step % EVAL_STEPS == 0:

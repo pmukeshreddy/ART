@@ -71,7 +71,10 @@ async def main():
             pbar_desc="gather",
         )
         await model.delete_checkpoints()
-        await model.train(train_groups, config=art.TrainConfig(learning_rate=5e-5))
+        result = await backend.train(model, train_groups, learning_rate=5e-5)
+        await model.log(
+            train_groups, metrics=result.metrics, step=result.step, split="train"
+        )
         await backend._experimental_push_to_s3(model)
 
     if DEPLOY_MODEL:

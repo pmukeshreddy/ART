@@ -4,7 +4,7 @@ import math
 import os
 import subprocess
 from types import TracebackType
-from typing import AsyncIterator, Literal, cast
+from typing import AsyncIterator, Iterable, Literal, cast
 import warnings
 
 import aiohttp
@@ -41,7 +41,7 @@ from ..preprocessing.pack import (
 )
 from ..preprocessing.tokenize import tokenize_trajectory_groups
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import Message, TrainConfig
+from ..types import LocalTrainResult, Message, TrainConfig
 from ..utils import format_message, get_model_step
 from .checkpoints import (
     delete_checkpoints,
@@ -116,6 +116,22 @@ class LocalBackend(Backend):
         # (wandb initialization is now handled by the model's _get_wandb_run method)
         if model.trainable and "WANDB_API_KEY" in os.environ:
             _ = model._get_wandb_run()
+
+    def _model_inference_name(self, model: Model, step: int | None = None) -> str:
+        """Return the inference name for a model checkpoint.
+
+        For LocalBackend with vLLM, the base model is served under its HF name,
+        and LoRA adapters are served as `model.name@step`.
+
+        Args:
+            model: The model.
+            step: If provided, returns name for specific checkpoint.
+                  If None, returns name for latest checkpoint (step 0 initially).
+        """
+        # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
+        # Default to step 0 when not specified (the initial checkpoint created at registration)
+        actual_step = step if step is not None else 0
+        return f"{model.name}@{actual_step}"
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
@@ -349,6 +365,160 @@ class LocalBackend(Backend):
                 message = cast(Message, message_or_choice.message.model_dump())
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
+
+    async def train(  # type: ignore[override]
+        self,
+        model: TrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        # Core training parameters
+        learning_rate: float = 5e-6,
+        beta: float = 0.0,
+        # RL algorithm settings
+        ppo: bool = False,
+        epsilon: float | None = None,
+        epsilon_high: float | None = None,
+        # Advantage computation
+        advantage_balance: float = 0.0,
+        scale_rewards: bool = True,
+        # Importance sampling
+        importance_sampling_level: Literal[
+            "token", "sequence", "average", "geometric_average"
+        ] = "token",
+        max_negative_advantage_importance_sampling_weight: float | None = None,
+        mask_prob_ratio: bool = False,
+        # Experimental parameters
+        kimi_k2_tau: float | None = None,
+        precalculate_logprobs: bool = False,
+        # LocalBackend-specific parameters
+        allow_training_without_logprobs: bool = False,
+        plot_tensors: bool = False,
+        truncated_importance_sampling: float | None = None,
+        scale_learning_rate_by_reward_std_dev: bool = False,
+        logprob_calculation_chunk_size: int = 1024,
+        num_trajectories_learning_rate_multiplier_power: float = 0.0,
+        # Checkpoint behavior
+        save_checkpoint: bool = True,
+        # Verbosity
+        verbose: bool = False,
+    ) -> LocalTrainResult:
+        """Train the model on the given trajectory groups.
+
+        This is the recommended way to train models. Unlike model.train(), this
+        method does NOT automatically log trajectories or metrics. Call model.log()
+        explicitly before and/or after training if you want to log data.
+
+        Args:
+            model: The trainable model to train.
+            trajectory_groups: Batches of trajectories to train on.
+            learning_rate: Learning rate for training. Defaults to 5e-6.
+            beta: KL penalty coefficient. Defaults to 0.0.
+            ppo: Whether to use PPO clipping. Defaults to False.
+            epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
+            epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
+            advantage_balance: Balance between negative and positive advantages
+                in range [-1.0, 1.0]. Defaults to 0.0 (balanced).
+            scale_rewards: Whether to scale rewards by standard deviation.
+                Defaults to True.
+            importance_sampling_level: Level at which to compute importance
+                sampling weights. Defaults to "token".
+            max_negative_advantage_importance_sampling_weight: Maximum weight
+                for negative advantage samples.
+            mask_prob_ratio: Whether to mask probability ratios. Defaults to False.
+            kimi_k2_tau: Tau parameter for Kimi K2 algorithm.
+            precalculate_logprobs: Whether to precalculate logprobs.
+            allow_training_without_logprobs: Allow training even when no logprobs
+                are available. Defaults to False.
+            plot_tensors: Whether to plot training tensors for debugging.
+                Defaults to False.
+            truncated_importance_sampling: Truncation threshold for importance
+                sampling weights.
+            scale_learning_rate_by_reward_std_dev: Whether to scale learning rate
+                by reward standard deviation. Defaults to False.
+            logprob_calculation_chunk_size: Chunk size for logprob calculation.
+                Defaults to 1024.
+            num_trajectories_learning_rate_multiplier_power: Power for learning
+                rate multiplier based on number of trajectories.
+            save_checkpoint: Whether to save a checkpoint after training.
+                Defaults to True.
+            verbose: Whether to print verbose output. Defaults to False.
+
+        Returns:
+            LocalTrainResult with step number, training metrics, and checkpoint path.
+
+        Example:
+            # Before (deprecated):
+            await model.train(trajectory_groups, config=TrainConfig(learning_rate=5e-6))
+
+            # After (recommended):
+            await model.log(trajectory_groups, split="train")
+            result = await backend.train(model, trajectory_groups, learning_rate=5e-6)
+            # Optionally log training metrics:
+            # await model.log(metrics=result.metrics, step=result.step)
+        """
+        groups_list = list(trajectory_groups)
+
+        # Build config objects from explicit kwargs
+        config = TrainConfig(learning_rate=learning_rate, beta=beta)
+        dev_config: dev.TrainConfig = {
+            "advantage_balance": advantage_balance,
+            "allow_training_without_logprobs": allow_training_without_logprobs,
+            "importance_sampling_level": importance_sampling_level,
+            "mask_prob_ratio": mask_prob_ratio,
+            "plot_tensors": plot_tensors,
+            "ppo": ppo,
+            "precalculate_logprobs": precalculate_logprobs,
+            "scale_learning_rate_by_reward_std_dev": scale_learning_rate_by_reward_std_dev,
+            "scale_rewards": scale_rewards,
+            "logprob_calculation_chunk_size": logprob_calculation_chunk_size,
+            "num_trajectories_learning_rate_multiplier_power": num_trajectories_learning_rate_multiplier_power,
+        }
+        # Only include optional fields if they're set
+        if epsilon is not None:
+            dev_config["epsilon"] = epsilon
+        if epsilon_high is not None:
+            dev_config["epsilon_high"] = epsilon_high
+        if max_negative_advantage_importance_sampling_weight is not None:
+            dev_config["max_negative_advantage_importance_sampling_weight"] = (
+                max_negative_advantage_importance_sampling_weight
+            )
+        if kimi_k2_tau is not None:
+            dev_config["kimi_k2_tau"] = kimi_k2_tau
+        if truncated_importance_sampling is not None:
+            dev_config["truncated_importance_sampling"] = truncated_importance_sampling
+
+        # Collect metrics from training
+        training_metrics: list[dict[str, float]] = []
+        async for metrics in self._train_model(
+            model, groups_list, config, dev_config, verbose
+        ):
+            training_metrics.append(metrics)
+
+        # Aggregate metrics
+        avg_metrics: dict[str, float] = {}
+        if training_metrics:
+            avg_metrics = {
+                k: sum(d.get(k, 0) for d in training_metrics)
+                / sum(1 for d in training_metrics if k in d)
+                for k in {k for d in training_metrics for k in d}
+                if k != "num_gradient_steps"
+            }
+
+        # Get step and checkpoint path
+        step = await self._get_step(model)
+        checkpoint_path: str | None = None
+        if save_checkpoint:
+            checkpoint_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path), step
+            )
+            if not os.path.exists(checkpoint_path):
+                checkpoint_path = None
+
+        return LocalTrainResult(
+            step=step,
+            metrics=avg_metrics,
+            checkpoint_path=checkpoint_path,
+        )
 
     async def _train_model(
         self,

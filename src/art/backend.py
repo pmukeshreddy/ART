@@ -1,5 +1,5 @@
 import json
-from typing import TYPE_CHECKING, AsyncIterator, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
 import warnings
 
 import httpx
@@ -15,7 +15,7 @@ from art.utils.deployment import (
 
 from . import dev
 from .trajectories import TrajectoryGroup
-from .types import TrainConfig
+from .types import TrainConfig, TrainResult
 
 if TYPE_CHECKING:
     from .model import Model, TrainableModel
@@ -79,6 +79,38 @@ class Backend:
         response.raise_for_status()
         base_url, api_key = tuple(response.json())
         return base_url, api_key
+
+    def _model_inference_name(self, model: "Model", step: int | None = None) -> str:
+        """Return the inference name for a model checkpoint.
+
+        Override in subclasses to provide backend-specific naming.
+        Default implementation returns model.name with optional @step suffix.
+        """
+        base_name = model.inference_model_name or model.name
+        if step is not None:
+            return f"{base_name}@{step}"
+        return base_name
+
+    async def train(
+        self,
+        model: "TrainableModel",
+        trajectory_groups: Iterable[TrajectoryGroup],
+        **kwargs: Any,
+    ) -> TrainResult:
+        """Train the model on the given trajectory groups.
+
+        This method is not implemented in the base Backend class. Use
+        LocalBackend, ServerlessBackend, or TinkerBackend directly for training.
+
+        Raises:
+            NotImplementedError: Always raised. Use a concrete backend instead.
+        """
+        raise NotImplementedError(
+            "The base Backend class does not support the train() method. "
+            "Use LocalBackend, ServerlessBackend, or TinkerBackend directly. "
+            "If you are using the 'art run' server, consider using LocalBackend "
+            "in-process instead."
+        )
 
     async def _train_model(
         self,
