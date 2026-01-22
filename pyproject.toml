@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "openai>=2.14.0",
     "typer>=0.15.2",
-    "litellm>=1.74.1",
+    "litellm>=1.71.1",
     "weave>=0.52.23",
     "tinker>=0.7.0",
     "tinker-cookbook>=0.1.0",
