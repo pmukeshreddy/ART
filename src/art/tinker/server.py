@@ -134,14 +134,15 @@ class OpenAICompatibleTinkerServer:
                             # from the content, so we remove them here.
                             content=(
                                 re.sub(
-                                    r"(?:\n<tool_call>.*?</tool_call>)+\s*$",
+                                    r"(?:\n?<tool_call>.*?</tool_call>)+\s*$",
                                     "",
                                     message["content"],
                                     flags=re.DOTALL,
                                 )
                                 if message["content"]
                                 else message["content"]
-                            ),
+                            )
+                            or None,
                             role="assistant",
                             tool_calls=[
                                 ChatCompletionMessageFunctionToolCall(
@@ -160,6 +161,9 @@ class OpenAICompatibleTinkerServer:
                             content=[
                                 ChatCompletionTokenLogprob(
                                     token=f"token_id:{token}",
+                                    bytes=list(
+                                        renderer.tokenizer.decode(token).encode()
+                                    ),
                                     logprob=logprob,
                                     top_logprobs=[],
                                 )
