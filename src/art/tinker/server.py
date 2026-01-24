@@ -104,20 +104,30 @@ class OpenAICompatibleTinkerServer:
                     add_generation_prompt=True,
                 )
             )
-            sample_response = await sampler_client.sample_async(
-                prompt=prompt,
-                num_samples=body.get("n") or 1,
-                sampling_params=tinker.SamplingParams(
-                    max_tokens=body.get("max_completion_tokens")
-                    or body.get("max_tokens"),
-                    seed=body.get("seed"),
-                    temperature=(
-                        t if (t := body.get("temperature")) is not None else 1.0
+            try:
+                sample_response = await sampler_client.sample_async(
+                    prompt=prompt,
+                    num_samples=body.get("n") or 1,
+                    sampling_params=tinker.SamplingParams(
+                        max_tokens=body.get("max_completion_tokens")
+                        or body.get("max_tokens"),
+                        seed=body.get("seed"),
+                        temperature=(
+                            t if (t := body.get("temperature")) is not None else 1.0
+                        ),
+                        top_k=body.get("top_k") or -1,
+                        top_p=body.get("top_p") or 1.0,
                     ),
-                    top_k=body.get("top_k") or -1,
-                    top_p=body.get("top_p") or 1.0,
-                ),
-            )
+                )
+            except tinker.APIStatusError as e:
+                error_body = e.body
+                if isinstance(error_body, dict) and "detail" in error_body:
+                    detail = error_body["detail"]
+                elif error_body is not None:
+                    detail = error_body
+                else:
+                    detail = str(e)
+                raise HTTPException(status_code=e.status_code, detail=detail) from e
             choices: list[Choice] = []
             for i, sequence in enumerate(sample_response.sequences):
                 assert sequence.logprobs is not None, "Logprobs are required"
