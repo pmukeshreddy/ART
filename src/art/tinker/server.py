@@ -31,7 +31,7 @@ class OpenAICompatibleTinkerServer:
     sampling_clients_and_renderers: dict[
         str, tuple[tinker.SamplingClient, renderers.Renderer]
     ] = field(default_factory=dict)
-    prompt_prefix_cache: LRUTrieCache = field(
+    prefix_cache: LRUTrieCache = field(
         default_factory=lambda: LRUTrieCache(max_entries=1000)
     )
     _task: asyncio.Task[None] | None = None
@@ -98,7 +98,7 @@ class OpenAICompatibleTinkerServer:
                 ),
             )
             prompt_tokens = rendered_prompt_tokens
-            prefix_entry = self.prompt_prefix_cache.lookup(rendered_prompt_tokens)
+            prefix_entry = self.prefix_cache.lookup(rendered_prompt_tokens)
             if prefix_entry is not None and prefix_entry.rendered_len <= len(
                 rendered_prompt_tokens
             ):
@@ -140,7 +140,7 @@ class OpenAICompatibleTinkerServer:
                     renderer.tokenizer.decode(sequence.tokens)
                 )
                 if rendered_response_tokens != sequence.tokens:
-                    self.prompt_prefix_cache.insert(
+                    self.prefix_cache.insert(
                         rendered_prompt_tokens + rendered_response_tokens,
                         prompt_tokens + sequence.tokens,
                     )
