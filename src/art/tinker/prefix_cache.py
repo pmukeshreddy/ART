@@ -7,8 +7,7 @@ from typing import Sequence
 
 import datrie
 
-_TOKEN_BYTES = 4
-_TRIE_ALPHABET = "".join(chr(i) for i in range(256))
+_TRIE_ALPHABET = "0123456789abcdef"
 
 
 @dataclass(frozen=True)
@@ -32,7 +31,7 @@ class LRUTrieCache:
         packed = bytearray()
         for token in tokens:
             packed.extend(struct.pack(">I", token))
-        return packed.decode("latin-1")
+        return packed.hex()
 
     def lookup(self, rendered_tokens: Sequence[int]) -> PrefixEntry | None:
         key = self._encode_tokens(rendered_tokens)

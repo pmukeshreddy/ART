@@ -127,6 +127,7 @@ unused-ignore-comment = "ignore"
 allowed-unresolved-imports = [
     # tinker deps
     "tinker.**",
+    "datrie.**",
     # backend deps
     "accelerate.**",
     "awscli.**",
