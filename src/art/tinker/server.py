@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import os
 import socket
 import time
+from typing import cast
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
@@ -20,6 +21,7 @@ import tinker
 import uvicorn
 
 from art.tinker.cookbook_v import renderers
+from art.tinker.prefix_cache import LRUTrieCache
 
 
 @dataclass
@@ -29,6 +31,9 @@ class OpenAICompatibleTinkerServer:
     sampling_clients_and_renderers: dict[
         str, tuple[tinker.SamplingClient, renderers.Renderer]
     ] = field(default_factory=dict)
+    prompt_prefix_cache: LRUTrieCache = field(
+        default_factory=lambda: LRUTrieCache(max_entries=1000)
+    )
     _task: asyncio.Task[None] | None = None
 
     async def start(self) -> tuple[str, int]:
@@ -84,17 +89,26 @@ class OpenAICompatibleTinkerServer:
                 raise HTTPException(
                     status_code=404, detail=f"Model {body['model']} not found"
                 )
-
-            prompt = tinker.ModelInput.from_ints(
-                tokens=renderer.tokenizer.apply_chat_template(
+            rendered_prompt_tokens = cast(
+                list[int],
+                renderer.tokenizer.apply_chat_template(
                     list(body["messages"]),  # type: ignore
                     tools=body.get("tools"),  # type: ignore
                     add_generation_prompt=True,
-                )  # ty:ignore[invalid-argument-type]
+                ),
             )
+            prompt_tokens = rendered_prompt_tokens
+            prefix_entry = self.prompt_prefix_cache.lookup(rendered_prompt_tokens)
+            if prefix_entry is not None and prefix_entry.rendered_len <= len(
+                rendered_prompt_tokens
+            ):
+                prompt_tokens = (
+                    list(prefix_entry.raw_prefix)
+                    + rendered_prompt_tokens[prefix_entry.rendered_len :]
+                )
             try:
                 sample_response = await sampler_client.sample_async(
-                    prompt=prompt,
+                    prompt=tinker.ModelInput.from_ints(tokens=prompt_tokens),
                     num_samples=body.get("n") or 1,
                     sampling_params=tinker.SamplingParams(
                         max_tokens=body.get("max_completion_tokens")
@@ -119,9 +133,17 @@ class OpenAICompatibleTinkerServer:
             choices: list[Choice] = []
             for i, sequence in enumerate(sample_response.sequences):
                 assert sequence.logprobs is not None, "Logprobs are required"
-                assert len(sequence.tokens) == len(sequence.logprobs), (
-                    "Tokens and logprobs must have the same length"
+                assert len(sequence.tokens) == len(
+                    sequence.logprobs
+                ), "Tokens and logprobs must have the same length"
+                rendered_response_tokens = renderer.tokenizer.encode(
+                    renderer.tokenizer.decode(sequence.tokens)
                 )
+                if rendered_response_tokens != sequence.tokens:
+                    self.prompt_prefix_cache.insert(
+                        rendered_prompt_tokens + rendered_response_tokens,
+                        prompt_tokens + sequence.tokens,
+                    )
                 message, _ = renderer.parse_response(sequence.tokens)
                 openai_message = renderer.to_openai_message(message)
                 tool_calls = (
@@ -176,8 +198,8 @@ class OpenAICompatibleTinkerServer:
                 object="chat.completion",
                 usage=CompletionUsage(
                     completion_tokens=completion_tokens,
-                    prompt_tokens=prompt.length,
-                    total_tokens=completion_tokens + prompt.length,
+                    prompt_tokens=len(prompt_tokens),
+                    total_tokens=completion_tokens + len(prompt_tokens),
                 ),
             )
 
