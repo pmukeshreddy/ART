@@ -563,27 +563,47 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         reward: float | None = None
         try:
             result = await self.eval_fn(self.model, step, self.config)
-            splits: dict[str, list[art.Trajectory]]
+            splits: dict[str, list[art.Trajectory | art.TrajectoryGroup]]
             if isinstance(result, dict):
                 splits = result
             else:
                 splits = {"val": result}
 
-            val_trajectories = splits.get("val") or []
-            if val_trajectories:
-                reward = sum(t.reward for t in val_trajectories) / len(val_trajectories)
-            else:
-                reward = None
-
-            for split_name, trajectories in splits.items():
-                if trajectories:
-                    await self.model.log(trajectories, split=split_name, step=step)
+            for split_name, items in splits.items():
+                groups, trajectories = self._normalize_eval_items(items)
+                if split_name == "val":
+                    if trajectories:
+                        reward = sum(t.reward for t in trajectories) / len(trajectories)
+                    else:
+                        reward = None
+                if groups:
+                    await self.model.log(groups, split=split_name, step=step)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"Eval failed at step {step}: {exc}")
         finally:
             self._status.note_val_finished(step, reward)
+
+    @staticmethod
+    def _normalize_eval_items(
+        items: list[art.Trajectory | art.TrajectoryGroup],
+    ) -> tuple[list[TrajectoryGroup], list[art.Trajectory]]:
+        if not items:
+            return [], []
+        groups: list[TrajectoryGroup] = []
+        loose: list[art.Trajectory] = []
+        for item in items:
+            if isinstance(item, TrajectoryGroup):
+                groups.append(item)
+            else:
+                loose.append(item)
+        if loose:
+            groups.append(TrajectoryGroup(loose))
+        trajectories: list[art.Trajectory] = []
+        for group in groups:
+            trajectories.extend(group.trajectories)
+        return groups, trajectories
 
     def _apply_policy_versions(
         self,

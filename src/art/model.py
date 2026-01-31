@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 import json
 import os
@@ -11,6 +12,7 @@ from pydantic import BaseModel
 from typing_extensions import Never, TypeVar
 
 from . import dev
+from .costs import CostCalculator
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig
 from .utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
@@ -24,6 +26,10 @@ if TYPE_CHECKING:
 
 ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
 StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
+
+COSTS_STATE_KEY = "_costs"
+COSTS_METRIC_PREFIX = "costs_"
+COSTS_TOTAL_KEY = f"{COSTS_METRIC_PREFIX}total"
 
 
 class Model(
@@ -87,6 +93,8 @@ class Model(
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
+    _costs_lock: asyncio.Lock
+    _cost_calculator: CostCalculator
 
     def __init__(
         self,
@@ -374,6 +382,7 @@ class Model(
             wandb.define_metric("training_step")
             wandb.define_metric("train/*", step_metric="training_step")
             wandb.define_metric("val/*", step_metric="training_step")
+            wandb.define_metric("costs/*", step_metric="training_step")
         return self._wandb_run
 
     def _log_metrics(
@@ -405,6 +414,64 @@ class Model(
         if should_log_wandb:
             if run := self._get_wandb_run():
                 run.log({"training_step": step, **prefixed})
+
+    async def _record_costs(
+        self,
+        split: str,
+        step: int,
+        *,
+        cost_components: dict[str, float],
+        cost_total_direct: float,
+        cost_seen: bool,
+    ) -> None:
+        component_total = sum(cost_components.values())
+        step_total = component_total if component_total > 0 else cost_total_direct
+        if not cost_seen or step_total <= 0:
+            return
+
+        async with self._costs_lock:
+            existing_state = self.read_state() or {}
+            raw_costs = existing_state.get(COSTS_STATE_KEY) or {}
+            cumulative = {
+                key: float(value)
+                for key, value in raw_costs.items()
+                if isinstance(value, (int, float))
+            }
+            last_steps = raw_costs.get("_last_steps")
+            if not isinstance(last_steps, dict):
+                last_steps = {}
+            last_step = last_steps.get(split)
+
+            if isinstance(last_step, (int, float)) and int(last_step) >= step:
+                for component, value in cost_components.items():
+                    if value == 0:
+                        continue
+                    cumulative_key = f"{split}_{component}"
+                    cumulative[cumulative_key] = max(
+                        cumulative.get(cumulative_key, 0.0), value
+                    )
+                cumulative[split] = max(cumulative.get(split, 0.0), step_total)
+                cumulative["total"] = max(
+                    cumulative.get("total", 0.0), cumulative.get(split, 0.0)
+                )
+                self.merge_state(
+                    {COSTS_STATE_KEY: {**cumulative, "_last_steps": last_steps}}
+                )
+                self._log_metrics(cumulative, "costs", step)
+                return
+
+            for component, value in cost_components.items():
+                if value == 0:
+                    continue
+                cumulative_key = f"{split}_{component}"
+                cumulative[cumulative_key] = cumulative.get(cumulative_key, 0.0) + value
+            cumulative[split] = cumulative.get(split, 0.0) + step_total
+            cumulative["total"] = cumulative.get("total", 0.0) + step_total
+            last_steps[split] = step
+            self.merge_state(
+                {COSTS_STATE_KEY: {**cumulative, "_last_steps": last_steps}}
+            )
+            self._log_metrics(cumulative, "costs", step)
 
     async def log(
         self,
@@ -439,7 +506,42 @@ class Model(
         # If only metrics provided (no trajectories), just log them and return
         if trajectories is None:
             if metrics is not None:
-                self._log_metrics(metrics, split, step)
+                cost_step = await self.get_step()
+                cost_components: dict[str, float] = {}
+                cost_total_direct = 0.0
+                cost_seen = False
+
+                for metric, value in metrics.items():
+                    if not isinstance(value, (int, float)):
+                        continue
+                    if metric == COSTS_TOTAL_KEY:
+                        raise ValueError(
+                            "Do not log 'costs_total' directly. Log costs_* components "
+                            "(e.g., costs_prefill, costs_sample) and totals are derived."
+                        )
+                    elif metric.startswith(COSTS_METRIC_PREFIX):
+                        component = metric[len(COSTS_METRIC_PREFIX) :]
+                        if component:
+                            cost_components[component] = cost_components.get(
+                                component, 0.0
+                            ) + float(value)
+                            cost_seen = True
+
+                metrics_without_costs = {
+                    key: value
+                    for key, value in metrics.items()
+                    if not key.startswith(COSTS_METRIC_PREFIX)
+                }
+                if metrics_without_costs:
+                    self._log_metrics(metrics_without_costs, split, step)
+
+                await self._record_costs(
+                    split,
+                    cost_step,
+                    cost_components=cost_components,
+                    cost_total_direct=cost_total_direct,
+                    cost_seen=cost_seen,
+                )
             return
 
         # Convert to list[TrajectoryGroup]
@@ -465,13 +567,39 @@ class Model(
             trajectory_groups, f"{trajectories_dir}/{file_name}"
         )
 
-        # 2. Calculate aggregate metrics
+        # 2. Calculate aggregate metrics (excluding additive costs)
+        cost_step = await self.get_step()
         all_metrics: dict[str, list[float]] = {"reward": [], "exception_rate": []}
         group_metrics: dict[str, list[float]] = {}
+        cost_components: dict[str, float] = {}
+        cost_total_direct = 0.0
+        cost_seen = False
+
+        def _add_costs(metrics_dict: dict[str, float | int | bool]) -> None:
+            nonlocal cost_total_direct, cost_seen
+            for metric, value in metrics_dict.items():
+                if not isinstance(value, (int, float)):
+                    continue
+                if metric == COSTS_TOTAL_KEY:
+                    raise ValueError(
+                        "Do not log 'costs_total' directly. Log costs_* components "
+                        "(e.g., costs_prefill, costs_sample) and totals are derived."
+                    )
+                elif metric.startswith(COSTS_METRIC_PREFIX):
+                    component = metric[len(COSTS_METRIC_PREFIX) :]
+                    if component:
+                        cost_components[component] = cost_components.get(
+                            component, 0.0
+                        ) + float(value)
+                        cost_seen = True
 
         for group in trajectory_groups:
+            if group.metrics:
+                _add_costs(group.metrics)
             if group.trajectories:
                 for metric, value in group.metrics.items():
+                    if metric.startswith(COSTS_METRIC_PREFIX):
+                        continue
                     if metric not in group_metrics:
                         group_metrics[metric] = []
                     group_metrics[metric].append(float(value))
@@ -486,9 +614,13 @@ class Model(
 
                 # Collect other custom metrics
                 for metric, value in trajectory.metrics.items():
+                    if metric.startswith(COSTS_METRIC_PREFIX):
+                        continue
                     if metric not in all_metrics:
                         all_metrics[metric] = []
                     all_metrics[metric].append(float(value))
+                if trajectory.metrics:
+                    _add_costs(trajectory.metrics)
 
         # Calculate averages for all metrics
         averages: dict[str, float] = {}
@@ -506,10 +638,25 @@ class Model(
 
         # Merge in any additional metrics passed directly
         if metrics is not None:
-            averages.update(metrics)
+            _add_costs(metrics)
+            metrics_without_costs = {
+                key: value
+                for key, value in metrics.items()
+                if not key.startswith(COSTS_METRIC_PREFIX)
+            }
+            averages.update(metrics_without_costs)
 
         # 3. Log metrics (writes to history.jsonl and wandb)
         self._log_metrics(averages, split, step)
+
+        # 4. Log cumulative costs (additive)
+        await self._record_costs(
+            split,
+            cost_step,
+            cost_components=cost_components,
+            cost_total_direct=cost_total_direct,
+            cost_seen=cost_seen,
+        )
 
     async def get_step(self) -> int:
         """
@@ -559,6 +706,25 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             report_metrics=report_metrics,
             **kwargs,
         )
+        object.__setattr__(self, "_costs_lock", asyncio.Lock())
+        object.__setattr__(self, "_cost_calculator", self._noop_cost_calculator)
+
+    @property
+    def cost_calculator(self) -> CostCalculator:
+        return self._cost_calculator
+
+    def set_cost_calculator(self, calculator: CostCalculator | None) -> None:
+        object.__setattr__(
+            self,
+            "_cost_calculator",
+            calculator if calculator is not None else self._noop_cost_calculator,
+        )
+
+    @staticmethod
+    def _noop_cost_calculator(
+        _prompt_tokens: int | None, _completion_tokens: int | None
+    ) -> dict[str, float]:
+        return {}
         if _internal_config is not None:
             # Bypass BaseModel __setattr__ to allow setting private attr
             object.__setattr__(self, "_internal_config", _internal_config)

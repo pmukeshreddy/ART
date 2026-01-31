@@ -29,6 +29,7 @@ from art.tinker.cookbook_v import renderers, tokenizer_utils
 
 from .. import dev
 from ..backend import Backend
+from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
@@ -159,6 +160,9 @@ class TinkerNativeBackend(Backend):
         if not model.trainable:
             return
         trainable_model = cast(TrainableModel, model)
+        pricing = get_model_pricing(trainable_model.base_model)
+        if pricing is not None:
+            trainable_model.set_cost_calculator(build_cost_calculator(pricing))
         state = await self._build_model_state(trainable_model)
         self._model_state[model.name] = state
 
@@ -219,6 +223,14 @@ class TinkerNativeBackend(Backend):
 
         if not datums:
             return TrainResult(step=state.current_step, metrics=metrics)
+
+        train_tokens = 0
+        for datum in datums:
+            train_tokens += len(datum.model_input.to_ints())
+        metrics["train_tokens"] = float(train_tokens)
+        pricing = get_model_pricing(model.base_model)
+        if pricing is not None:
+            metrics["costs_train"] = compute_train_cost(train_tokens, pricing)
 
         if adam_params is None:
             adam_params = tinker.AdamParams(

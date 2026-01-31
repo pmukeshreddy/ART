@@ -21,5 +21,8 @@ SingleRolloutFn = Callable[
 
 EvalFn = Callable[
     [art.TrainableModel, int, ConfigT],
-    Awaitable[list[Trajectory] | dict[str, list[Trajectory]]],
+    Awaitable[
+        list[Trajectory | TrajectoryGroup]
+        | dict[str, list[Trajectory | TrajectoryGroup]]
+    ],
 ]

@@ -223,11 +223,11 @@ async def main() -> None:
         project=project,
         base_model=base_model,
         _internal_config=internal_config,
-        report_metrics=[],  # Disable wandb logging
     )
     await model.register(backend)
 
     openai_client = model.openai_client()
+    cost_calculator = model.cost_calculator
 
     async def do_rollout(scenario: Scenario, temp: float) -> art.Trajectory:
         """Core rollout logic used by both training and eval."""
@@ -241,6 +241,9 @@ async def main() -> None:
             tools=TOOLS,
             tool_choice=TOOL_CHOICE,
         )
+        usage = getattr(response, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         choice = response.choices[0]
         raw_guess, source = extract_guess(choice)
         sampled_content = choice.message.content or ""
@@ -259,6 +262,12 @@ async def main() -> None:
             "tool_call_found": 1.0 if source != "missing" else 0.0,
             "tool_call_structured": 1.0 if source == "tool_call" else 0.0,
         }
+        sample_costs = cost_calculator(
+            prompt_tokens,
+            completion_tokens,
+        )
+        if sample_costs:
+            metrics.update(sample_costs)
         return art.Trajectory(
             messages_and_choices=[*messages, choice],
             tools=TOOLS,
