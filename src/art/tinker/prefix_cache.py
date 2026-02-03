@@ -41,7 +41,12 @@ class LRUTrieCache:
         if match is None:
             return None
         match_key, entry = match
-        self._lru.move_to_end(match_key)
+        try:
+            self._lru.move_to_end(match_key)
+        except KeyError:
+            self._lru[match_key] = None
+            self._lru.move_to_end(match_key)
+            self._evict()
         return entry
 
     def insert(self, rendered_prefix: Sequence[int], raw_prefix: Sequence[int]) -> None:
