@@ -335,7 +335,7 @@ class SGLangService:
             
             try:
                 async with session.post(
-                    f"http://{self._server_host}:{self._server_port}/update_weights_from_lora",
+                    f"http://{self._server_host}:{self._server_port}/load_lora_adapter",
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=60)
                 ) as resp:
