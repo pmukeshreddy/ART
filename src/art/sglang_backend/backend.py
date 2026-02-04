@@ -205,7 +205,11 @@ class SGLangBackend(LocalBackend):
         try:
             async with aiohttp.ClientSession() as session:
                 while not getattr(self, '_monitor_should_stop', False):
-                    await asyncio.sleep(self._sglang_config.health_check_interval)
+                    # Sleep in small increments to allow fast shutdown
+                    for _ in range(int(self._sglang_config.health_check_interval)):
+                        if getattr(self, '_monitor_should_stop', False):
+                            return
+                        await asyncio.sleep(1)
                     
                     # Check stop flag after sleep
                     if getattr(self, '_monitor_should_stop', False):
@@ -267,8 +271,8 @@ class SGLangBackend(LocalBackend):
         # Signal monitor to stop
         self._monitor_should_stop = True
         
-        # Give monitor time to exit gracefully
-        await asyncio.sleep(0.5)
+        # Brief pause for monitor to notice stop flag
+        await asyncio.sleep(0.1)
         
         # Shutdown all SGLang services
         for name, service in list(self._services.items()):
