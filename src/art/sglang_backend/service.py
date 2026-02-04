@@ -223,6 +223,7 @@ class SGLangService:
             "--port", str(self._server_port),
             "--mem-fraction-static", str(self.sglang_config.mem_fraction_static),
             "--log-level", self.sglang_config.log_level,
+            "--enable-lora",  # Enable LoRA hot-reload endpoint
         ]
         
         # Add tensor parallelism if configured
