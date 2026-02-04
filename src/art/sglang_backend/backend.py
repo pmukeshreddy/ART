@@ -202,50 +202,74 @@ class SGLangBackend(LocalBackend):
         consecutive_failures = 0
         max_consecutive_failures = 3
         
-        async with aiohttp.ClientSession() as session:
-            while True:
-                await asyncio.sleep(self._sglang_config.health_check_interval)
-                try:
-                    # Check if service is sleeping (single-GPU mode during training)
-                    service = self._services.get(model_name)
-                    if service and await service.vllm_engine_is_sleeping():
-                        consecutive_failures = 0
-                        continue
+        try:
+            async with aiohttp.ClientSession() as session:
+                while not getattr(self, '_monitor_should_stop', False):
+                    await asyncio.sleep(self._sglang_config.health_check_interval)
                     
-                    # Health check via models endpoint
-                    async with session.get(
-                        f"{base_url.replace('/v1', '')}/v1/models",
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as response:
-                        if response.status == 200:
-                            consecutive_failures = 0
-                            continue
+                    # Check stop flag after sleep
+                    if getattr(self, '_monitor_should_stop', False):
+                        return
                     
-                    # Fallback: try completion
-                    await openai_client.completions.create(
-                        model=model_name,
-                        prompt="Hi",
-                        max_tokens=1,
-                        timeout=5.0,
-                    )
-                    consecutive_failures = 0
-                    
-                except Exception:
-                    # Check sleep status during exception
                     try:
+                        # Check if service is sleeping (single-GPU mode during training)
                         service = self._services.get(model_name)
                         if service and await service.vllm_engine_is_sleeping():
                             consecutive_failures = 0
                             continue
+                        
+                        # Health check via models endpoint
+                        async with session.get(
+                            f"{base_url.replace('/v1', '')}/v1/models",
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as response:
+                            if response.status == 200:
+                                consecutive_failures = 0
+                                continue
+                        
+                        # Fallback: try completion
+                        await openai_client.completions.create(
+                            model=model_name,
+                            prompt="Hi",
+                            max_tokens=1,
+                            timeout=5.0,
+                        )
+                        consecutive_failures = 0
+                        
                     except Exception:
-                        pass
-                    
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        raise
+                        # Check stop flag - don't error during shutdown
+                        if getattr(self, '_monitor_should_stop', False):
+                            return
+                        
+                        # Check sleep status during exception
+                        try:
+                            service = self._services.get(model_name)
+                            if service and await service.vllm_engine_is_sleeping():
+                                consecutive_failures = 0
+                                continue
+                        except Exception:
+                            pass
+                        
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            raise
+        except asyncio.CancelledError:
+            # Graceful shutdown
+            return
+        except aiohttp.ClientError:
+            # Connection errors during shutdown are expected
+            if getattr(self, '_monitor_should_stop', False):
+                return
+            raise
 
     async def close(self) -> None:
         """Clean up resources and shutdown SGLang servers."""
+        # Signal monitor to stop
+        self._monitor_should_stop = True
+        
+        # Give monitor time to exit gracefully
+        await asyncio.sleep(0.5)
+        
         # Shutdown all SGLang services
         for name, service in list(self._services.items()):
             if isinstance(service, SGLangService):
