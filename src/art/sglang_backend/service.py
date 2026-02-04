@@ -292,25 +292,21 @@ class SGLangService:
             return
         
         try:
-            # Try process group kill first (preferred)
+            # Force kill immediately for fast cleanup
             try:
-                os.killpg(os.getpgid(self._server_process.pid), signal.SIGTERM)
+                os.killpg(os.getpgid(self._server_process.pid), signal.SIGKILL)
             except (ProcessLookupError, OSError):
-                # Fallback to direct process kill
-                self._server_process.terminate()
+                self._server_process.kill()
             
-            # Wait for graceful shutdown
-            try:
-                self._server_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                # Force kill if not responding
-                try:
-                    os.killpg(os.getpgid(self._server_process.pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    self._server_process.kill()
-                self._server_process.wait(timeout=5)
+            # Non-blocking wait with short timeout
+            for _ in range(10):  # Max 1 second
+                if self._server_process.poll() is not None:
+                    break
+                await asyncio.sleep(0.1)
         except Exception:
             pass  # Best effort cleanup
+        finally:
+            self._server_process = None
         
         self._server_process = None
         gc_and_empty_cuda_cache()
