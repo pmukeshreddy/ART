@@ -188,20 +188,15 @@ async def test_e2e():
         await backend.close()
         return False
     
-    # Cleanup with timeout
-    print("\n" + "=" * 60)
-    print("Cleaning up...")
-    try:
-        await asyncio.wait_for(backend.close(), timeout=5.0)
-    except asyncio.TimeoutError:
-        print("  (cleanup timed out, force killing)")
-        import subprocess
-        subprocess.run(["pkill", "-9", "-f", "sglang"], capture_output=True)
-    print("✓ Clean shutdown")
-    
+    # Skip cleanup - just kill processes on exit
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED!")
     print("=" * 60)
+    
+    # Force kill SGLang server (faster than graceful shutdown)
+    import subprocess
+    subprocess.run(["pkill", "-9", "-f", "sglang"], capture_output=True)
+    
     return True
 
 
