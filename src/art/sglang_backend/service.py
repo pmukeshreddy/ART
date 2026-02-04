@@ -412,8 +412,9 @@ class SGLangService:
         
         Server keeps running. Weights hot-reloaded after training.
         """
-        # Set training device
-        training_device = f"cuda:{self.device_config.training_devices[0]}"
+        # Training device is cuda:0 after CUDA_VISIBLE_DEVICES is set in _training_state
+        # (e.g., if training GPUs are [1,2,3], GPU 1 becomes cuda:0 after setting CUDA_VISIBLE_DEVICES="1,2,3")
+        training_device = "cuda:0"
         
         # Ensure training model is on GPU
         self._training_state.reload_to_gpu(training_device)
@@ -588,10 +589,13 @@ class SGLangService:
         """Initialize Unsloth model and trainer on training device."""
         import unsloth
 
-        # Set training device
+        # Set training device with proper GPU isolation
         if self.device_config.is_split_mode:
-            device = f"cuda:{self.device_config.training_devices[0]}"
-            torch.cuda.set_device(self.device_config.training_devices[0])
+            # CRITICAL: Set CUDA_VISIBLE_DEVICES to training GPUs only
+            # This ensures training doesn't accidentally use the inference GPU
+            os.environ["CUDA_VISIBLE_DEVICES"] = self.device_config.training_cuda_devices
+            device = "cuda:0"  # After CUDA_VISIBLE_DEVICES, GPU 0 is the first training GPU
+            torch.cuda.set_device(0)
         else:
             device = "cuda:0"
 
