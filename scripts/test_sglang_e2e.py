@@ -13,12 +13,18 @@ Usage:
     python scripts/test_sglang_e2e.py
 """
 
+# CRITICAL: Set CUDA_VISIBLE_DEVICES for training BEFORE any imports
+# This must be the VERY FIRST thing to happen before PyTorch initializes CUDA
+import os
+
+# For split-mode training, we need GPUs 1,2,3 for training
+# But we keep all GPUs visible so SGLang server (subprocess) can use GPU 0
+# The subprocess will set its own CUDA_VISIBLE_DEVICES
+os.environ["IMPORT_UNSLOTH"] = "1"  # Tell art package to import unsloth early
+
 # IMPORTANT: Import unsloth BEFORE any other ML libraries to prevent early CUDA initialization.
 # This must happen before importing transformers, torch, vllm, or the art package.
 # See: https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing
-import os
-os.environ["IMPORT_UNSLOTH"] = "1"  # Tell art package to import unsloth early
-
 try:
     import unsloth  # noqa: F401
 except ImportError:

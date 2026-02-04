@@ -122,7 +122,9 @@ class SGLangConfig:
     sglang_python_path: str | None = None
     
     # Memory configuration
-    mem_fraction_static: float = 0.9
+    # NOTE: Set to 0.5 to leave enough GPU memory for training when CUDA_VISIBLE_DEVICES
+    # can't be set early enough (before PyTorch initialization)
+    mem_fraction_static: float = 0.5
     disable_radix_cache: bool = False  # Keep False for RL training!
     max_loras_per_batch: int = 4
     context_length: int | None = None
