@@ -13,6 +13,10 @@ Usage:
     python scripts/test_sglang_e2e.py
 """
 
+# Suppress multiprocessing resource_tracker warnings
+import warnings
+warnings.filterwarnings("ignore", message="resource_tracker:")
+
 # CRITICAL: Set CUDA_VISIBLE_DEVICES for training BEFORE any imports
 # This must be the VERY FIRST thing to happen before PyTorch initializes CUDA
 import os
