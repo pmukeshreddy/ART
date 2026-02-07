@@ -1042,10 +1042,15 @@ class SGLangMegatronService:
         - Same prefix + same adapter = cache HIT (~80% hit rate)
         
         As of PR #7216 (August 2025), SGLang LoRA + RadixCache is supported.
+        
+        Raises RuntimeError if both /load_lora_adapter and /add_lora fail.
         """
         # Use FIXED adapter name for RadixCache consistency across epochs
         # This is critical: different names = different cache branches = no hits
         lora_name = self._get_fixed_lora_name()
+        
+        load_error = None
+        add_error = None
         
         async with aiohttp.ClientSession() as session:
             # Try load_lora_adapter endpoint first (REPLACES weights for same name)
@@ -1058,8 +1063,9 @@ class SGLangMegatronService:
                     if resp.status == 200:
                         print(f"  Hot-reloaded LoRA '{lora_name}' step {step} (RadixCache preserved)")
                         return
-            except Exception:
-                pass
+                    load_error = f"/load_lora_adapter returned {resp.status}: {await resp.text()}"
+            except Exception as e:
+                load_error = f"/load_lora_adapter exception: {e}"
             
             # Fallback: try add_lora endpoint
             try:
@@ -1075,10 +1081,15 @@ class SGLangMegatronService:
                     if resp.status == 200:
                         print(f"  Added LoRA '{lora_name}' step {step} (RadixCache preserved)")
                         return
-                    error_text = await resp.text()
-                    print(f"Warning: Failed to hot-reload LoRA: {error_text}")
+                    add_error = f"/add_lora returned {resp.status}: {await resp.text()}"
             except Exception as e:
-                print(f"Warning: Failed to hot-reload LoRA: {e}")
+                add_error = f"/add_lora exception: {e}"
+        
+        # Both endpoints failed: raise so caller knows and can fall back to restart
+        raise RuntimeError(
+            f"Failed to hot-reload LoRA step {step} at {checkpoint_dir}. "
+            f"load_lora_adapter: {load_error}; add_lora: {add_error}"
+        )
 
         # NOTE: We intentionally do NOT add step-specific aliases (model@1, model@2, etc.)
         # Each unique adapter name creates a separate radix tree branch in SGLang,
