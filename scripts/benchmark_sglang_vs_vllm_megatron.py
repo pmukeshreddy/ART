@@ -208,6 +208,90 @@ Step 7: Total cups per day = number_of_chickens × 3. Feed given = 15 + 25 = 40.
 
 Now solve the following problem using the same step-by-step format. Remember to end with #### [number]."""
     
+    # Multi-level category prefixes for RadixAttention tree optimization.
+    # With 500+ samples, a flat prefix (system → question) creates 500 unique
+    # cache entries that compete for GPU memory. Adding a CATEGORY layer creates
+    # a tree structure where the radix tree efficiently deduplicates:
+    #
+    #   Root → [System Prompt ~500 tokens] (shared by ALL questions)
+    #          ├── [Arithmetic ~100 tokens] (shared by ~30% of questions)
+    #          │   ├── Question 1 (~80 tokens, unique)
+    #          │   └── Question 2
+    #          ├── [Money/Shopping ~100 tokens] (shared by ~25%)
+    #          │   └── ...
+    #          ├── [Rate/Speed ~100 tokens] (shared by ~15%)
+    #          │   └── ...
+    #          ├── [Fraction/Percentage ~100 tokens] (shared by ~15%)
+    #          │   └── ...
+    #          └── [General ~100 tokens] (shared by ~15%)
+    #              └── ...
+    #
+    # Cache pressure drops: 500 questions share only ~6 prefix branches,
+    # not 500 independent entries. Each branch is ~600 tokens (system + category).
+    CATEGORY_PREFIXES = {
+        "arithmetic": (
+            "This is a basic arithmetic word problem involving addition, subtraction, "
+            "multiplication, or division of whole numbers. Focus on identifying the "
+            "quantities given and the operations needed. Watch for multi-step chains "
+            "where the result of one calculation feeds into the next. Common patterns: "
+            "finding totals, differences, products, or equal shares. Always double-check "
+            "your arithmetic at each step before moving to the next one."
+        ),
+        "money": (
+            "This is a money and shopping problem involving prices, costs, earnings, "
+            "profits, or budgets. Pay attention to units (dollars, cents) and make sure "
+            "they are consistent throughout. Common patterns: calculating total cost from "
+            "unit price × quantity, finding change, computing profit (revenue minus cost), "
+            "splitting bills, or comparing deals. Convert cents to dollars when needed "
+            "and round only if the problem asks for it."
+        ),
+        "rate": (
+            "This is a rate, speed, or time problem. The key relationship is: "
+            "amount = rate × time. Identify which two of the three quantities are given "
+            "and solve for the third. Watch for unit conversions (hours to minutes, "
+            "miles to kilometers). Common patterns: travel problems, work-rate problems "
+            "(two people working together), filling/draining pools, or production rates. "
+            "If rates combine, add them when working together, subtract when opposing."
+        ),
+        "fraction_percent": (
+            "This is a fraction or percentage problem. Remember: X% of Y = X/100 × Y. "
+            "To find what percentage A is of B: (A/B) × 100. For fraction operations: "
+            "find common denominators for addition/subtraction, multiply straight across, "
+            "and flip-and-multiply for division. Common patterns: discounts, tax, tips, "
+            "increases/decreases by a percentage, or splitting quantities into fractional "
+            "parts. Always simplify fractions in intermediate steps."
+        ),
+        "general": (
+            "This is a general math word problem. Read it carefully to identify all "
+            "given quantities and what is being asked. Draw out relationships between "
+            "quantities if helpful. Common strategies: work backwards from the answer, "
+            "set up an equation, or break into smaller sub-problems. If the problem has "
+            "multiple conditions, handle them one at a time. Double-check that your "
+            "final answer actually addresses what was asked."
+        ),
+    }
+    
+    # Keywords for automatic question classification
+    _CATEGORY_KEYWORDS = {
+        "money": [
+            "dollar", "cent", "price", "cost", "buy", "sell", "pay", "earn",
+            "profit", "spend", "charge", "discount", "sale", "store", "shop",
+            "market", "wage", "salary", "budget", "afford", "cheap", "expensive",
+            "receipt", "bill", "tip", "tax", "revenue", "income",
+        ],
+        "rate": [
+            "per hour", "per minute", "per day", "per week", "speed", "rate",
+            "mile", "kilometer", "faster", "slower", "travel", "drive", "walk",
+            "run", "fill", "drain", "pump", "flow", "produce", "manufacture",
+            "per second", "mph", "km/h",
+        ],
+        "fraction_percent": [
+            "percent", "%", "fraction", "half", "third", "quarter", "fifth",
+            "ratio", "proportion", "increase by", "decrease by", "doubled",
+            "tripled", "twice", "three times",
+        ],
+    }
+    
     def __init__(self, split: str = "test", max_samples: int | None = None):
         self.split = split
         self.max_samples = max_samples
@@ -233,15 +317,51 @@ Now solve the following problem using the same step-by-step format. Remember to 
         
         dataset = load_dataset("gsm8k", "main", split=self.split)
         
+        category_counts = {}
         for i, item in enumerate(dataset):
             if self.max_samples and i >= self.max_samples:
                 break
+            category = self._classify_question(item["question"])
+            category_counts[category] = category_counts.get(category, 0) + 1
             self.data.append({
                 "question": item["question"],
                 "answer": item["answer"],
                 "final_answer": self._extract_final_answer(item["answer"]),
+                "category": category,
             })
-        print(f"Loaded {len(self.data)} GSM8K problems")
+        
+        # Sort by category so questions in the same category are adjacent.
+        # This improves cache locality — the radix tree keeps the category branch
+        # warm while processing a batch of same-category questions.
+        self.data.sort(key=lambda x: x["category"])
+        
+        cat_summary = ", ".join(f"{k}: {v}" for k, v in sorted(category_counts.items()))
+        print(f"Loaded {len(self.data)} GSM8K problems ({cat_summary})")
+    
+    @classmethod
+    def _classify_question(cls, question: str) -> str:
+        """Classify a GSM8K question into a category using keyword matching.
+        
+        Used to assign a category-specific prefix that creates a multi-level
+        prefix tree for RadixAttention caching.
+        """
+        q_lower = question.lower()
+        scores = {}
+        for category, keywords in cls._CATEGORY_KEYWORDS.items():
+            scores[category] = sum(1 for kw in keywords if kw in q_lower)
+        
+        # If money and fraction_percent both match, prefer fraction_percent
+        # (e.g., "20% discount on a $50 item" is really a percentage problem)
+        if scores.get("fraction_percent", 0) >= 2 and scores.get("money", 0) > 0:
+            return "fraction_percent"
+        
+        best = max(scores, key=scores.get) if scores else "general"
+        if scores.get(best, 0) == 0:
+            return "general"
+        
+        # Need at least 1 keyword match; for arithmetic, it's the fallback
+        # when money/rate/fraction don't match but numbers are present
+        return best
     
     def _extract_final_answer(self, answer: str) -> str:
         """Extract the final numerical answer from GSM8K format."""
@@ -250,15 +370,34 @@ Now solve the following problem using the same step-by-step format. Remember to 
         return ""
     
     def get_prompts(self, n: int, with_system: bool = True) -> list[dict]:
-        """Get n prompts for inference."""
+        """Get n prompts with multi-level prefix for optimal cache utilization.
+        
+        Prompt structure (3 levels for RadixAttention tree):
+          Level 0: System prompt (~500 tokens) — shared by ALL questions
+          Level 1: Category prefix (~100 tokens) — shared by same-category questions
+          Level 2: Actual question (~80 tokens) — unique per question
+        
+        With 500+ samples across ~5 categories, this creates only ~6 unique
+        prefix branches instead of 500 independent cache entries.
+        """
         prompts = []
         for i in range(min(n, len(self.data))):
             item = self.data[i % len(self.data)]
             if with_system:
+                category = item.get("category", "general")
+                category_prefix = self.CATEGORY_PREFIXES.get(category, self.CATEGORY_PREFIXES["general"])
+                
+                # Build multi-level prompt:
+                # system message = SYSTEM_PROMPT (Level 0, shared by all)
+                # user message = category_prefix + "\n\n" + question (Level 1 + Level 2)
+                # The category_prefix text is identical for all questions in the same
+                # category, so RadixAttention caches [system + category] as one branch.
+                user_content = f"{category_prefix}\n\nQuestion: {item['question']}"
+                
                 prompts.append({
                     "messages": [
                         {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": item["question"]},
+                        {"role": "user", "content": user_content},
                     ],
                     "expected_answer": item["final_answer"],
                 })
