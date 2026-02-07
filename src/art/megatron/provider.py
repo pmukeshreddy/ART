@@ -28,28 +28,40 @@ def get_provider(model: str) -> GPTModelProvider:
     #   - Attention (q/k/v/o) × 48 layers                      = ~3.6 GiB total
     #   - Embeddings                                            = ~1.2 GiB total
     #
-    # The SHARED EXPERT is the hidden memory hog (18944 vs 768 intermediate).
-    # With TP=1, it's fully replicated → 21 GiB per GPU.
-    # With TP=2, it's split → 10.5 GiB per GPU (saves 10.5 GiB!).
+    # KEY INSIGHT: With TP < num_gpus, some components get REPLICATED across
+    # TP groups.  E.g. TP=2 on 4 GPUs → 2 TP groups → shared expert (21 GiB)
+    # is split within each group (10.5 GiB) but COPIED to both groups.
+    # Result: 42 GiB weights per GPU → OOM on backward pass.
     #
-    # TP=1,EP=4 (BAD):  routed=29 + shared=21 + attn=3.6 = ~54 GiB → OOM on backward
-    # TP=2,EP=2,ETP=2:  routed=29 + shared=10.5 + attn=1.8 = ~42 GiB → 33 GiB free ✅
+    # FIX: Use TP = num_gpus (all GPUs in ONE TP group).  Zero replication:
+    #   TP=4, EP=1, ETP=4 → everything split 4 ways → ~15 GiB/GPU
+    #   Leaves ~60 GiB free for activations/backward (plenty).
     #
-    # expert_tensor_parallel_size (ETP) splits each expert's weights across TP
-    # ranks, so routed expert memory stays ~29 GiB per GPU in both configs.
-    # The win comes from TP=2 splitting the shared expert and attention.
+    # Trade-off: TP=4 has more all-reduce communication than TP=2, making
+    # each training step ~20-30% slower.  But TP=2 OOMs, so slower > crash.
     #
-    # Parallelism math: world=TP×PP×CP×DP, EP≤DP, ETP≤TP
-    #   TP=2, PP=1, CP=1 → DP=num_gpus/2 → EP=DP, ETP=TP
+    # Parallelism math: world = TP × PP × CP × DP
+    #   TP=4, PP=1, CP=1 → DP=1, EP=1, ETP=4
+    #
+    # Memory per GPU with TP=4:
+    #   routed = 58/4 = 14.5 GiB   (split by ETP=4)
+    #   shared = 21/4 =  5.25 GiB  (split by TP=4, NO replication)
+    #   attn   = 3.6/4 = 0.9 GiB   (split by TP=4, NO replication)
+    #   embed  = 1.2/4 = 0.3 GiB
+    #   TOTAL  ≈ 21 GiB  → 59 GiB free for backward ✅
     pp = 1
     cp = 1
-    if num_gpus >= 2 and num_gpus % 2 == 0:
-        tp = 2  # Split shared expert + attention across 2 GPUs
+    # Use ALL GPUs in one TP group to eliminate weight replication.
+    # Round down to nearest power-of-2 for TP (Megatron requirement).
+    if num_gpus >= 4:
+        tp = 4
+    elif num_gpus >= 2:
+        tp = 2
     else:
         tp = 1
     dp_size = num_gpus // (tp * pp * cp)
-    ep = max(1, dp_size)
-    etp = tp  # Match expert-TP to TP so expert weights are also split
+    ep = max(1, dp_size)       # EP=1 when TP=num_gpus (DP=1)
+    etp = tp                   # Split expert weights across all TP ranks
 
     provider.tensor_model_parallel_size = tp
     provider.context_parallel_size = cp
