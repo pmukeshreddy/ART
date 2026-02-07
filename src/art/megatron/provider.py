@@ -20,17 +20,23 @@ def get_provider(model: str) -> GPTModelProvider:
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
     num_gpus = torch.cuda.device_count()
-    provider.tensor_model_parallel_size = min(2, num_gpus)
+    # ── Parallelism strategy for MoE-heavy models (Qwen3-30B-A3B) ──
+    # Qwen3-30B-A3B: ~83% of params are experts (128 experts × 24 MoE layers).
+    # Memory bottleneck is EXPERT weights, not attention.
+    #
+    # TP=2,EP=2 (BAD): each GPU holds 64 experts → ~29 GB expert weights → OOM
+    # TP=1,EP=4 (GOOD): each GPU holds 32 experts → ~14.5 GB expert weights → fits
+    #
+    # TP=1 means attention layers are replicated (not split) across GPUs, but
+    # Qwen3's attention is only ~5B params, so the +5 GB overhead is dwarfed
+    # by the -14.5 GB savings from halving expert count per GPU.
+    #
+    # Parallelism math: world_size = TP × PP × CP × DP_total, EP ≤ DP_total
+    #   TP=1, PP=1, CP=1 → DP_total = num_gpus → EP = num_gpus
+    provider.tensor_model_parallel_size = 1
     provider.context_parallel_size = 1
     provider.pipeline_model_parallel_size = 1
-    # EP must divide the data-parallel size: DP = world_size / (TP * PP * CP)
-    # With TP=2, PP=1, CP=1 on 4 GPUs: DP=2, so max EP=2.
-    # Setting EP > DP would cause a Megatron assertion or silent misconfiguration.
-    tp = provider.tensor_model_parallel_size
-    pp = provider.pipeline_model_parallel_size
-    cp = provider.context_parallel_size
-    dp_size = num_gpus // (tp * pp * cp)
-    provider.expert_model_parallel_size = max(1, dp_size)
+    provider.expert_model_parallel_size = num_gpus
     provider.expert_tensor_parallel_size = 1
     provider.moe_shared_expert_overlap = True
     provider.moe_router_dtype = "fp32"

@@ -309,14 +309,21 @@ while True:
         )
         optimizer.zero_grad()
 
+        # Free the autograd graph immediately — with MoE models the intermediate
+        # activations from 32+ experts per layer are huge and must be released
+        # before the next sequence's forward pass.
+        loss_val = loss.detach().clone()
+        del loss, inputs
+        torch.cuda.empty_cache()
+
         # Mean reduce loss across all ranks for logging
-        torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+        torch.distributed.all_reduce(loss_val, op=torch.distributed.ReduceOp.AVG)
 
         if rank == 0:
             with open(job.log_file_path, "a") as log_file:
                 log_msg = json.dumps(
                     {
-                        "loss": loss.item(),
+                        "loss": loss_val.item(),
                         "grad_norm": grad_norm,
                         "probs_corr": probs_corr,
                     }
