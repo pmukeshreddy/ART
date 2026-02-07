@@ -490,7 +490,7 @@ class BackendManager:
         
         sglang_config = {
             "server_timeout": 600,
-            "mem_fraction_static": 0.90,  # Higher = more cache entries survive
+            "mem_fraction_static": 0.80,  # Matches SGLangConfig default — gives ~16GB headroom on 80GB GPU
             "log_level": "warning",
             "preserve_cache_during_training": self.preserve_cache,
             "cache_method": self.sglang_cache_method,  # "freeze" (default) | "sleep_wake" | "hot_reload" | "restart"
