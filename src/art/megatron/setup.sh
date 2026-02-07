@@ -18,14 +18,55 @@ else
   echo "  Trying to use nvcc from PATH..."
 fi
 export TORCH_CUDA_ARCH_LIST="9.0"
-# install missing cudnn headers & ninja build tools
-# Use sudo if available (non-root environments like ubuntu user on cloud instances)
-if command -v sudo &>/dev/null && [ "$(id -u)" -ne 0 ]; then
-  sudo apt-get update -qq 2>/dev/null || true
-  sudo apt-get install -y -qq libcudnn9-headers-cuda-12 ninja-build 2>/dev/null || true
+
+# ── cuDNN headers ──────────────────────────────────────────────────────
+# transformer-engine-torch needs cudnn.h at build time.  Try three strategies:
+#   1. pip-installed nvidia-cudnn headers (most reliable in venvs)
+#   2. System-installed headers (/usr/include)
+#   3. apt-get install as last resort
+CUDNN_INCLUDE=""
+
+# Strategy 1: find cudnn.h inside pip nvidia-cudnn package
+VENV_DIR="$(python3 -c 'import sys; print(sys.prefix)')"
+for candidate in \
+  "${VENV_DIR}/lib/python"*/site-packages/nvidia/cudnn/include \
+  "${VENV_DIR}/lib/python"*/site-packages/nvidia/cuda_runtime/include \
+  /usr/include/x86_64-linux-gnu \
+  /usr/include \
+  /usr/local/cuda/include; do
+  # Resolve globs
+  for dir in $candidate; do
+    if [ -f "$dir/cudnn.h" ]; then
+      CUDNN_INCLUDE="$dir"
+      break 2
+    fi
+  done
+done
+
+if [ -n "$CUDNN_INCLUDE" ]; then
+  echo "Found cudnn.h at: $CUDNN_INCLUDE"
+  export CPLUS_INCLUDE_PATH="${CUDNN_INCLUDE}:${CPLUS_INCLUDE_PATH:-}"
+  export C_INCLUDE_PATH="${CUDNN_INCLUDE}:${C_INCLUDE_PATH:-}"
 else
-  apt-get update -qq 2>/dev/null || true
-  apt-get install -y -qq libcudnn9-headers-cuda-12 ninja-build 2>/dev/null || true
+  echo "cudnn.h not found in pip packages or system paths, trying apt install..."
+  if command -v sudo &>/dev/null && [ "$(id -u)" -ne 0 ]; then
+    sudo apt-get update -qq 2>/dev/null || true
+    sudo apt-get install -y -qq libcudnn9-dev-cuda-12 2>/dev/null || \
+    sudo apt-get install -y -qq libcudnn9-headers-cuda-12 2>/dev/null || true
+  else
+    apt-get update -qq 2>/dev/null || true
+    apt-get install -y -qq libcudnn9-dev-cuda-12 2>/dev/null || \
+    apt-get install -y -qq libcudnn9-headers-cuda-12 2>/dev/null || true
+  fi
+fi
+
+# Ensure ninja is available
+if ! command -v ninja &>/dev/null; then
+  if command -v sudo &>/dev/null && [ "$(id -u)" -ne 0 ]; then
+    sudo apt-get install -y -qq ninja-build 2>/dev/null || true
+  else
+    apt-get install -y -qq ninja-build 2>/dev/null || true
+  fi
 fi
 # install apex
 # Use $HOME instead of /root for non-root users
