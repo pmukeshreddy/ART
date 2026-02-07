@@ -21,25 +21,43 @@ def get_provider(model: str) -> GPTModelProvider:
     provider.recompute_num_layers = 1
     num_gpus = torch.cuda.device_count()
     # ── Parallelism strategy for MoE-heavy models (Qwen3-30B-A3B) ──
-    # Qwen3-30B-A3B: ~83% of params are experts (128 experts × 24 MoE layers).
-    # Memory bottleneck is EXPERT weights, not attention.
     #
-    # TP=2,EP=2 (BAD): each GPU holds 64 experts → ~29 GB expert weights → OOM
-    # TP=1,EP=4 (GOOD): each GPU holds 32 experts → ~14.5 GB expert weights → fits
+    # Qwen3-30B-A3B memory breakdown (bf16):
+    #   - 128 routed experts × 48 layers × (3 × 4096 × 768)   = ~58 GiB total
+    #   - 1 shared expert  × 48 layers × (3 × 4096 × 18944)   = ~21 GiB total  ← BIG
+    #   - Attention (q/k/v/o) × 48 layers                      = ~3.6 GiB total
+    #   - Embeddings                                            = ~1.2 GiB total
     #
-    # TP=1 means attention layers are replicated (not split) across GPUs, but
-    # Qwen3's attention is only ~5B params, so the +5 GB overhead is dwarfed
-    # by the -14.5 GB savings from halving expert count per GPU.
+    # The SHARED EXPERT is the hidden memory hog (18944 vs 768 intermediate).
+    # With TP=1, it's fully replicated → 21 GiB per GPU.
+    # With TP=2, it's split → 10.5 GiB per GPU (saves 10.5 GiB!).
     #
-    # Parallelism math: world_size = TP × PP × CP × DP_total, EP ≤ DP_total
-    #   TP=1, PP=1, CP=1 → DP_total = num_gpus → EP = num_gpus
-    provider.tensor_model_parallel_size = 1
-    provider.context_parallel_size = 1
-    provider.pipeline_model_parallel_size = 1
-    provider.expert_model_parallel_size = num_gpus
-    provider.expert_tensor_parallel_size = 1
+    # TP=1,EP=4 (BAD):  routed=29 + shared=21 + attn=3.6 = ~54 GiB → OOM on backward
+    # TP=2,EP=2,ETP=2:  routed=29 + shared=10.5 + attn=1.8 = ~42 GiB → 33 GiB free ✅
+    #
+    # expert_tensor_parallel_size (ETP) splits each expert's weights across TP
+    # ranks, so routed expert memory stays ~29 GiB per GPU in both configs.
+    # The win comes from TP=2 splitting the shared expert and attention.
+    #
+    # Parallelism math: world=TP×PP×CP×DP, EP≤DP, ETP≤TP
+    #   TP=2, PP=1, CP=1 → DP=num_gpus/2 → EP=DP, ETP=TP
+    pp = 1
+    cp = 1
+    if num_gpus >= 2 and num_gpus % 2 == 0:
+        tp = 2  # Split shared expert + attention across 2 GPUs
+    else:
+        tp = 1
+    dp_size = num_gpus // (tp * pp * cp)
+    ep = max(1, dp_size)
+    etp = tp  # Match expert-TP to TP so expert weights are also split
+
+    provider.tensor_model_parallel_size = tp
+    provider.context_parallel_size = cp
+    provider.pipeline_model_parallel_size = pp
+    provider.expert_model_parallel_size = ep
+    provider.expert_tensor_parallel_size = etp
     provider.moe_shared_expert_overlap = True
     provider.moe_router_dtype = "fp32"
-    if provider.tensor_model_parallel_size > 1:
+    if tp > 1:
         provider.sequence_parallel = True
     return provider
