@@ -177,6 +177,7 @@ class SGLangConfig:
     enable_torch_compile: bool = False       # Compiled kernels for faster decode
     cuda_graph_max_bs: int = 128            # CUDA graph max batch size
     attention_backend: str = "flashinfer"   # Attention kernel backend
+    enable_metrics: bool = True             # Expose Prometheus /metrics endpoint (needed for cache_hit_rate)
     
     def get_tensor_parallel_size(self) -> int:
         """Get tensor parallel size, auto-detecting if not set."""
@@ -634,6 +635,14 @@ class SGLangMegatronService:
         # Disable radix cache only if explicitly requested
         if self.sglang_config.disable_radix_cache:
             cmd.append("--disable-radix-cache")
+        
+        # 6. Prometheus /metrics endpoint (required for cache_hit_rate measurement)
+        #    Without this, /metrics returns 404 and all cache stats show 0%.
+        if self.sglang_config.enable_metrics:
+            if "--enable-metrics" in _help:
+                cmd.append("--enable-metrics")
+            else:
+                print(f"  WARNING: --enable-metrics not supported by this SGLang version, skipping")
         
         print(f"Starting SGLang server: {' '.join(cmd)}")
         
