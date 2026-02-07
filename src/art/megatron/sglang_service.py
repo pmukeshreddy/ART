@@ -125,7 +125,7 @@ class SGLangConfig:
     
     # Set to 0.85 to maximize KV cache pool while leaving 5-8GB for activations
     # and CUDA graph buffers. This improves prefix cache hit rate significantly.
-    mem_fraction_static: float = 0.85
+    mem_fraction_static: float = 0.80
     disable_radix_cache: bool = False
     max_loras_per_batch: int = 4
     context_length: int | None = None
@@ -509,15 +509,15 @@ class SGLangMegatronService:
             print(f"  Using ART sleep launcher (control port: {self._control_port})")
         else:
             self._control_port = None
-        cmd = [
-            server_python, "-m", "sglang.launch_server",
-            "--model-path", self.base_model,
-            "--host", self._server_host,
-            "--port", str(self._server_port),
-            "--mem-fraction-static", str(self.sglang_config.mem_fraction_static),
-            "--log-level", self.sglang_config.log_level,
-            "--enable-lora",
-        ]
+            cmd = [
+                server_python, "-m", "sglang.launch_server",
+                "--model-path", self.base_model,
+                "--host", self._server_host,
+                "--port", str(self._server_port),
+                "--mem-fraction-static", str(self.sglang_config.mem_fraction_static),
+                "--log-level", self.sglang_config.log_level,
+                "--enable-lora",
+            ]
         
         # Cache the --help output for flag validation (used here and below)
         try:
@@ -1553,6 +1553,26 @@ class SGLangMegatronService:
                         if line := line.strip():
                             if line == "all done":
                                 print("[SGLang] DEBUG: Found 'all done' in log file", flush=True)
+                                
+                                # Wait for Megatron process to exit cleanly.
+                                # train.py now exits after each job (veRL-style),
+                                # so we must wait for destroy_process_group() to
+                                # finish before proceeding. This frees ALL GPU
+                                # memory (CUDA contexts, allocated tensors, etc.)
+                                if self._megatron_process is not None:
+                                    try:
+                                        print("[SGLang] Waiting for Megatron process to exit...", flush=True)
+                                        await asyncio.wait_for(
+                                            self._megatron_process.wait(), timeout=60.0
+                                        )
+                                        rc = self._megatron_process.returncode
+                                        print(f"[SGLang] Megatron process exited (rc={rc})", flush=True)
+                                    except asyncio.TimeoutError:
+                                        print("[SGLang] ⚠️ Megatron process didn't exit in 60s, killing", flush=True)
+                                        self._megatron_process.kill()
+                                        await self._megatron_process.wait()
+                                    self._megatron_process = None
+                                
                                 print("[SGLang] Training complete, merging LoRA adapters...", flush=True)
                                 self._merge_lora_adapter(lora_path)
                                 print("[SGLang] LoRA merge complete", flush=True)
@@ -1585,6 +1605,11 @@ class SGLangMegatronService:
         _t_checkpoint = _time.perf_counter()
 
         # === AFTER TRAINING: Resume inference + reload weights ===
+        # The Megatron process has exited (waited above), so ALL its GPU
+        # memory (CUDA contexts, model weights, optimizer states, gradients)
+        # is now freed by the CUDA driver. Force a gc + empty_cache to
+        # reclaim any orchestrator-side GPU refs before SGLang reloads.
+        gc_and_empty_cuda_cache()
         print(f"[SGLang] DEBUG: Post-training phase starting. strategy={strategy}", flush=True)
         _reload_method = strategy
         if strategy in ("sleep_wake", "sleep", "freeze"):
