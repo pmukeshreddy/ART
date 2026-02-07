@@ -106,6 +106,8 @@ uv pip install --no-build-isolation --override /tmp/te-override.txt \
   megatron-core==0.15.2 \
   megatron-bridge==0.2.0rc6
 rm /tmp/te-override.txt
+# grouped_gemm — required for MoE expert LoRA (grouped_gemm_util.ops.gmm)
+uv pip install grouped_gemm 2>/dev/null || pip install grouped_gemm
 # silence pynvml warnings
 uv pip uninstall pynvml
 uv pip install nvidia-ml-py==13.580.82
