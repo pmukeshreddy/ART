@@ -587,14 +587,14 @@ class SGLangMegatronService:
             else:
                 print(f"  WARNING: --enable-overlap-schedule not supported by this SGLang version, skipping")
         
-        # 5. Torch compile — incompatible with flashinfer + CUDA graphs on MoE models
-        #    (AssertionError: fused_set_kv_buffer_arg not supported for native implementation)
-        #    flashinfer + CUDA graphs already provide optimal kernel performance.
-        #    Only enable if using triton/native attention backend without CUDA graphs.
+        # 5. Torch compile — compiled kernels for faster decode
+        #    Incompatible flashinfer ops (fused_set_kv_buffer) are handled via
+        #    TORCHDYNAMO_SUPPRESS_ERRORS=1 (set in env above), which makes
+        #    torch.compile fall back to eager on those ops instead of crashing.
         if self.sglang_config.enable_torch_compile:
             if "--enable-torch-compile" in _help:
                 cmd.append("--enable-torch-compile")
-                print(f"  WARNING: torch.compile may conflict with flashinfer + CUDA graphs on MoE models")
+                print(f"  torch.compile enabled (incompatible ops fall back to eager via TORCHDYNAMO_SUPPRESS_ERRORS)")
             else:
                 print(f"  WARNING: --enable-torch-compile not supported by this SGLang version, skipping")
         
@@ -729,6 +729,15 @@ class SGLangMegatronService:
         
         # 5. Set CUDA environment
         env["CUDA_HOME"] = "/usr/local/cuda"
+        
+        # 6. torch.compile + flashinfer compatibility
+        #    torch.compile can't compile flashinfer's fused_set_kv_buffer ops,
+        #    causing AssertionError during CUDA graph capture on MoE models.
+        #    TORCHDYNAMO_SUPPRESS_ERRORS=1 makes torch.compile gracefully fall
+        #    back to eager mode on incompatible ops instead of crashing.
+        #    Result: compiled kernels where possible + flashinfer + CUDA graphs.
+        if self.sglang_config.enable_torch_compile:
+            env["TORCHDYNAMO_SUPPRESS_ERRORS"] = "1"
         # =====================================================================
         
         if self.sglang_config.can_preserve_cache():
