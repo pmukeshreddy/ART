@@ -1313,23 +1313,37 @@ class SGLangMegatronService:
         _native_sleep_tags = ["weights", "cuda_graph"]  # Keep KV cache for prefix caching!
         
         if strategy == "sleep_wake":
-            print(f"[SGLang] Method: Native Sleep/Wake (offload weights+CUDA graphs, keep KV cache)")
-            print(f"  SGLang GPUs: {self.sglang_config.get_sglang_gpu_ids()}")
-            print(f"  Megatron GPUs: {self.sglang_config.get_megatron_gpu_ids()}")
+            sglang_gpus = set(self.sglang_config.get_sglang_gpu_ids())
+            megatron_gpus = set(self.sglang_config.get_megatron_gpu_ids())
+            gpus_overlap = bool(sglang_gpus & megatron_gpus)
             
-            # Offload weights + CUDA graphs via native endpoint
-            # KV cache stays on GPU -> prefix cache preserved!
-            release_ok = await self._native_release_memory(tags=_native_sleep_tags)
-            if release_ok:
-                _slept = True
-                print(f"  \u2713 Weights + CUDA graphs offloaded to CPU (KV cache stays on GPU)")
-                print(f"  Server idle with minimal GPU footprint")
+            print(f"[SGLang] Method: Sleep/Wake (cache PRESERVED)")
+            print(f"  SGLang GPUs: {sorted(sglang_gpus)}")
+            print(f"  Megatron GPUs: {sorted(megatron_gpus)}")
+            print(f"  GPU overlap: {gpus_overlap}")
+            
+            if gpus_overlap:
+                # Same GPU(s) for inference + training: MUST offload weights to
+                # make room.  This path is risky for MoE models (server may crash
+                # when internal scheduler touches CPU-offloaded expert weights).
+                release_ok = await self._native_release_memory(tags=_native_sleep_tags)
+                if release_ok:
+                    _slept = True
+                    print(f"  ✓ Weights + CUDA graphs offloaded to CPU (KV cache stays on GPU)")
+                    print(f"  Server idle with minimal GPU footprint")
+                else:
+                    print(f"  ⚠️ Native release_memory failed, falling back to restart")
+                    strategy = "restart"
+                    await self._stop_sglang_server()
+                    self._is_sleeping = True
+                    gc_and_empty_cuda_cache()
             else:
-                print(f"  \u26a0\ufe0f Native release_memory failed, falling back to restart")
-                strategy = "restart"
-                await self._stop_sglang_server()
-                self._is_sleeping = True
-                gc_and_empty_cuda_cache()
+                # Separate GPUs: no need to offload. Server stays fully loaded
+                # on its own GPU(s), training runs on disjoint GPU(s).
+                # This avoids the MoE crash (SGLang issue #6367) entirely.
+                # KV cache + weights stay on GPU → cache PRESERVED, 0s overhead.
+                print(f"  ✓ Separate GPUs — skipping weight offload (no memory contention)")
+                print(f"  Server stays fully loaded, KV cache + weights on GPU")
             use_gpu_isolation = True
         elif strategy == "sleep":
             print(f"[SGLang] Method: Sleep (DEPRECATED — offload weights to CPU)")
