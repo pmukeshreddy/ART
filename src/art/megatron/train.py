@@ -231,6 +231,9 @@ while True:
         )
     print(f"[Rank {rank}] Starting training loop over {len(indices)} sequences")
     for seq_idx, index in enumerate(indices):
+        # Release fragmented reserved memory before each sequence to avoid OOM
+        # on MoE models where grouped_gemm allocations cause fragmentation.
+        torch.cuda.empty_cache()
         print(f"[Rank {rank}] Processing sequence {seq_idx+1}/{len(indices)}, index={index}")
         inputs = PackedTensors(  # type: ignore
             **{
@@ -268,6 +271,8 @@ while True:
             labels=shift_tensor(inputs["tokens"], 0),
             extra_block_kwargs={"attention_bias": attention_bias},
         )
+        # Free mask tensors immediately — they're large ([B,1,S,S]) and no longer needed
+        del attention_mask, attention_bias
         print(f"[Rank {rank}] Forward pass complete, computing loss...")
         loss = loss_fn(
             inputs,  # type: ignore
@@ -276,6 +281,7 @@ while True:
             None,
             experimental_config,
         )
+        del new_logprobs  # free logprobs before backward (recomputed via checkpointing)
         probs_corr = loss.probs_corr.item()
         print0("Correlation between old and new probabilities:", probs_corr)
         loss = loss.mean_policy_loss + config.beta * loss.mean_kl

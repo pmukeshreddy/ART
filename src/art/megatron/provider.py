@@ -19,10 +19,18 @@ def get_provider(model: str) -> GPTModelProvider:
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
-    provider.tensor_model_parallel_size = min(2, torch.cuda.device_count())
+    num_gpus = torch.cuda.device_count()
+    provider.tensor_model_parallel_size = min(2, num_gpus)
     provider.context_parallel_size = 1
     provider.pipeline_model_parallel_size = 1
-    provider.expert_model_parallel_size = torch.cuda.device_count()
+    # EP must divide the data-parallel size: DP = world_size / (TP * PP * CP)
+    # With TP=2, PP=1, CP=1 on 4 GPUs: DP=2, so max EP=2.
+    # Setting EP > DP would cause a Megatron assertion or silent misconfiguration.
+    tp = provider.tensor_model_parallel_size
+    pp = provider.pipeline_model_parallel_size
+    cp = provider.context_parallel_size
+    dp_size = num_gpus // (tp * pp * cp)
+    provider.expert_model_parallel_size = max(1, dp_size)
     provider.expert_tensor_parallel_size = 1
     provider.moe_shared_expert_overlap = True
     provider.moe_router_dtype = "fp32"
