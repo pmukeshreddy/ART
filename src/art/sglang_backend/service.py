@@ -177,6 +177,7 @@ class SGLangConfig:
     enable_torch_compile: bool = False       # Compiled kernels for faster decode
     cuda_graph_max_bs: int = 128            # CUDA graph max batch size
     attention_backend: str = "flashinfer"   # Attention kernel backend
+    enable_metrics: bool = True             # Expose Prometheus /metrics endpoint (needed for cache_hit_rate)
     
     def get_tensor_parallel_size(self) -> int:
         """Get tensor parallel size, auto-detecting if not set."""
@@ -635,6 +636,14 @@ class SGLangMegatronService:
         if self.sglang_config.disable_radix_cache:
             cmd.append("--disable-radix-cache")
         
+        # 6. Prometheus /metrics endpoint (required for cache_hit_rate measurement)
+        #    Without this, /metrics returns 404 and all cache stats show 0%.
+        if self.sglang_config.enable_metrics:
+            if "--enable-metrics" in _help:
+                cmd.append("--enable-metrics")
+            else:
+                print(f"  WARNING: --enable-metrics not supported by this SGLang version, skipping")
+        
         print(f"Starting SGLang server: {' '.join(cmd)}")
         
         # Set up environment with GPU isolation
@@ -1042,10 +1051,15 @@ class SGLangMegatronService:
         - Same prefix + same adapter = cache HIT (~80% hit rate)
         
         As of PR #7216 (August 2025), SGLang LoRA + RadixCache is supported.
+        
+        Raises RuntimeError if both /load_lora_adapter and /add_lora fail.
         """
         # Use FIXED adapter name for RadixCache consistency across epochs
         # This is critical: different names = different cache branches = no hits
         lora_name = self._get_fixed_lora_name()
+        
+        load_error = None
+        add_error = None
         
         async with aiohttp.ClientSession() as session:
             # Try load_lora_adapter endpoint first (REPLACES weights for same name)
@@ -1058,8 +1072,9 @@ class SGLangMegatronService:
                     if resp.status == 200:
                         print(f"  Hot-reloaded LoRA '{lora_name}' step {step} (RadixCache preserved)")
                         return
-            except Exception:
-                pass
+                    load_error = f"/load_lora_adapter returned {resp.status}: {await resp.text()}"
+            except Exception as e:
+                load_error = f"/load_lora_adapter exception: {e}"
             
             # Fallback: try add_lora endpoint
             try:
@@ -1075,10 +1090,15 @@ class SGLangMegatronService:
                     if resp.status == 200:
                         print(f"  Added LoRA '{lora_name}' step {step} (RadixCache preserved)")
                         return
-                    error_text = await resp.text()
-                    print(f"Warning: Failed to hot-reload LoRA: {error_text}")
+                    add_error = f"/add_lora returned {resp.status}: {await resp.text()}"
             except Exception as e:
-                print(f"Warning: Failed to hot-reload LoRA: {e}")
+                add_error = f"/add_lora exception: {e}"
+        
+        # Both endpoints failed: raise so caller knows and can fall back to restart
+        raise RuntimeError(
+            f"Failed to hot-reload LoRA step {step} at {checkpoint_dir}. "
+            f"load_lora_adapter: {load_error}; add_lora: {add_error}"
+        )
 
         # NOTE: We intentionally do NOT add step-specific aliases (model@1, model@2, etc.)
         # Each unique adapter name creates a separate radix tree branch in SGLang,
