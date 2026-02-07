@@ -1199,7 +1199,10 @@ class SGLangMegatronService:
             print(f"  WARNING: Could not find nvidia lib paths in training venv (site={venv_site})")
         
         # Determine which GPUs to use for Megatron
-        if use_gpu_isolation:
+        # Always respect explicit training_gpu_ids even when sleep_wake freed
+        # memory. The SGLang process is still alive and its CUDA context + driver
+        # overhead can cause OOM on shared GPUs (especially for large MoE models).
+        if use_gpu_isolation or self.sglang_config.training_gpu_ids is not None:
             megatron_gpu_ids = self.sglang_config.get_megatron_gpu_ids()
             num_gpus = len(megatron_gpu_ids)
             cuda_devices = ",".join(map(str, megatron_gpu_ids))
