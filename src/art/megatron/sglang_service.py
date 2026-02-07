@@ -1469,78 +1469,94 @@ class SGLangMegatronService:
         print(f"[SGLang] DEBUG: Post-training phase starting. strategy={strategy}", flush=True)
         _reload_method = strategy
         if strategy in ("sleep_wake", "sleep", "freeze"):
-            # Server was NOT frozen (no SIGSTOP), just check health
-            print(f"[SGLang] DEBUG: Checking server health...", flush=True)
-            thaw_ok = await self._is_server_healthy()
-            print(f"[SGLang] DEBUG: Server health check result: {thaw_ok}", flush=True)
-            
-            if thaw_ok:
-                try:
-                    # Resume weights if we used native sleep/wake
-                    # NOTE: We use update_weights_from_disk instead of resume_memory_occupation.
-                    # resume_memory_occupation is BROKEN for MoE models (SGLang issue #6367):
-                    # it restores from CPU backup but expert layers don't get properly placed
-                    # on GPU, causing garbage output. update_weights_from_disk reloads ALL
-                    # weights fresh from disk, which works correctly for MoE models.
-                    # The KV cache stays on GPU throughout (prefix cache preserved).
-                    if _slept and strategy == "sleep_wake":
-                        print(f"[SGLang] DEBUG: Reloading base weights from disk (MoE-safe)...", flush=True)
-                        reload_ok = await self._update_weights_from_disk()
-                        if reload_ok:
-                            print(f"  ✓ Base weights reloaded from disk (MoE-safe)", flush=True)
-                        else:
-                            print(f"  ⚠️ update_weights_from_disk failed — server may need restart", flush=True)
-                    elif _slept and strategy == "sleep":
-                        # Old custom launcher wake
-                        print(f"[SGLang] DEBUG: Calling wake (old launcher)...", flush=True)
-                        wake_result = await self._wake_server()
-                        if wake_result:
-                            print(f"  ✓ Weights reloaded: {wake_result.get('gpu_reloaded_gb', '?')}GB "
-                                  f"in {wake_result.get('reload_time_s', '?')}s", flush=True)
-                        else:
-                            print(f"  ⚠️ Wake failed — server may need restart", flush=True)
+            try:
+                if _slept and strategy == "sleep_wake":
+                    # ──────────────────────────────────────────────────────────
+                    # SLEEP_WAKE resume: weights are on CPU after release_memory_occupation.
+                    # The server process IS alive but can't serve inference (weights on CPU),
+                    # so /health will return False. Do NOT health-check first!
+                    #
+                    # Correct order (veRL/Slime pattern for MoE):
+                    #   1. update_weights_from_disk → reload ALL weights from disk to GPU
+                    #      (NOT resume_memory_occupation which is broken for MoE — #6367)
+                    #   2. Wait for server to become healthy (weights now on GPU)
+                    #   3. load_lora_adapter → apply new LoRA checkpoint
+                    #
+                    # KV cache stays on GPU the whole time → prefix cache PRESERVED.
+                    # ──────────────────────────────────────────────────────────
+                    print(f"[SGLang] Reloading base weights from disk (MoE-safe)...", flush=True)
+                    reload_ok = await self._update_weights_from_disk()
+                    if not reload_ok:
+                        raise RuntimeError("update_weights_from_disk failed")
+                    print(f"  ✓ Base weights reloaded from disk", flush=True)
                     
-                    # Wait a moment for server to stabilize after resume
-                    if _slept:
+                    # Wait for server to become healthy after weight reload
+                    print(f"[SGLang] Waiting for server to be healthy after weight reload...", flush=True)
+                    healthy = False
+                    for i in range(30):  # Up to 30s
+                        if await self._is_server_healthy():
+                            healthy = True
+                            break
                         await asyncio.sleep(1.0)
-                        # Verify server is healthy after memory resume
+                    if not healthy:
+                        raise RuntimeError("Server not healthy after update_weights_from_disk")
+                    print(f"  ✓ Server healthy", flush=True)
+                    
+                elif _slept and strategy == "sleep":
+                    # Old custom launcher wake
+                    print(f"[SGLang] Calling wake (old launcher)...", flush=True)
+                    wake_result = await self._wake_server()
+                    if wake_result:
+                        print(f"  ✓ Weights reloaded: {wake_result.get('gpu_reloaded_gb', '?')}GB "
+                              f"in {wake_result.get('reload_time_s', '?')}s", flush=True)
+                    else:
+                        raise RuntimeError("Wake endpoint failed")
+                    await asyncio.sleep(1.0)
+                    for i in range(10):
+                        if await self._is_server_healthy():
+                            break
+                        await asyncio.sleep(1.0)
+                    
+                else:
+                    # freeze or non-slept: server should be healthy, just verify
+                    print(f"[SGLang] Checking server health...", flush=True)
+                    thaw_ok = await self._is_server_healthy()
+                    if not thaw_ok:
+                        # Wait a bit — server may be briefly unresponsive
                         for i in range(10):
                             if await self._is_server_healthy():
+                                thaw_ok = True
                                 break
                             await asyncio.sleep(1.0)
-                    
-                    print(f"[SGLang] DEBUG: About to hot-reload LoRA...", flush=True)
-                    await asyncio.wait_for(
-                        self._hot_reload_lora(new_checkpoint_dir, next_step),
-                        timeout=120.0
-                    )
-                    print(f"[SGLang] DEBUG: Hot-reload complete", flush=True)
-                    await self._unload_old_loras(keep_step=next_step)
-                    if _slept:
-                        _reload_method = f"{strategy}+hot_reload"
-                    else:
-                        _reload_method = "gpu_isolation+hot_reload"
-                    print(f"[SGLang] ✓ Server resumed + LoRA reloaded (cache preserved)", flush=True)
-                except (asyncio.TimeoutError, Exception) as e:
-                    print(f"[SGLang] ⚠️ Post-thaw reload failed: {e}", flush=True)
-                    import traceback
-                    traceback.print_exc()
-                    print(f"[SGLang] ⚠️ RESTARTING SERVER — cache will be LOST", flush=True)
-                    self.sglang_config.cache_method = "freeze"
-                    await self._stop_sglang_server()
-                    gc_and_empty_cuda_cache()
-                    await self._start_sglang_server(new_checkpoint_dir)
-                    await self._hot_reload_lora(new_checkpoint_dir, next_step)
-                    _reload_method = f"{strategy}_failed→restart"
-            else:
-                print(f"[SGLang] ⚠️ Server dead after thaw attempts", flush=True)
+                    if not thaw_ok:
+                        raise RuntimeError("Server not healthy after freeze/idle")
+                    print(f"  ✓ Server healthy", flush=True)
+                
+                # Hot-reload LoRA with new checkpoint
+                print(f"[SGLang] Hot-reloading LoRA for step {next_step}...", flush=True)
+                await asyncio.wait_for(
+                    self._hot_reload_lora(new_checkpoint_dir, next_step),
+                    timeout=120.0
+                )
+                print(f"  ✓ LoRA hot-reloaded", flush=True)
+                await self._unload_old_loras(keep_step=next_step)
+                if _slept:
+                    _reload_method = f"{strategy}+update_weights_from_disk"
+                else:
+                    _reload_method = "gpu_isolation+hot_reload"
+                print(f"[SGLang] ✓ Server resumed + LoRA reloaded (cache preserved)", flush=True)
+                
+            except (asyncio.TimeoutError, Exception) as e:
+                print(f"[SGLang] ⚠️ Post-training reload failed: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
                 print(f"[SGLang] ⚠️ RESTARTING SERVER — cache will be LOST", flush=True)
                 self.sglang_config.cache_method = "freeze"
                 await self._stop_sglang_server()
                 gc_and_empty_cuda_cache()
                 await self._start_sglang_server(new_checkpoint_dir)
                 await self._hot_reload_lora(new_checkpoint_dir, next_step)
-                _reload_method = "thaw_failed→restart"
+                _reload_method = f"{strategy}_failed→restart"
         elif strategy == "hot_reload":
             # Server was active the whole time, just hot-reload
             print(f"[SGLang] Hot-reloading LoRA for step {next_step} (cache preserved)")
