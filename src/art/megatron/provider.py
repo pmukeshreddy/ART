@@ -58,6 +58,17 @@ def get_provider(model: str) -> GPTModelProvider:
     provider.expert_tensor_parallel_size = etp
     provider.moe_shared_expert_overlap = True
     provider.moe_router_dtype = "fp32"
+    # ── MoE token capacity: prevent routing-spike OOM across epochs ──
+    # Without a cap, the router can send disproportionately many tokens to
+    # experts on one GPU (data-dependent).  With EP, tokens are all-to-all
+    # dispatched, so one GPU can receive 2-3× the average, causing transient
+    # OOM during backward.  Setting a capacity factor caps per-expert tokens
+    # to (total_tokens / num_experts) * capacity_factor.  Tokens beyond cap
+    # are dropped (lowest-probability first) — has negligible training impact
+    # for RL/RLHF but makes memory usage bounded and deterministic.
+    provider.moe_token_drop_policy = "probs"        # drop least-confident routes
+    provider.moe_expert_capacity_factor = 1.5        # 50% headroom over uniform
+    provider.moe_pad_expert_input_to_capacity = True # deterministic memory per expert
     if tp > 1:
         provider.sequence_parallel = True
     return provider

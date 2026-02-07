@@ -3,7 +3,8 @@ import os
 
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+# Support both A100 (8.0) and H100 (9.0) — hardcoding "9.0" breaks A100
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;9.0"
 # isort: on
 
 import json
