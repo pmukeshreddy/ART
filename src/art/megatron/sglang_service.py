@@ -967,23 +967,10 @@ class SGLangMegatronService:
             except Exception as e:
                 print(f"Warning: Failed to hot-reload LoRA: {e}")
 
-        # Also add step-specific alias for debugging/tracking
-        step_alias = f"{self.model_name}@{step}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"http://{self._server_host}:{self._server_port}/add_lora",
-                    json={
-                        "lora_path": checkpoint_dir,
-                        "lora_name": step_alias,
-                        "lora_int_id": self._next_lora_id(),
-                    },
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as resp:
-                    if resp.status == 200:
-                        print(f"  Added step alias: {step_alias}")
-        except Exception:
-            pass  # Alias is optional
+        # NOTE: We intentionally do NOT add step-specific aliases (model@1, model@2, etc.)
+        # Each unique adapter name creates a separate radix tree branch in SGLang,
+        # which kills cache hit rates. The fixed name (model@latest) is sufficient.
+        # Step tracking is done via _latest_step and checkpoint directories.
 
     # ========================================================================
     # Megatron Training (same as MegatronService)
@@ -1192,12 +1179,39 @@ class SGLangMegatronService:
     async def _unload_old_loras(self, keep_step: int | None = None) -> None:
         """Unload old LoRA adapters to free memory.
         
-        SGLang may accumulate LoRAs across training steps. This cleans up old ones.
+        SGLang may accumulate step-aliased LoRAs across training steps.
+        The fixed-name adapter (model@latest) is always kept since it's
+        the one used for inference. Step aliases (model@1, model@2, ...)
+        are unloaded to prevent memory creep.
+        
+        Uses SGLang's /unload_lora_adapter or /delete_lora_adapter endpoint
+        if available.
         """
-        # SGLang doesn't have a standard unload endpoint, but we can try
-        # For now, just track that we should manage LoRA memory
-        # Future: implement actual unload when SGLang supports it
-        pass
+        if keep_step is None:
+            return
+        
+        fixed_name = self._get_fixed_lora_name()
+        
+        # Try to unload any step-specific aliases that may have accumulated
+        # We don't know exactly which steps exist, so try recent ones
+        for old_step in range(max(0, keep_step - 10), keep_step):
+            old_name = f"{self.model_name}@{old_step}"
+            if old_name == fixed_name:
+                continue  # Never unload the fixed adapter
+            
+            for endpoint in ("/unload_lora_adapter", "/delete_lora_adapter"):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"http://{self._server_host}:{self._server_port}{endpoint}",
+                            json={"lora_name": old_name},
+                            timeout=aiohttp.ClientTimeout(total=10)
+                        ) as resp:
+                            if resp.status == 200:
+                                print(f"  Unloaded old LoRA: {old_name}")
+                                break  # Success, no need to try other endpoint
+                except Exception:
+                    pass  # Endpoint may not exist in this SGLang version
 
     async def train(
         self,
