@@ -587,10 +587,14 @@ class SGLangMegatronService:
             else:
                 print(f"  WARNING: --enable-overlap-schedule not supported by this SGLang version, skipping")
         
-        # 5. Torch compile — compiled kernels for faster decode
+        # 5. Torch compile — incompatible with flashinfer + CUDA graphs on MoE models
+        #    (AssertionError: fused_set_kv_buffer_arg not supported for native implementation)
+        #    flashinfer + CUDA graphs already provide optimal kernel performance.
+        #    Only enable if using triton/native attention backend without CUDA graphs.
         if self.sglang_config.enable_torch_compile:
             if "--enable-torch-compile" in _help:
                 cmd.append("--enable-torch-compile")
+                print(f"  WARNING: torch.compile may conflict with flashinfer + CUDA graphs on MoE models")
             else:
                 print(f"  WARNING: --enable-torch-compile not supported by this SGLang version, skipping")
         

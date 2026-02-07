@@ -498,7 +498,7 @@ class BackendManager:
             "schedule_policy": "lpm",           # Longest Prefix Match: reorders requests for max cache hits
             "chunked_prefill_size": 8192,       # Overlap prefill with decode
             "enable_overlap_schedule": True,    # CPU scheduling parallel with GPU execution
-            "enable_torch_compile": False,      # Disabled: incompatible with Qwen3 MoE + flashinfer CUDA graphs
+            "enable_torch_compile": False,      # Off: conflicts with flashinfer + CUDA graphs on MoE models
         }
         
         # Set tensor parallelism for SGLang (for fair comparison with vLLM)
