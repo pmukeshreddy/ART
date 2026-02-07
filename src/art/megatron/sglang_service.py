@@ -142,11 +142,13 @@ class SGLangConfig:
     
     # Cache method for SGLang during training:
     #   "sleep_wake" (RECOMMENDED): Uses SGLang's native /release_memory_occupation
-    #                 and /resume_memory_occupation endpoints to offload model weights
-    #                 + CUDA graphs to CPU. KV cache stays on GPU → prefix cache PRESERVED.
-    #                 Then SIGSTOP to eliminate CPU contention. After training: SIGCONT →
-    #                 resume_memory_occupation → hot-reload LoRA.
-    #                 Requires: --enable-memory-saver --enable-weights-cpu-backup on server.
+    #                 to offload model weights + CUDA graphs to CPU before training.
+    #                 KV cache stays on GPU → prefix cache PRESERVED.
+    #                 After training: /update_weights_from_disk reloads ALL weights
+    #                 fresh from disk (NOT resume_memory_occupation which is broken
+    #                 for MoE models — SGLang issue #6367). Then /load_lora_adapter
+    #                 with the new LoRA checkpoint.
+    #                 Requires: --enable-memory-saver on server.
     #                 Frees ~48GB (weights + CUDA graphs), keeps ~17GB (KV cache) on GPU.
     #                 Training speed should match vLLM sleep_wake.
     #   "freeze":     SIGSTOP the SGLang process group during training, SIGCONT after.
@@ -494,23 +496,23 @@ class SGLangMegatronService:
         # NOTE: These flags may not exist in all SGLang versions (e.g. 0.5.8).
         # If the server fails to start, fall back to freeze mode.
         if self.sglang_config.cache_method == "sleep_wake":
-            # Validate flags exist by checking sglang help output
+            # Validate --enable-memory-saver exists by checking sglang help output
+            # NOTE: We do NOT need --enable-weights-cpu-backup because we use
+            # /update_weights_from_disk to reload weights after training (not
+            # resume_memory_occupation which is broken for MoE models).
             try:
                 help_output = subprocess.run(
                     [server_python, "-m", "sglang.launch_server", "--help"],
                     capture_output=True, text=True, timeout=15
                 ).stdout
                 has_memory_saver = "--enable-memory-saver" in help_output
-                has_cpu_backup = "--enable-weights-cpu-backup" in help_output
             except Exception:
                 has_memory_saver = False
-                has_cpu_backup = False
             
             if has_memory_saver:
                 cmd.extend(["--enable-memory-saver"])
-                if has_cpu_backup:
-                    cmd.extend(["--enable-weights-cpu-backup"])
-                print(f"  Native sleep/wake enabled (memory-saver={has_memory_saver}, cpu-backup={has_cpu_backup})")
+                print(f"  Native sleep/wake enabled (memory-saver={has_memory_saver})")
+                print(f"  Post-training: update_weights_from_disk (MoE-safe, no CPU backup needed)")
             else:
                 print(f"  WARNING: SGLang version does not support --enable-memory-saver.")
                 print(f"  Falling back to 'freeze' mode (cache still preserved).")
@@ -889,35 +891,58 @@ class SGLangMegatronService:
             print(f"[SGLang] ⚠️ release_memory_occupation error: {e}")
             return False
 
-    async def _native_resume_memory(self, tags: list[str] | None = None) -> bool:
-        """Call SGLang's native /resume_memory_occupation endpoint.
+    async def _update_weights_from_disk(self, model_path: str | None = None) -> bool:
+        """Reload ALL model weights from disk via /update_weights_from_disk.
         
-        Reloads specified memory types from CPU back to GPU.
+        This is the correct post-training resume path for MoE models.
+        
+        Why NOT resume_memory_occupation:
+            resume_memory_occupation restores weights from CPU backup, but this is
+            broken for MoE models (SGLang issue #6367) — expert layers don't get
+            properly placed on GPU, causing garbage output.
+        
+        Why update_weights_from_disk:
+            - Reloads ALL weights fresh from disk, properly placing MoE expert layers
+            - Bypasses the broken CPU backup restore entirely
+            - KV cache stays on GPU (prefix cache preserved)
+            - Slightly slower than CPU→GPU copy (disk I/O) but actually works for MoE
+            - Still way faster than full server restart (no process spawn, no CUDA
+              graph recapture, no KV cache rebuild)
+        
+        This pattern is used by veRL and Slime for the same reason.
         
         Args:
-            tags: List of memory types to resume. Must match what was released.
-                  
+            model_path: Path to load weights from. Defaults to self.base_model.
+        
         Returns True if successful.
         """
-        if tags is None:
-            tags = ["weights", "cuda_graph"]  # Must match release tags
+        if model_path is None:
+            model_path = self.base_model
+        
+        import time as _time
+        _t0 = _time.perf_counter()
         
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"http://{self._server_host}:{self._server_port}/resume_memory_occupation",
-                    json={"tags": tags},
-                    timeout=aiohttp.ClientTimeout(total=120)
+                    f"http://{self._server_host}:{self._server_port}/update_weights_from_disk",
+                    json={
+                        "model_path": model_path,
+                        "load_format": "auto",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=300)  # Large models take time
                 ) as resp:
+                    elapsed = _time.perf_counter() - _t0
                     if resp.status == 200:
-                        print(f"[SGLang] ✓ Memory resumed: tags={tags}")
+                        print(f"[SGLang] ✓ Weights reloaded from disk in {elapsed:.1f}s (model={model_path})")
                         return True
                     else:
                         error_text = await resp.text()
-                        print(f"[SGLang] ⚠️ resume_memory_occupation failed ({resp.status}): {error_text}")
+                        print(f"[SGLang] ⚠️ update_weights_from_disk failed ({resp.status}): {error_text}")
                         return False
         except Exception as e:
-            print(f"[SGLang] ⚠️ resume_memory_occupation error: {e}")
+            elapsed = _time.perf_counter() - _t0
+            print(f"[SGLang] ⚠️ update_weights_from_disk error after {elapsed:.1f}s: {e}")
             return False
 
     async def _hot_reload_lora(self, checkpoint_dir: str, step: int) -> None:
@@ -1226,7 +1251,8 @@ class SGLangMegatronService:
         - "sleep_wake" (RECOMMENDED): Uses SGLang's native /release_memory_occupation
               to offload weights + CUDA graphs to CPU. KV cache stays on GPU.
               Server stays alive (idle) with GPU isolation — no SIGSTOP.
-              After training: /resume_memory_occupation → hot-reload LoRA.
+              After training: /update_weights_from_disk (NOT resume_memory_occupation
+              which is broken for MoE — issue #6367) → hot-reload LoRA.
               Cache PRESERVED. Training speed matches vLLM sleep_wake.
         - "freeze": GPU isolation only — server stays alive and idle.
               GPU memory stays allocated (weights + KV cache on SGLang GPUs).
@@ -1432,14 +1458,20 @@ class SGLangMegatronService:
             
             if thaw_ok:
                 try:
-                    # Resume memory if we used native sleep/wake
+                    # Resume weights if we used native sleep/wake
+                    # NOTE: We use update_weights_from_disk instead of resume_memory_occupation.
+                    # resume_memory_occupation is BROKEN for MoE models (SGLang issue #6367):
+                    # it restores from CPU backup but expert layers don't get properly placed
+                    # on GPU, causing garbage output. update_weights_from_disk reloads ALL
+                    # weights fresh from disk, which works correctly for MoE models.
+                    # The KV cache stays on GPU throughout (prefix cache preserved).
                     if _slept and strategy == "sleep_wake":
-                        print(f"[SGLang] DEBUG: Calling native resume_memory_occupation...", flush=True)
-                        resume_ok = await self._native_resume_memory(tags=_native_sleep_tags)
-                        if resume_ok:
-                            print(f"  ✓ Weights + CUDA graphs reloaded from CPU", flush=True)
+                        print(f"[SGLang] DEBUG: Reloading base weights from disk (MoE-safe)...", flush=True)
+                        reload_ok = await self._update_weights_from_disk()
+                        if reload_ok:
+                            print(f"  ✓ Base weights reloaded from disk (MoE-safe)", flush=True)
                         else:
-                            print(f"  ⚠️ resume_memory_occupation failed — server may need restart", flush=True)
+                            print(f"  ⚠️ update_weights_from_disk failed — server may need restart", flush=True)
                     elif _slept and strategy == "sleep":
                         # Old custom launcher wake
                         print(f"[SGLang] DEBUG: Calling wake (old launcher)...", flush=True)
