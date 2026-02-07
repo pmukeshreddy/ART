@@ -142,15 +142,17 @@ class SGLangConfig:
     
     # Cache method for SGLang during training:
     #   "sleep_wake" (RECOMMENDED): Uses SGLang's native /release_memory_occupation
-    #                 to offload model weights + CUDA graphs to CPU before training.
-    #                 KV cache stays on GPU → prefix cache PRESERVED.
+    #                 to offload ALL GPU memory (weights + KV cache + CUDA graphs)
+    #                 to CPU before training. ALL GPUs are freed for training.
     #                 After training: /update_weights_from_disk reloads ALL weights
     #                 fresh from disk (NOT resume_memory_occupation which is broken
     #                 for MoE models — SGLang issue #6367). Then /load_lora_adapter
     #                 with the new LoRA checkpoint.
+    #                 NOTE: KV/radix cache is REBUILT (not preserved) because new
+    #                 weights invalidate all cached KV entries. Warmup requests
+    #                 repopulate the cache at the start of each inference phase.
     #                 Requires: --enable-memory-saver on server.
-    #                 Frees ~48GB (weights + CUDA graphs), keeps ~17GB (KV cache) on GPU.
-    #                 Training speed should match vLLM sleep_wake.
+    #                 Frees ALL GPU memory. Training speed matches vLLM sleep_wake.
     #   "freeze":     SIGSTOP the SGLang process group during training, SIGCONT after.
     #                 Suspends ALL threads → zero CPU/PCIe contention.
     #                 GPU memory stays allocated (model weights + KV cache on GPU 0).
@@ -166,6 +168,15 @@ class SGLangConfig:
     #                 Use only as fallback when freeze/hot_reload don't work.
     #   "sleep":      (DEPRECATED) Old custom launcher approach. Use "sleep_wake" instead.
     cache_method: SGLangCacheMethod = "freeze"
+    
+    # Performance optimization flags (passed to SGLang server CLI)
+    # These are critical for matching/beating vLLM throughput.
+    schedule_policy: str = "lpm"            # "lpm" (Longest Prefix Match) reorders for max cache hits
+    chunked_prefill_size: int | None = None  # Overlap prefill with decode (e.g. 8192). None = SGLang default.
+    enable_overlap_schedule: bool = False    # CPU scheduling parallel with GPU execution
+    enable_torch_compile: bool = False       # Compiled kernels for faster decode
+    cuda_graph_max_bs: int = 128            # CUDA graph max batch size
+    attention_backend: str = "flashinfer"   # Attention kernel backend
     
     def get_tensor_parallel_size(self) -> int:
         """Get tensor parallel size, auto-detecting if not set."""
@@ -192,6 +203,11 @@ class SGLangConfig:
         If training_gpu_ids is set, use those explicitly.
         Otherwise, auto-detect healthy GPUs not used by SGLang.
         Dead/stuck GPUs (high util, zero memory) are automatically excluded.
+        
+        NOTE: This always excludes SGLang GPUs because it's used as the
+        FALLBACK when GPU isolation is needed (e.g., sleep_wake release
+        failed). When sleep_wake succeeds, use_gpu_isolation=False bypasses
+        this entirely and Megatron uses torch.cuda.device_count() (ALL GPUs).
         """
         if self.training_gpu_ids is not None:
             # Warn if user explicitly picked a dead GPU
@@ -211,15 +227,27 @@ class SGLangConfig:
     def can_preserve_cache(self) -> bool:
         """Check if we can keep SGLang process alive during training.
         
-        Returns True for "sleep_wake", "sleep", "freeze", and "hot_reload" modes (all preserve cache).
+        Returns True for modes where the server PROCESS stays alive:
+        - "sleep_wake": process alive, but GPU memory fully released.
+          KV cache is NOT preserved (invalidated by weight reload).
+          However, the server doesn't need to be restarted.
+        - "sleep": (deprecated) process alive, weights offloaded to CPU.
+        - "freeze": process alive, GPU memory stays allocated. Cache preserved.
+        - "hot_reload": process alive and active. Cache preserved.
+        
         Returns False for "restart" (server is killed, cache lost).
         
-        Requires GPUs available for Megatron that aren't used by SGLang.
+        For freeze/hot_reload, requires GPUs available for Megatron that
+        aren't used by SGLang. For sleep_wake, all GPUs are available.
         """
         if not self.preserve_cache_during_training:
             return False
         if self.cache_method == "restart":
             return False
+        if self.cache_method == "sleep_wake":
+            # Sleep/wake keeps the server process alive but releases all GPU memory.
+            # All GPUs are available for training (no separate GPU requirement).
+            return True
         megatron_gpus = self.get_megatron_gpu_ids()
         return len(megatron_gpus) > 0
     
@@ -491,23 +519,25 @@ class SGLangMegatronService:
             "--enable-lora",
         ]
         
+        # Cache the --help output for flag validation (used here and below)
+        try:
+            self._sglang_help_output = subprocess.run(
+                [server_python, "-m", "sglang.launch_server", "--help"],
+                capture_output=True, text=True, timeout=15
+            ).stdout
+        except Exception:
+            self._sglang_help_output = ""
+        
         # For sleep_wake mode, try to enable native memory saver so we can
         # call /release_memory_occupation and /resume_memory_occupation.
         # NOTE: These flags may not exist in all SGLang versions (e.g. 0.5.8).
         # If the server fails to start, fall back to freeze mode.
         if self.sglang_config.cache_method == "sleep_wake":
-            # Validate --enable-memory-saver exists by checking sglang help output
+            # Validate --enable-memory-saver exists
             # NOTE: We do NOT need --enable-weights-cpu-backup because we use
             # /update_weights_from_disk to reload weights after training (not
             # resume_memory_occupation which is broken for MoE models).
-            try:
-                help_output = subprocess.run(
-                    [server_python, "-m", "sglang.launch_server", "--help"],
-                    capture_output=True, text=True, timeout=15
-                ).stdout
-                has_memory_saver = "--enable-memory-saver" in help_output
-            except Exception:
-                has_memory_saver = False
+            has_memory_saver = "--enable-memory-saver" in self._sglang_help_output
             
             if has_memory_saver:
                 cmd.extend(["--enable-memory-saver"])
@@ -523,17 +553,46 @@ class SGLangMegatronService:
             cmd.extend(["--tp-size", str(tp_size)])
             print(f"  Using tensor parallelism: TP={tp_size}")
         
-        # Performance optimizations for SGLang
-        # Tested various flags - minimal config performs best for RL workloads
-        # Removed: --schedule-conservativeness, --chunked-prefill-size
+        # Performance optimizations for SGLang (configurable via SGLangConfig)
         # Note: --enable-memory-saver is added above only for sleep_wake mode
+        #
+        # IMPORTANT: Not all flags exist in every SGLang version. We validate
+        # optional flags against --help output to avoid crashing the server.
+        # Only --schedule-policy, --cuda-graph-max-bs, and --attention-backend
+        # are safe to use unconditionally (present since SGLang 0.4+).
         
-        # 1. LPM (Longest Prefix Match) scheduler - reorders requests for prefix sharing
-        cmd.extend(["--schedule-policy", "lpm"])
+        # Reuse cached --help output for flag validation
+        _help = getattr(self, '_sglang_help_output', "")
+        
+        # 1. Scheduler policy — "lpm" (Longest Prefix Match) reorders requests to
+        #    maximize prefix cache hits (critical for RL workloads with shared prompts)
+        cmd.extend(["--schedule-policy", self.sglang_config.schedule_policy])
         
         # 2. CUDA graph and attention backend
-        cmd.extend(["--cuda-graph-max-bs", "128"])
-        cmd.extend(["--attention-backend", "flashinfer"])
+        cmd.extend(["--cuda-graph-max-bs", str(self.sglang_config.cuda_graph_max_bs)])
+        cmd.extend(["--attention-backend", self.sglang_config.attention_backend])
+        
+        # 3. Chunked prefill — overlap prefill with decode (improves TTFT)
+        #    WARNING: Can cause OOM on memory-constrained setups (see sglang_backend/service.py)
+        if self.sglang_config.chunked_prefill_size is not None:
+            if "--chunked-prefill-size" in _help:
+                cmd.extend(["--chunked-prefill-size", str(self.sglang_config.chunked_prefill_size)])
+            else:
+                print(f"  WARNING: --chunked-prefill-size not supported by this SGLang version, skipping")
+        
+        # 4. Overlap scheduling — CPU scheduling parallel with GPU execution
+        if self.sglang_config.enable_overlap_schedule:
+            if "--enable-overlap-schedule" in _help:
+                cmd.append("--enable-overlap-schedule")
+            else:
+                print(f"  WARNING: --enable-overlap-schedule not supported by this SGLang version, skipping")
+        
+        # 5. Torch compile — compiled kernels for faster decode
+        if self.sglang_config.enable_torch_compile:
+            if "--enable-torch-compile" in _help:
+                cmd.append("--enable-torch-compile")
+            else:
+                print(f"  WARNING: --enable-torch-compile not supported by this SGLang version, skipping")
         
         # Add context length if specified
         if self.sglang_config.context_length:
@@ -904,10 +963,17 @@ class SGLangMegatronService:
         Why update_weights_from_disk:
             - Reloads ALL weights fresh from disk, properly placing MoE expert layers
             - Bypasses the broken CPU backup restore entirely
-            - KV cache stays on GPU (prefix cache preserved)
             - Slightly slower than CPU→GPU copy (disk I/O) but actually works for MoE
-            - Still way faster than full server restart (no process spawn, no CUDA
-              graph recapture, no KV cache rebuild)
+            - Still faster than full server restart (no process spawn, no CUDA
+              graph recapture)
+            - KV/radix cache is INVALIDATED by new weights and rebuilt from scratch
+              (this is expected — same behavior as vLLM's sleep_wake level=2)
+        
+        Performance comparison vs vLLM do_wake_up():
+            - vLLM: CPU→GPU copy (~3-5s for 30B model) — weights cached in RAM
+            - SGLang: disk→GPU load (~8-15s for 30B model) — full reload from disk
+            - Both invalidate KV cache (new weights → stale KV entries)
+            - Net throughput difference is mainly in wake-up latency, not steady-state
         
         This pattern is used by veRL and Slime for the same reason.
         
@@ -1267,11 +1333,12 @@ class SGLangMegatronService:
         
         Cache methods:
         - "sleep_wake" (RECOMMENDED): Uses SGLang's native /release_memory_occupation
-              to offload weights + CUDA graphs to CPU. KV cache stays on GPU.
-              Server stays alive (idle) with GPU isolation — no SIGSTOP.
+              to offload ALL GPU memory (weights + KV cache + CUDA graphs) to CPU.
+              ALL GPUs freed for training (like vLLM sleep_wake).
               After training: /update_weights_from_disk (NOT resume_memory_occupation
               which is broken for MoE — issue #6367) → hot-reload LoRA.
-              Cache PRESERVED. Training speed matches vLLM sleep_wake.
+              Cache REBUILT (not preserved — new weights invalidate old KV entries).
+              Training speed matches vLLM sleep_wake.
         - "freeze": GPU isolation only — server stays alive and idle.
               GPU memory stays allocated (weights + KV cache on SGLang GPUs).
               Megatron trains on separate GPUs. Cache 100% preserved.
@@ -1310,27 +1377,33 @@ class SGLangMegatronService:
         
         # === PRE-TRAINING: Prepare GPU for Megatron ===
         _slept = False
-        _native_sleep_tags = ["weights", "cuda_graph"]  # Keep KV cache for prefix caching!
+        # Release ALL memory types including KV cache.
+        # Why not keep KV cache? Because update_weights_from_disk (called after
+        # training) reloads new weights which INVALIDATES all cached KV entries
+        # (computed with old weights). Keeping KV cache wastes ~17GB of GPU memory
+        # during training for a cache that will be flushed anyway.
+        _native_sleep_tags = ["weights", "kv_cache", "cuda_graph"]
         
         if strategy == "sleep_wake":
             sglang_gpus = set(self.sglang_config.get_sglang_gpu_ids())
             megatron_gpus = set(self.sglang_config.get_megatron_gpu_ids())
             gpus_overlap = bool(sglang_gpus & megatron_gpus)
             
-            print(f"[SGLang] Method: Sleep/Wake (cache PRESERVED)")
+            print(f"[SGLang] Method: Sleep/Wake (cache rebuilt after training)")
             print(f"  SGLang GPUs: {sorted(sglang_gpus)}")
             print(f"  Megatron GPUs: {sorted(megatron_gpus)}")
             print(f"  GPU overlap: {gpus_overlap}")
             
             if gpus_overlap:
-                # Same GPU(s) for inference + training: MUST offload weights to
-                # make room.  This path is risky for MoE models (server may crash
-                # when internal scheduler touches CPU-offloaded expert weights).
+                # Same GPU(s) for inference + training: MUST offload ALL memory
+                # (weights + KV cache + CUDA graphs) to free GPU for training.
+                # KV cache is released too because update_weights_from_disk will
+                # invalidate it anyway (new weights → stale KV values).
                 release_ok = await self._native_release_memory(tags=_native_sleep_tags)
                 if release_ok:
                     _slept = True
-                    print(f"  ✓ Weights + CUDA graphs offloaded to CPU (KV cache stays on GPU)")
-                    print(f"  Server idle with minimal GPU footprint")
+                    print(f"  ✓ All GPU memory released (weights + KV cache + CUDA graphs)")
+                    print(f"  Server idle, GPU fully free for training")
                 else:
                     print(f"  ⚠️ Native release_memory failed, falling back to restart")
                     strategy = "restart"
@@ -1338,13 +1411,20 @@ class SGLangMegatronService:
                     self._is_sleeping = True
                     gc_and_empty_cuda_cache()
             else:
-                # Separate GPUs: no need to offload. Server stays fully loaded
-                # on its own GPU(s), training runs on disjoint GPU(s).
-                # This avoids the MoE crash (SGLang issue #6367) entirely.
-                # KV cache + weights stay on GPU → cache PRESERVED, 0s overhead.
-                print(f"  ✓ Separate GPUs — skipping weight offload (no memory contention)")
-                print(f"  Server stays fully loaded, KV cache + weights on GPU")
-            use_gpu_isolation = True
+                # Separate GPUs: offload SGLang's GPU memory so training can also
+                # use those GPUs (like vLLM sleep_wake which frees ALL GPUs).
+                # Since update_weights_from_disk invalidates KV cache anyway,
+                # there's no benefit to keeping it alive.
+                release_ok = await self._native_release_memory(tags=_native_sleep_tags)
+                if release_ok:
+                    _slept = True
+                    print(f"  ✓ SGLang GPU memory released (training can use all GPUs)")
+                else:
+                    print(f"  ⚠️ release_memory failed on separate GPUs, continuing with isolation")
+                    print(f"  Server stays fully loaded, training uses non-SGLang GPUs only")
+            # When memory is released (_slept=True), allow training to use ALL GPUs
+            # (like vLLM sleep_wake). When not released, use GPU isolation.
+            use_gpu_isolation = not _slept
         elif strategy == "sleep":
             print(f"[SGLang] Method: Sleep (DEPRECATED — offload weights to CPU)")
             print(f"  SGLang GPUs: {self.sglang_config.get_sglang_gpu_ids()}")
@@ -1486,8 +1566,9 @@ class SGLangMegatronService:
             try:
                 if _slept and strategy == "sleep_wake":
                     # ──────────────────────────────────────────────────────────
-                    # SLEEP_WAKE resume: weights are on CPU after release_memory_occupation.
-                    # The server process IS alive but can't serve inference (weights on CPU),
+                    # SLEEP_WAKE resume: ALL memory was released (weights + KV cache
+                    # + CUDA graphs) via release_memory_occupation.
+                    # The server process IS alive but can't serve inference,
                     # so /health will return False. Do NOT health-check first!
                     #
                     # Correct order (veRL/Slime pattern for MoE):
@@ -1496,13 +1577,16 @@ class SGLangMegatronService:
                     #   2. Wait for server to become healthy (weights now on GPU)
                     #   3. load_lora_adapter → apply new LoRA checkpoint
                     #
-                    # KV cache stays on GPU the whole time → prefix cache PRESERVED.
+                    # NOTE: KV cache / radix cache is REBUILT from scratch after weight
+                    # reload. The old KV entries were computed with old weights and are
+                    # invalid. Warmup requests in the next iteration's batch will
+                    # repopulate the cache with fresh KV values.
                     # ──────────────────────────────────────────────────────────
                     print(f"[SGLang] Reloading base weights from disk (MoE-safe)...", flush=True)
                     reload_ok = await self._update_weights_from_disk()
                     if not reload_ok:
                         raise RuntimeError("update_weights_from_disk failed")
-                    print(f"  ✓ Base weights reloaded from disk", flush=True)
+                    print(f"  ✓ Base weights reloaded from disk (radix cache will rebuild)", flush=True)
                     
                     # Wait for server to become healthy after weight reload
                     print(f"[SGLang] Waiting for server to be healthy after weight reload...", flush=True)
@@ -1558,7 +1642,7 @@ class SGLangMegatronService:
                     _reload_method = f"{strategy}+update_weights_from_disk"
                 else:
                     _reload_method = "gpu_isolation+hot_reload"
-                print(f"[SGLang] ✓ Server resumed + LoRA reloaded (cache preserved)", flush=True)
+                print(f"[SGLang] ✓ Server resumed + LoRA reloaded (cache rebuilds on next inference)", flush=True)
                 
             except (asyncio.TimeoutError, Exception) as e:
                 print(f"[SGLang] ⚠️ Post-training reload failed: {e}", flush=True)

@@ -738,18 +738,55 @@ class BackendManager:
         ttft_ms = total_ms
         
         # Extract per-request cache info from response usage
-        # Both SGLang and vLLM return this in OpenAI-compatible format
+        # vLLM uses prompt_tokens_details.cached_tokens (OpenAI standard).
+        # SGLang may use different field names or not report at all.
         cache_info = {"prompt_tokens": 0, "cached_tokens": 0}
         if response.usage:
             cache_info["prompt_tokens"] = response.usage.prompt_tokens or 0
-            # Try prompt_tokens_details.cached_tokens (OpenAI standard field)
+            
+            # Method 1: OpenAI standard — prompt_tokens_details.cached_tokens (vLLM)
             if hasattr(response.usage, 'prompt_tokens_details') and response.usage.prompt_tokens_details:
                 details = response.usage.prompt_tokens_details
-                if hasattr(details, 'cached_tokens'):
-                    cache_info["cached_tokens"] = details.cached_tokens or 0
-            # Fallback: some SGLang versions put it directly in usage
+                if hasattr(details, 'cached_tokens') and details.cached_tokens:
+                    cache_info["cached_tokens"] = details.cached_tokens
+            
+            # Method 2: Direct field — some SGLang versions
             if cache_info["cached_tokens"] == 0 and hasattr(response.usage, 'cached_tokens'):
-                cache_info["cached_tokens"] = response.usage.cached_tokens or 0
+                ct = response.usage.cached_tokens
+                if ct:
+                    cache_info["cached_tokens"] = ct
+            
+            # Method 3: SGLang may report in completion_tokens_details or other fields
+            if cache_info["cached_tokens"] == 0:
+                # Try extra_body or additional fields that SGLang might set
+                for attr_name in ('completion_tokens_details', 'extra'):
+                    if hasattr(response.usage, attr_name):
+                        details = getattr(response.usage, attr_name)
+                        if details and hasattr(details, 'cached_tokens'):
+                            ct = getattr(details, 'cached_tokens', None)
+                            if ct:
+                                cache_info["cached_tokens"] = ct
+                                break
+                
+                # Method 4: Check raw dict representation (handles unknown fields)
+                if cache_info["cached_tokens"] == 0:
+                    try:
+                        usage_dict = response.usage.model_dump() if hasattr(response.usage, 'model_dump') else {}
+                        # Search recursively for cached_tokens in any nested structure
+                        def _find_cached(d):
+                            if isinstance(d, dict):
+                                if 'cached_tokens' in d and d['cached_tokens']:
+                                    return d['cached_tokens']
+                                for v in d.values():
+                                    result = _find_cached(v)
+                                    if result:
+                                        return result
+                            return None
+                        ct = _find_cached(usage_dict)
+                        if ct:
+                            cache_info["cached_tokens"] = ct
+                    except Exception:
+                        pass
         
         return choice, response_text, ttft_ms, total_ms, cache_info
     
@@ -854,46 +891,55 @@ class BackendManager:
     def _parse_sglang_prometheus_metrics(text: str) -> dict:
         """Parse SGLang's Prometheus metrics for cache hit information.
         
-        SGLang exposes various metrics. We look for cache-related counters
-        like sglang_cache_hit_rate, radix_cache_hit, etc.
+        SGLang exposes various metrics. We look for cache-related counters.
+        Known SGLang metric names across versions:
+        - sglang_cache_hit_rate (gauge, 0.0-1.0)
+        - sglang_radix_cache_hit_total / sglang_radix_cache_miss_total (counters)
+        - sglang_token_usage (gauge, tokens cached)
+        - sglang_cache_total_tokens / sglang_cache_used_tokens
+        - sglang:num_requests_running / sglang:num_requests_waiting
         """
         stats = {}
         for line in text.splitlines():
             if line.startswith("#"):
                 continue
-            # SGLang cache hit rate (direct gauge)
-            if "cache_hit_rate" in line and not line.startswith("#"):
-                try:
-                    val = float(line.split()[-1])
-                    stats["hit_rate"] = val
-                except (ValueError, IndexError):
-                    pass
-            # SGLang prefix match/cache tokens counters
-            if "cached_tokens" in line.lower() or "cache_hit" in line.lower():
-                try:
-                    parts = line.split()
-                    metric_name = parts[0]
-                    val = float(parts[-1])
-                    stats[metric_name] = val
-                except (ValueError, IndexError):
-                    pass
-            if "cache_miss" in line.lower():
-                try:
-                    parts = line.split()
-                    metric_name = parts[0]
-                    val = float(parts[-1])
-                    stats[metric_name] = val
-                except (ValueError, IndexError):
-                    pass
+            if not line.strip():
+                continue
+            
+            try:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                metric_name = parts[0]
+                val = float(parts[-1])
+            except (ValueError, IndexError):
+                continue
+            
+            # Direct cache hit rate (best signal)
+            if "cache_hit_rate" in metric_name.lower():
+                stats["hit_rate"] = val
+            
+            # Cache hit/miss counters (for computing hit rate)
+            if "cache_hit" in metric_name.lower() or "cached_tokens" in metric_name.lower():
+                stats[metric_name] = val
+            if "cache_miss" in metric_name.lower():
+                stats[metric_name] = val
+            
+            # Token-level stats
+            if "token_usage" in metric_name.lower():
+                stats[metric_name] = val
+            if "num_tokens" in metric_name.lower() and "cache" in metric_name.lower():
+                stats[metric_name] = val
         
         # If we found individual hit/miss counters but no hit_rate, compute it
-        hit_keys = [k for k in stats if "hit" in k.lower() and k != "hit_rate"]
-        miss_keys = [k for k in stats if "miss" in k.lower()]
-        if hit_keys and miss_keys and "hit_rate" not in stats:
-            total_hits = sum(stats[k] for k in hit_keys)
-            total_misses = sum(stats[k] for k in miss_keys)
-            if total_hits + total_misses > 0:
-                stats["hit_rate"] = total_hits / (total_hits + total_misses)
+        if "hit_rate" not in stats:
+            hit_keys = [k for k in stats if "hit" in k.lower() and k != "hit_rate"]
+            miss_keys = [k for k in stats if "miss" in k.lower()]
+            if hit_keys and miss_keys:
+                total_hits = sum(stats[k] for k in hit_keys)
+                total_misses = sum(stats[k] for k in miss_keys)
+                if total_hits + total_misses > 0:
+                    stats["hit_rate"] = total_hits / (total_hits + total_misses)
         
         return stats
     

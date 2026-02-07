@@ -115,6 +115,13 @@ class SGLangMegatronBackend(LocalBackend):
                 training_gpu_ids=self._sglang_config.get("training_gpu_ids"),  # None = auto (use non-SGLang GPUs)
                 # Cache method: "sleep_wake" (default) | "freeze" | "hot_reload" | "restart"
                 cache_method=self._sglang_config.get("cache_method", "freeze"),
+                # Performance optimization flags
+                schedule_policy=self._sglang_config.get("schedule_policy", "lpm"),
+                chunked_prefill_size=self._sglang_config.get("chunked_prefill_size"),
+                enable_overlap_schedule=self._sglang_config.get("enable_overlap_schedule", False),
+                enable_torch_compile=self._sglang_config.get("enable_torch_compile", False),
+                cuda_graph_max_bs=self._sglang_config.get("cuda_graph_max_bs", 128),
+                attention_backend=self._sglang_config.get("attention_backend", "flashinfer"),
             )
             
             self._services[model.name] = SGLangMegatronService(
