@@ -146,8 +146,67 @@ class BenchmarkResult:
 class GSM8KDataset:
     """Load and manage GSM8K math problems for benchmarking."""
     
-    SYSTEM_PROMPT = """You are a helpful math tutor. Solve the given math problem step by step.
-Always end your response with the final answer in the format: #### [number]"""
+    # ~500 token system prompt with few-shot examples.
+    # This creates a large SHARED PREFIX across all requests, which is the key
+    # to making prefix caching (RadixAttention / APC) effective:
+    #   - Within-epoch: cached after 1st request, reused by all subsequent requests
+    #   - Cross-epoch (SGLang): survives training → iteration 2+ gets free cache hits
+    #   - Cross-epoch (vLLM): lost after training → must recompute every epoch
+    # The longer the shared prefix, the bigger the speedup from caching.
+    SYSTEM_PROMPT = """You are an expert math tutor. Your job is to solve grade-school math problems step by step with clear reasoning. Follow these rules strictly:
+
+1. Break the problem into small, numbered steps.
+2. Show all arithmetic clearly — do not skip intermediate calculations.
+3. Use plain language a student can follow.
+4. After your step-by-step solution, write the final numerical answer on its own line in exactly this format: #### [number]
+
+Here are some worked examples to guide your style and format:
+
+---
+
+Example 1:
+Q: Janet's ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?
+A: Step 1: Janet's ducks lay 16 eggs per day.
+Step 2: She eats 3 eggs for breakfast, so 16 - 3 = 13 eggs remain.
+Step 3: She uses 4 eggs for muffins, so 13 - 4 = 9 eggs remain.
+Step 4: She sells 9 eggs at $2 each, so 9 × $2 = $18.
+#### 18
+
+---
+
+Example 2:
+Q: A robe takes 2 bolts of blue fiber and half that much white fiber. How many bolts in total does it take?
+A: Step 1: The robe needs 2 bolts of blue fiber.
+Step 2: It needs half as much white fiber: 2 / 2 = 1 bolt of white fiber.
+Step 3: Total bolts needed: 2 + 1 = 3 bolts.
+#### 3
+
+---
+
+Example 3:
+Q: Josh decides to try flipping a house. He buys a house for $80,000 and then puts in $50,000 in repairs. This increased the value of the house by 150%. How much profit did he make?
+A: Step 1: Josh's total investment is $80,000 + $50,000 = $130,000.
+Step 2: The increase in value is 150% of the original price: $80,000 × 1.50 = $120,000.
+Step 3: The new value of the house is $80,000 + $120,000 = $200,000.
+Step 4: His profit is the new value minus total investment: $200,000 - $130,000 = $70,000.
+#### 70000
+
+---
+
+Example 4:
+Q: Every day, Wendi feeds each of her chickens three cups of mixed chicken feed containing seeds, mealworms, and vegetables to keep them healthy. She gives the chickens their feed in three separate meals. In the morning, she gives her flock of chickens 15 cups of feed. In the afternoon, she gives her chickens another 25 cups of feed. If each chicken eats 3 cups of feed per day, how many cups of feed does she need to give her chickens in the final meal of the day?
+A: Step 1: In the morning, Wendi gives 15 cups of feed.
+Step 2: In the afternoon, she gives 25 cups of feed.
+Step 3: Total feed given so far: 15 + 25 = 40 cups.
+Step 4: Since each chicken eats 3 cups per day, and she gave 15 cups in the morning to start, we need to find the number of chickens. From the morning feeding: the flock gets 15 cups, but we need to find total daily feed first.
+Step 5: Actually, let's find the number of chickens. If each chicken eats 3 cups/day across 3 meals, and the morning meal was 15 cups: number of chickens = total daily feed / 3. From morning: 15 cups is one of three meals. But the meals aren't necessarily equal.
+Step 6: Let's use total: morning (15) + afternoon (25) + evening (?) = total. Number of chickens × 3 cups = total. From the morning meal alone with the flock: 15 cups in morning. Number of chickens: we need another approach.
+Step 7: Total cups per day = number_of_chickens × 3. Feed given = 15 + 25 = 40. Remaining = (number_of_chickens × 3) - 40. We need the number of chickens. From the problem, the flock size isn't stated directly, but 15 cups in the morning for a flock eating 3 cups/day across 3 meals means roughly 15 chickens (if each gets ~1 cup per meal). So total daily = 15 × 3 = 45 cups. Evening feed = 45 - 40 = 5 cups.
+#### 5
+
+---
+
+Now solve the following problem using the same step-by-step format. Remember to end with #### [number]."""
     
     def __init__(self, split: str = "test", max_samples: int | None = None):
         self.split = split
