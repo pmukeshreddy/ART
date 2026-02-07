@@ -508,7 +508,11 @@ class BackendManager:
     ):
         """
         Generate completion with logprobs for training.
-        Returns (Choice object, response_text, ttft_ms, total_latency_ms).
+        Returns (Choice object, response_text, ttft_ms, total_latency_ms, cache_info).
+        
+        cache_info is a dict with prompt_tokens and cached_tokens extracted from
+        the response usage field, enabling real counter-based cache hit measurement
+        for both SGLang and vLLM (same method, apples-to-apples comparison).
         
         The Choice object can be used directly in Trajectory for training.
         """
@@ -534,7 +538,21 @@ class BackendManager:
         # For non-streaming, TTFT ~= total time (first token comes with response)
         ttft_ms = total_ms
         
-        return choice, response_text, ttft_ms, total_ms
+        # Extract per-request cache info from response usage
+        # Both SGLang and vLLM return this in OpenAI-compatible format
+        cache_info = {"prompt_tokens": 0, "cached_tokens": 0}
+        if response.usage:
+            cache_info["prompt_tokens"] = response.usage.prompt_tokens or 0
+            # Try prompt_tokens_details.cached_tokens (OpenAI standard field)
+            if hasattr(response.usage, 'prompt_tokens_details') and response.usage.prompt_tokens_details:
+                details = response.usage.prompt_tokens_details
+                if hasattr(details, 'cached_tokens'):
+                    cache_info["cached_tokens"] = details.cached_tokens or 0
+            # Fallback: some SGLang versions put it directly in usage
+            if cache_info["cached_tokens"] == 0 and hasattr(response.usage, 'cached_tokens'):
+                cache_info["cached_tokens"] = response.usage.cached_tokens or 0
+        
+        return choice, response_text, ttft_ms, total_ms, cache_info
     
     async def generate_batch(
         self,
@@ -556,28 +574,60 @@ class BackendManager:
         return 0.0
     
     async def get_real_cache_stats(self) -> dict:
-        """Get actual cache statistics from the backend server."""
+        """Get actual cache statistics from the backend server.
+        
+        Uses Prometheus /metrics endpoint for BOTH backends to ensure
+        apples-to-apples comparison. Falls back to /get_server_info for SGLang.
+        """
         import aiohttp
         
+        host = self.service._server_host
+        port = self.service._server_port
+        
         if self.backend_type == "sglang":
-            # SGLang provides /get_server_info with radix cache stats
+            # Strategy 1: Try /metrics Prometheus endpoint (same method as vLLM)
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
-                        f"http://{self.service._server_host}:{self.service._server_port}/get_server_info",
+                        f"http://{host}:{port}/metrics",
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            stats = self._parse_sglang_prometheus_metrics(text)
+                            if "hit_rate" in stats:
+                                stats["source"] = "prometheus"
+                                return stats
+            except Exception:
+                pass
+            
+            # Strategy 2: Try /get_server_info radix_cache_stats
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"http://{host}:{port}/get_server_info",
                         timeout=aiohttp.ClientTimeout(total=5)
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            return data.get("radix_cache_stats", {})
+                            cache_stats = data.get("radix_cache_stats", {})
+                            if cache_stats:
+                                parsed = self._parse_sglang_server_info_cache(cache_stats)
+                                if "hit_rate" in parsed:
+                                    parsed["source"] = "server_info"
+                                    return parsed
+                                # Return raw stats even without hit_rate for debugging
+                                cache_stats["source"] = "server_info_raw"
+                                return cache_stats
             except Exception:
                 pass
+                
         elif self.backend_type == "vllm":
             # vLLM provides metrics endpoint (Prometheus format)
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
-                        f"http://{self.service._server_host}:{self.service._server_port}/metrics",
+                        f"http://{host}:{port}/metrics",
                         timeout=aiohttp.ClientTimeout(total=5)
                     ) as resp:
                         if resp.status == 200:
@@ -591,10 +641,96 @@ class BackendManager:
                                     miss_count = int(float(line.split()[-1]))
                             total = hit_count + miss_count
                             if total > 0:
-                                return {"hit_rate": hit_count / total}
+                                return {
+                                    "hit_rate": hit_count / total,
+                                    "hit_count": hit_count,
+                                    "miss_count": miss_count,
+                                    "source": "prometheus",
+                                }
             except Exception:
                 pass
         return {}
+    
+    @staticmethod
+    def _parse_sglang_prometheus_metrics(text: str) -> dict:
+        """Parse SGLang's Prometheus metrics for cache hit information.
+        
+        SGLang exposes various metrics. We look for cache-related counters
+        like sglang_cache_hit_rate, radix_cache_hit, etc.
+        """
+        stats = {}
+        for line in text.splitlines():
+            if line.startswith("#"):
+                continue
+            # SGLang cache hit rate (direct gauge)
+            if "cache_hit_rate" in line and not line.startswith("#"):
+                try:
+                    val = float(line.split()[-1])
+                    stats["hit_rate"] = val
+                except (ValueError, IndexError):
+                    pass
+            # SGLang prefix match/cache tokens counters
+            if "cached_tokens" in line.lower() or "cache_hit" in line.lower():
+                try:
+                    parts = line.split()
+                    metric_name = parts[0]
+                    val = float(parts[-1])
+                    stats[metric_name] = val
+                except (ValueError, IndexError):
+                    pass
+            if "cache_miss" in line.lower():
+                try:
+                    parts = line.split()
+                    metric_name = parts[0]
+                    val = float(parts[-1])
+                    stats[metric_name] = val
+                except (ValueError, IndexError):
+                    pass
+        
+        # If we found individual hit/miss counters but no hit_rate, compute it
+        hit_keys = [k for k in stats if "hit" in k.lower() and k != "hit_rate"]
+        miss_keys = [k for k in stats if "miss" in k.lower()]
+        if hit_keys and miss_keys and "hit_rate" not in stats:
+            total_hits = sum(stats[k] for k in hit_keys)
+            total_misses = sum(stats[k] for k in miss_keys)
+            if total_hits + total_misses > 0:
+                stats["hit_rate"] = total_hits / (total_hits + total_misses)
+        
+        return stats
+    
+    @staticmethod
+    def _parse_sglang_server_info_cache(cache_stats: dict) -> dict:
+        """Parse radix_cache_stats from SGLang's /get_server_info.
+        
+        Possible field names across SGLang versions:
+        - hit_rate (direct)
+        - total, hit, miss (counters)
+        - token_usage, total_token_num (capacity info)
+        """
+        result = {}
+        
+        # Direct hit_rate field
+        if "hit_rate" in cache_stats:
+            result["hit_rate"] = float(cache_stats["hit_rate"])
+            return result
+        
+        # Hit/miss counters
+        hits = cache_stats.get("hit", cache_stats.get("hits", cache_stats.get("hit_count", 0)))
+        misses = cache_stats.get("miss", cache_stats.get("misses", cache_stats.get("miss_count", 0)))
+        total = hits + misses
+        if total > 0:
+            result["hit_rate"] = hits / total
+            result["hit_count"] = hits
+            result["miss_count"] = misses
+            return result
+        
+        # Token-level stats
+        total_tokens = cache_stats.get("total_token_num", cache_stats.get("total_tokens", 0))
+        used_tokens = cache_stats.get("token_usage", cache_stats.get("used_tokens", 0))
+        if total_tokens > 0 and used_tokens > 0:
+            result["token_usage_rate"] = used_tokens / total_tokens
+        
+        return result
     
     async def measure_streaming_ttft(self, messages: list[dict], max_tokens: int = 256, num_probes: int = 5) -> float:
         """Measure actual TTFT using streaming requests.
@@ -1314,7 +1450,7 @@ class BenchmarkRunner:
                     prompt_idx, rollout_idx, messages, expected_answer = batch_metadata[idx]
                     
                     if use_training_gen:
-                        choice, response, ttft_ms, latency_ms = gen_result
+                        choice, response, ttft_ms, latency_ms, _cache_info = gen_result
                         reward = self.dataset.compute_reward(response, expected_answer)
                         
                         traj = Trajectory(
@@ -1481,6 +1617,10 @@ class BenchmarkRunner:
             sync_times = []
             losses = []
             all_ttft_values = []
+            # Per-request cache tracking (same method for both backends)
+            total_prompt_tokens = 0
+            total_cached_tokens = 0
+            per_iteration_cache_rates = []  # Track cache rate per iteration
             
             use_training_gen = self.enable_training
             gen_method = "generate_for_training" if use_training_gen else "generate"
@@ -1499,6 +1639,8 @@ class BenchmarkRunner:
                 # Build all tasks for batched execution
                 all_tasks = []
                 task_metadata = []  # Track (prompt_idx, rollout_idx, prompt, expected_answer)
+                iter_prompt_tokens = 0
+                iter_cached_tokens = 0
                 
                 for i, prompt in enumerate(prompts):
                     for rollout in range(self.num_rollouts):
@@ -1532,8 +1674,12 @@ class BenchmarkRunner:
                         prompt_idx, rollout_idx, messages, expected_answer = batch_metadata[idx]
                         
                         if use_training_gen:
-                            choice, response, ttft_ms, latency_ms = gen_result
+                            choice, response, ttft_ms, latency_ms, cache_info = gen_result
                             reward = self.dataset.compute_reward(response, expected_answer)
+                            
+                            # Accumulate per-request cache tokens
+                            iter_prompt_tokens += cache_info["prompt_tokens"]
+                            iter_cached_tokens += cache_info["cached_tokens"]
                             
                             from art.trajectories import Trajectory
                             traj = Trajectory(
@@ -1568,6 +1714,16 @@ class BenchmarkRunner:
                 inference_time = time.perf_counter() - inference_start
                 inference_times.append(inference_time)
                 all_ttft_values.extend(ttft_values)
+                
+                # Track per-iteration cache stats from response usage
+                total_prompt_tokens += iter_prompt_tokens
+                total_cached_tokens += iter_cached_tokens
+                if iter_prompt_tokens > 0:
+                    iter_cache_rate = iter_cached_tokens / iter_prompt_tokens
+                    per_iteration_cache_rates.append(iter_cache_rate)
+                    print(f"  Cache (from response): {iter_cache_rate:.2%} ({iter_cached_tokens}/{iter_prompt_tokens} tokens cached)")
+                else:
+                    per_iteration_cache_rates.append(0.0)
                 
                 # Phase 2: Training
                 training_start = time.perf_counter()
@@ -1652,22 +1808,38 @@ class BenchmarkRunner:
             result.inference_metrics.time_to_first_token_ms = sum(all_ttft_values) / len(all_ttft_values) if all_ttft_values else 0
             result.inference_metrics.total_requests = total_rollouts * self.num_iterations
             
-            # Get accurate cache hit rate: prefer real server stats > streaming TTFT > estimation
+            # === Cache Hit Rate (unified measurement for both backends) ===
+            # Priority 1: Per-request cached_tokens from response usage (same API, same metric)
+            # Priority 2: Server-side Prometheus/metrics counters
+            # Priority 3: TTFT estimation (last resort, clearly labeled)
             cache_hit_rate = 0.0
-            cache_stats = await manager.get_real_cache_stats()
-            if "hit_rate" in cache_stats:
-                cache_hit_rate = cache_stats["hit_rate"]
-                print(f"  Cache hit rate (from server): {cache_hit_rate:.2%}")
-            elif all_ttft_values:
-                # Fallback: use streaming TTFT if available, else estimate from non-streaming values
-                try:
-                    test_messages = [{"role": "user", "content": "Hello, how are you?"}]
-                    streaming_ttft = await manager.measure_streaming_ttft(test_messages, max_tokens=32, num_probes=3)
-                    if streaming_ttft > 0:
-                        print(f"  Streaming TTFT probe: {streaming_ttft:.1f}ms (for reference)")
-                except Exception:
-                    pass
-                cache_hit_rate = self._estimate_cache_hit_rate(all_ttft_values)
+            cache_source = "none"
+            
+            if total_prompt_tokens > 0:
+                # Priority 1: Per-request tracking from API response usage
+                # This is the SAME measurement for both SGLang and vLLM
+                cache_hit_rate = total_cached_tokens / total_prompt_tokens
+                cache_source = "per_request_usage"
+                print(f"\n  Cache stats (per-request, unified):")
+                print(f"    Total prompt tokens: {total_prompt_tokens:,}")
+                print(f"    Cached tokens:       {total_cached_tokens:,}")
+                print(f"    Cache hit rate:       {cache_hit_rate:.2%}")
+                if per_iteration_cache_rates:
+                    print(f"    Per-iteration rates:  {', '.join(f'{r:.1%}' for r in per_iteration_cache_rates)}")
+            
+            if cache_hit_rate == 0.0:
+                # Priority 2: Server-side counters (Prometheus /metrics or /get_server_info)
+                cache_stats = await manager.get_real_cache_stats()
+                if "hit_rate" in cache_stats:
+                    cache_hit_rate = cache_stats["hit_rate"]
+                    cache_source = f"server_{cache_stats.get('source', 'unknown')}"
+                    print(f"\n  Cache hit rate (from server {cache_source}): {cache_hit_rate:.2%}")
+                elif all_ttft_values:
+                    # Priority 3: TTFT estimation (fallback, clearly labeled as estimate)
+                    cache_hit_rate = self._estimate_cache_hit_rate(all_ttft_values)
+                    cache_source = "ttft_estimate"
+                    print(f"\n  Cache hit rate (TTFT estimate - less reliable): {cache_hit_rate:.2%}")
+            
             result.inference_metrics.prefix_cache_hit_rate = cache_hit_rate
             
             print(f"\nResults:")
@@ -1677,7 +1849,7 @@ class BenchmarkRunner:
             print(f"  Avg training time: {sum(training_times) / len(training_times):.2f}s")
             print(f"  Avg sync time: {sum(sync_times) / len(sync_times):.2f}s")
             print(f"  Training throughput: {samples_per_second:.2f} samples/s")
-            print(f"  Cache hit rate: {result.inference_metrics.prefix_cache_hit_rate:.2%}")
+            print(f"  Cache hit rate: {cache_hit_rate:.2%} (source: {cache_source})")
             if losses:
                 print(f"  Avg loss: {result.training_metrics.loss:.4f}")
             
