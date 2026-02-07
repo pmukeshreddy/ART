@@ -19,19 +19,28 @@ else
 fi
 export TORCH_CUDA_ARCH_LIST="9.0"
 # install missing cudnn headers & ninja build tools
-apt-get update
-apt-get install -y libcudnn9-headers-cuda-12 ninja-build
+# Use sudo if available (non-root environments like ubuntu user on cloud instances)
+if command -v sudo &>/dev/null && [ "$(id -u)" -ne 0 ]; then
+  sudo apt-get update -qq 2>/dev/null || true
+  sudo apt-get install -y -qq libcudnn9-headers-cuda-12 ninja-build 2>/dev/null || true
+else
+  apt-get update -qq 2>/dev/null || true
+  apt-get install -y -qq libcudnn9-headers-cuda-12 ninja-build 2>/dev/null || true
+fi
 # install apex
-if [ -d /root/apex ]; then
+# Use $HOME instead of /root for non-root users
+APEX_DIR="${HOME}/apex"
+if [ -d "$APEX_DIR" ]; then
   echo "apex directory already exists, skipping clone"
 else
-  git clone --depth 1 --branch 25.09 https://github.com/NVIDIA/apex.git /root/apex
+  git clone --depth 1 --branch 25.09 https://github.com/NVIDIA/apex.git "$APEX_DIR"
 fi
 # Patch Apex to skip CUDA version check — system nvcc may be 12.4 while
 # PyTorch was built with 12.8. This is a minor version mismatch within
 # CUDA 12.x and works fine at runtime (pip provides the 12.8 runtime libs).
 python3 -c "
-p = '/root/apex/setup.py'
+import os
+p = os.path.expanduser('${APEX_DIR}/setup.py')
 with open(p) as f: t = f.read()
 t = t.replace(
     'check_cuda_torch_binary_vs_bare_metal(CUDA_HOME)',
@@ -40,7 +49,7 @@ t = t.replace(
 with open(p, 'w') as f: f.write(t)
 print('Patched Apex setup.py to skip CUDA version check')
 "
-NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=16 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 APEX_FAST_LAYER_NORM=1 uv pip install --no-build-isolation /root/apex
+NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=16 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 APEX_FAST_LAYER_NORM=1 uv pip install --no-build-isolation "$APEX_DIR"
 # install flash attention
 # git clone https://github.com/Dao-AILab/flash-attention.git /root/flash-attention
 # (cd /root/flash-attention && git checkout 27f501d)
