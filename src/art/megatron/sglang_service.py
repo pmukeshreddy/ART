@@ -588,13 +588,30 @@ class SGLangMegatronService:
                 print(f"  WARNING: --enable-overlap-schedule not supported by this SGLang version, skipping")
         
         # 5. Torch compile — compiled kernels for faster decode
-        #    Incompatible flashinfer ops (fused_set_kv_buffer) are handled via
-        #    TORCHDYNAMO_SUPPRESS_ERRORS=1 (set in env above), which makes
-        #    torch.compile fall back to eager on those ops instead of crashing.
+        #    KNOWN INCOMPATIBILITY: torch.compile + flashinfer + CUDA graphs
+        #    crashes on MoE models (fused_set_kv_buffer_arg assertion in
+        #    rotary_embedding.forward_native during CUDA graph capture).
+        #    torch.compile falls back to forward_native which can't handle
+        #    flashinfer's fused KV buffer — this is a runtime assertion,
+        #    not a tracing error, so TORCHDYNAMO_SUPPRESS_ERRORS won't help.
+        #
+        #    Auto-detect: skip torch.compile when flashinfer + CUDA graphs
+        #    are both active (the common/optimal case). flashinfer already
+        #    provides hand-tuned CUDA kernels — torch.compile adds minimal
+        #    value on top of flashinfer + CUDA graphs.
         if self.sglang_config.enable_torch_compile:
-            if "--enable-torch-compile" in _help:
+            _flashinfer_active = self.sglang_config.attention_backend == "flashinfer"
+            _cuda_graphs_active = self.sglang_config.cuda_graph_max_bs > 0
+            
+            if _flashinfer_active and _cuda_graphs_active:
+                print(f"  torch.compile: SKIPPED (incompatible with flashinfer + CUDA graphs on MoE)")
+                print(f"  → flashinfer already provides optimized CUDA kernels")
+                print(f"  → CUDA graphs provide kernel replay optimization")
+                print(f"  → torch.compile would add <5% on top of these, not worth the crash risk")
+                print(f"  → To force: set attention_backend='triton' (loses flashinfer perf)")
+            elif "--enable-torch-compile" in _help:
                 cmd.append("--enable-torch-compile")
-                print(f"  torch.compile enabled (incompatible ops fall back to eager via TORCHDYNAMO_SUPPRESS_ERRORS)")
+                print(f"  torch.compile enabled (no flashinfer conflict)")
             else:
                 print(f"  WARNING: --enable-torch-compile not supported by this SGLang version, skipping")
         
@@ -730,14 +747,6 @@ class SGLangMegatronService:
         # 5. Set CUDA environment
         env["CUDA_HOME"] = "/usr/local/cuda"
         
-        # 6. torch.compile + flashinfer compatibility
-        #    torch.compile can't compile flashinfer's fused_set_kv_buffer ops,
-        #    causing AssertionError during CUDA graph capture on MoE models.
-        #    TORCHDYNAMO_SUPPRESS_ERRORS=1 makes torch.compile gracefully fall
-        #    back to eager mode on incompatible ops instead of crashing.
-        #    Result: compiled kernels where possible + flashinfer + CUDA graphs.
-        if self.sglang_config.enable_torch_compile:
-            env["TORCHDYNAMO_SUPPRESS_ERRORS"] = "1"
         # =====================================================================
         
         if self.sglang_config.can_preserve_cache():
