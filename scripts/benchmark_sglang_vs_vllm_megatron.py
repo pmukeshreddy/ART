@@ -325,6 +325,8 @@ class BackendManager:
         self.backend = SGLangMegatronBackend(
             path=str(self.work_dir),
             sglang_config=sglang_config,
+            in_process=True,  # Must be in-process: mp_actors can't proxy AsyncIterator
+                              # from service.train() across process boundary, causing hangs
         )
         
         # Create and register model
