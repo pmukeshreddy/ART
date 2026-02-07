@@ -1024,7 +1024,17 @@ class SGLangMegatronService:
             if os.path.isdir(p)
         )
 
+        # Kill ALL stale training processes — not just "megatron-service".
+        # torch.distributed.run spawns processes named "train.py" / "torchrun"
+        # that hold port 29500. If we only pkill "megatron-service", these
+        # survive and block the next run with EADDRINUSE.
         subprocess.run(["pkill", "-9", "megatron-service"], check=False)
+        subprocess.run(["pkill", "-9", "-f", "megatron/train.py"], check=False)
+        subprocess.run(["pkill", "-9", "-f", "torchrun"], check=False)
+        subprocess.run(["pkill", "-9", "-f", "torch.distributed.run"], check=False)
+        # Wait for ports (29500) to be released by the kernel
+        import time as _time_mod
+        _time_mod.sleep(1.0)
         train_script = Path(__file__).parent / "train.py"
 
         # Ensure GPUs are in DEFAULT compute mode (not EXCLUSIVE_PROCESS).
@@ -1144,16 +1154,22 @@ class SGLangMegatronService:
 
         cv = train_env.get("CUDA_VISIBLE_DEVICES", "(all)")
 
+        # Pick a random master port to avoid EADDRINUSE on 29500.
+        # Port 29500 is torch.distributed's default and stale processes
+        # or slow kernel cleanup can leave it bound for seconds.
+        import random
+        master_port = random.randint(29500, 29999)
+
         if need_setup:
             # First run: need setup.sh, must use shell
             setup_script = Path(__file__).parent / "setup.sh"
             command = (
                 f"bash {setup_script} && "
                 f"{sys.executable} -m torch.distributed.run "
-                f"--nproc_per_node {num_gpus} {train_script}"
+                f"--nproc_per_node {num_gpus} --master_port {master_port} {train_script}"
             )
             print(f"Starting Megatron training (with setup): {command}")
-            print(f"  CUDA_VISIBLE_DEVICES={cv}")
+            print(f"  CUDA_VISIBLE_DEVICES={cv}, master_port={master_port}")
             self._megatron_process = await asyncio.create_subprocess_shell(
                 command, env=train_env,
             )
@@ -1162,10 +1178,12 @@ class SGLangMegatronService:
             # reliable way to ensure CUDA_VISIBLE_DEVICES propagates.
             args = [
                 sys.executable, "-m", "torch.distributed.run",
-                "--nproc_per_node", str(num_gpus), str(train_script),
+                "--nproc_per_node", str(num_gpus),
+                "--master_port", str(master_port),
+                str(train_script),
             ]
             print(f"Starting Megatron training: {' '.join(args)}")
-            print(f"  CUDA_VISIBLE_DEVICES={cv}")
+            print(f"  CUDA_VISIBLE_DEVICES={cv}, master_port={master_port}")
             self._megatron_process = await asyncio.create_subprocess_exec(
                 *args, env=train_env,
             )
