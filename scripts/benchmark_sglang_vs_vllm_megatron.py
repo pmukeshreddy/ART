@@ -149,9 +149,10 @@ class GSM8KDataset:
     # ~500 token system prompt with few-shot examples.
     # This creates a large SHARED PREFIX across all requests, which is the key
     # to making prefix caching (RadixAttention / APC) effective:
-    #   - Within-epoch: cached after 1st request, reused by all subsequent requests
-    #   - Cross-epoch (SGLang): survives training → iteration 2+ gets free cache hits
-    #   - Cross-epoch (vLLM): lost after training → must recompute every epoch
+    #   - Within-epoch: cached after 1st request (or warmup), reused by all batches
+    #   - Cross-epoch: cache is INVALIDATED after training (LoRA weights change →
+    #     all cached KV values are stale). The warmup_prefix_cache() method re-populates
+    #     the cache after each training step so the next epoch starts warm.
     # The longer the shared prefix, the bigger the speedup from caching.
     SYSTEM_PROMPT = """You are an expert math tutor. Your job is to solve grade-school math problems step by step with clear reasoning. Follow these rules strictly:
 
@@ -960,6 +961,58 @@ class BackendManager:
         if ttft_values:
             return sum(ttft_values) / len(ttft_values)
         return 0.0
+    
+    async def warmup_prefix_cache(self, dataset: 'GSM8KDataset') -> float:
+        """Pre-populate prefix cache with shared prefixes after training.
+        
+        After training, the KV cache is invalidated (LoRA weights changed), so
+        all requests start cold. This method sends lightweight warmup requests
+        that compute ONLY the shared prefixes (system prompt + category prefixes),
+        populating the cache BEFORE the real inference batch.
+        
+        Why this matters:
+        - Without warmup: all 32 requests in the first batch arrive simultaneously
+          via asyncio.gather. Each computes the 500-token system prompt independently
+          because the cache is cold → wasted compute.
+        - With warmup: system prompt + category branches are already cached.
+          All 32+ requests hit warm cache immediately → faster inference.
+        
+        Returns the warmup time in seconds.
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+        
+        # Build warmup messages: system prompt + each category prefix
+        # These are the exact prefixes that real requests will share
+        warmup_messages = []
+        
+        # One warmup per category branch (system_prompt + category_prefix)
+        for category, prefix_text in dataset.CATEGORY_PREFIXES.items():
+            user_content = f"{prefix_text}\n\nQuestion: What is 1+1?"  # Minimal question
+            warmup_messages.append([
+                {"role": "system", "content": dataset.SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ])
+        
+        # Send all warmup requests concurrently with max_tokens=1 (just prefill)
+        warmup_tasks = [
+            self.client.chat.completions.create(
+                model=self.model_name,
+                messages=msgs,
+                max_tokens=1,  # We only need prefill, not generation
+                temperature=0.0,
+            )
+            for msgs in warmup_messages
+        ]
+        
+        try:
+            await asyncio.gather(*warmup_tasks)
+        except Exception as e:
+            print(f"  ⚠️ Cache warmup partially failed: {e}")
+        
+        elapsed = _time.perf_counter() - t0
+        print(f"  ✓ Cache warmup: {len(warmup_messages)} prefixes pre-cached in {elapsed:.2f}s")
+        return elapsed
     
     async def cleanup(self):
         """Cleanup backend resources."""
@@ -1824,6 +1877,13 @@ class BenchmarkRunner:
             gen_method = "generate_for_training" if use_training_gen else "generate"
             batch_size = self.batch_size
             
+            # Initial cache warmup: pre-populate shared prefixes before first iteration.
+            # This ensures even iteration 1's batch gets warm cache hits on the
+            # 500-token system prompt + category prefixes.
+            if self.preserve_cache:
+                print("\n--- Initial cache warmup ---")
+                await manager.warmup_prefix_cache(self.dataset)
+            
             for iteration in range(self.num_iterations):
                 print(f"\n--- Iteration {iteration + 1}/{self.num_iterations} [mode: {gen_method}, batch={batch_size}] ---")
                 iter_start = time.perf_counter()
@@ -1983,6 +2043,17 @@ class BenchmarkRunner:
                 sync_time = time.perf_counter() - sync_start
                 sync_times.append(sync_time)
                 
+                # Phase 4: Cache warmup — pre-populate shared prefixes for next iteration
+                # After training, KV cache is invalidated (LoRA weights changed).
+                # Sending warmup requests populates the cache with the shared system
+                # prompt + category prefixes computed with the NEW weights. This ensures
+                # all requests in the next iteration's batch hit warm cache immediately.
+                if self.enable_training and self.preserve_cache:
+                    warmup_time = await manager.warmup_prefix_cache(self.dataset)
+                    # Count warmup time as part of sync (it's a post-training overhead)
+                    sync_time += warmup_time
+                    sync_times[-1] = sync_time
+                
                 iter_time = time.perf_counter() - iter_start
                 iteration_times.append(iter_time)
                 
@@ -2050,6 +2121,16 @@ class BenchmarkRunner:
             print(f"  Cache hit rate: {cache_hit_rate:.2%} (source: {cache_source})")
             if losses:
                 print(f"  Avg loss: {result.training_metrics.loss:.4f}")
+            
+            # Per-iteration breakdown — shows whether inference improves with warmup
+            if len(inference_times) > 1:
+                print(f"\n  Per-iteration inference times:")
+                for i, (inf_t, cache_r) in enumerate(zip(inference_times, per_iteration_cache_rates)):
+                    marker = " ← cold start" if i == 0 and not self.preserve_cache else ""
+                    print(f"    Iter {i+1}: {inf_t:.2f}s (cache: {cache_r:.1%}){marker}")
+                if inference_times[0] > 0:
+                    speedup = (inference_times[0] - inference_times[-1]) / inference_times[0] * 100
+                    print(f"  Inference speedup (iter 1 → {len(inference_times)}): {speedup:+.1f}%")
             
         finally:
             await manager.cleanup()
