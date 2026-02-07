@@ -157,7 +157,8 @@ class LoRA(torch.nn.Module):
                 return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
             tmp = grouped_gemm_util.ops.gmm(x, self.A_T, bsz, trans_b=False)  # type: ignore[attr-defined]
             out = grouped_gemm_util.ops.gmm(tmp, self.B_T, bsz, trans_b=False)  # type: ignore[attr-defined]
-            return out * self.scale
+            del tmp  # Free intermediate activation before allocating scaled output
+            return out.mul_(self.scale)
         else:
             return ((x @ self.A_T) @ self.B_T) * self.scale
 
