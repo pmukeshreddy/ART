@@ -204,10 +204,10 @@ class SGLangConfig:
         Otherwise, auto-detect healthy GPUs not used by SGLang.
         Dead/stuck GPUs (high util, zero memory) are automatically excluded.
         
-        NOTE: This always excludes SGLang GPUs because it's used as the
-        FALLBACK when GPU isolation is needed (e.g., sleep_wake release
-        failed). When sleep_wake succeeds, use_gpu_isolation=False bypasses
-        this entirely and Megatron uses torch.cuda.device_count() (ALL GPUs).
+        NOTE: This always excludes SGLang GPUs to protect the sleeping
+        server process (its CUDA context is still alive on GPU 0 even after
+        release_memory_occupation). We need the server alive for
+        update_weights_from_disk after training completes.
         """
         if self.training_gpu_ids is not None:
             # Warn if user explicitly picked a dead GPU
@@ -1447,9 +1447,18 @@ class SGLangMegatronService:
                 else:
                     print(f"  ⚠️ release_memory failed on separate GPUs, continuing with isolation")
                     print(f"  Server stays fully loaded, training uses non-SGLang GPUs only")
-            # When memory is released (_slept=True), allow training to use ALL GPUs
-            # (like vLLM sleep_wake). When not released, use GPU isolation.
-            use_gpu_isolation = not _slept
+            # When memory is released (_slept=True), the SGLang PROCESS is still
+            # alive with a CUDA context on its GPU(s). If Megatron also uses those
+            # GPUs, the sleeping process can crash from CUDA errors / OOM.
+            #
+            # If the user explicitly set training_gpu_ids, respect that.
+            # Otherwise, STILL isolate to non-SGLang GPUs to protect the sleeping
+            # server (we need it alive for update_weights_from_disk after training).
+            if _slept and self.sglang_config.training_gpu_ids is None:
+                # Auto-isolate: train on all GPUs EXCEPT SGLang's
+                use_gpu_isolation = True
+            else:
+                use_gpu_isolation = not _slept
         elif strategy == "sleep":
             print(f"[SGLang] Method: Sleep (DEPRECATED — offload weights to CPU)")
             print(f"  SGLang GPUs: {self.sglang_config.get_sglang_gpu_ids()}")
