@@ -17,7 +17,7 @@ else
   echo "WARNING: No CUDA toolkit found at /usr/local/cuda*"
   echo "  Trying to use nvcc from PATH..."
 fi
-export TORCH_CUDA_ARCH_LIST="8.0"
+export TORCH_CUDA_ARCH_LIST="9.0"
 
 export NVTE_CUDA_ARCHS="80"
 
