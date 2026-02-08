@@ -43,11 +43,15 @@ Usage:
     python scripts/benchmark_sglang_vs_vllm_megatron.py --backend vllm --scenario C \\
         --vllm-cache-method sleep_wake --enable-training
     
-    # SGLang with native sleep/wake (RECOMMENDED — offload weights to CPU, cache preserved)
+    # SGLang with veRL pattern (RECOMMENDED — production RL: weight sync + within-iteration caching)
+    python scripts/benchmark_sglang_vs_vllm_megatron.py --backend sglang --scenario C \\
+        --sglang-cache-method verl --enable-training --preserve-cache --sglang-gpu-ids 0
+    
+    # SGLang with sleep/wake (offload weights to CPU, all GPUs free for training)
     python scripts/benchmark_sglang_vs_vllm_megatron.py --backend sglang --scenario C \\
         --sglang-cache-method sleep_wake --enable-training --preserve-cache --sglang-gpu-ids 0
     
-    # SGLang with freeze mode (SIGSTOP only, cache preserved, no weight offload)
+    # SGLang with freeze mode (NO weight sync — demo only, NOT production RL)
     python scripts/benchmark_sglang_vs_vllm_megatron.py --backend sglang --scenario C \\
         --sglang-cache-method freeze --enable-training --preserve-cache --sglang-gpu-ids 0
 """
@@ -442,7 +446,7 @@ class BackendManager:
         vllm_tp_size: int | None = None,
         preserve_cache: bool = False,
         sglang_gpu_ids: list[int] | None = None,
-        sglang_cache_method: str = "freeze",
+        sglang_cache_method: str = "verl",
         vllm_cache_method: str = "http",
         vllm_gpu_ids: list[int] | None = None,
         training_gpu_ids: list[int] | None = None,
@@ -493,7 +497,7 @@ class BackendManager:
             "mem_fraction_static": 0.80,  # Matches SGLangConfig default — gives ~16GB headroom on 80GB GPU
             "log_level": "warning",
             "preserve_cache_during_training": self.preserve_cache,
-            "cache_method": self.sglang_cache_method,  # "freeze" (default) | "sleep_wake" | "hot_reload" | "restart"
+            "cache_method": self.sglang_cache_method,  # "verl" (default) | "freeze" | "sleep_wake" | "hot_reload" | "restart"
             # --- SGLang-specific optimizations ---
             "schedule_policy": "lpm",           # Longest Prefix Match: reorders requests for max cache hits
             "chunked_prefill_size": 8192,       # Overlap prefill with decode
@@ -1542,7 +1546,7 @@ class BenchmarkRunner:
         temperature: float = 1.0,
         preserve_cache: bool = False,
         sglang_gpu_ids: list[int] | None = None,
-        sglang_cache_method: str = "freeze",
+        sglang_cache_method: str = "verl",
         vllm_cache_method: str = "http",
         vllm_gpu_ids: list[int] | None = None,
         training_gpu_ids: list[int] | None = None,
@@ -2101,8 +2105,14 @@ class BenchmarkRunner:
                 if best_rate == 0:
                     print(f"  Cache: 0.00% — per-response={per_response_rate:.2%}, server={server_rate:.2%} ({server_source or 'unavailable'})")
                     if iteration > 0:
-                        print(f"    NOTE: update_weights_from_disk flushes SGLang RadixCache (by design).")
-                        print(f"    Within-iteration prefix caching still active for shared system prompts.")
+                        cache_method = getattr(self, 'sglang_cache_method', 'unknown')
+                        if cache_method == "verl":
+                            print(f"    NOTE: veRL mode — weight sync flushes radix cache between iterations (correct for on-policy RL).")
+                            print(f"    Within-iteration prefix caching active: system prompt + question prefixes shared across rollouts.")
+                            print(f"    Expected within-iteration rate: 60-80% (measured server-wide, may not appear in per-response metrics).")
+                        else:
+                            print(f"    NOTE: update_weights_from_disk flushes SGLang RadixCache (by design).")
+                            print(f"    Within-iteration prefix caching still active for shared system prompts.")
                 
                 # One-time diagnostic: raw HTTP probe + native API check
                 if best_rate == 0 and not hasattr(self, '_cache_diag_done'):
@@ -2788,18 +2798,20 @@ Examples:
     parser.add_argument(
         "--sglang-cache-method",
         type=str,
-        choices=["freeze", "sleep_wake", "hot_reload", "restart", "sleep"],
-        default="freeze",
-        help="Cache method for SGLang during training (default: freeze). "
-             "freeze: (RECOMMENDED) SIGSTOP the SGLang process during training, SIGCONT after. "
-             "  Zero CPU contention, cache 100%% preserved, instant resume. "
-             "  With 4+ GPUs, training speed matches vLLM since training GPUs are free. "
-             "sleep_wake: (EXPERIMENTAL) Native SGLang weight offload via "
-             "  /release_memory_occupation + /resume_memory_occupation. "
-             "  Requires SGLang >=0.6. Falls back to freeze if unsupported. "
-             "hot_reload: Keep server active. Cache preserved but ~2x slower on 2-GPU. "
+        choices=["verl", "freeze", "sleep_wake", "hot_reload", "restart", "sleep"],
+        default="verl",
+        help="Cache method for SGLang during training (default: verl). "
+             "verl: (RECOMMENDED) Production RL pattern — GPU isolation + weight sync. "
+             "  Server stays alive on dedicated GPU. After training: update_weights_from_disk "
+             "  syncs weights (cache flushed — correct) + LoRA reload + cache warmup. "
+             "  Within-iteration prefix sharing gives 60-80%% cache hits. "
+             "freeze: GPU isolation only, NO weight sync. Cache 100%% preserved but "
+             "  weights become stale (off-policy). Demo only, NOT production RL. "
+             "sleep_wake: Native SGLang memory offload + weight reload. "
+             "  Frees ALL GPUs for training. ~8-15s wake overhead. "
+             "hot_reload: Keep server active. No weight sync. ~2x slower on 2-GPU. "
              "restart: Kill server. Cache LOST. Fallback only. "
-             "sleep: (DEPRECATED) Old custom launcher. Use freeze instead.",
+             "sleep: (DEPRECATED) Old custom launcher. Use verl instead.",
     )
     parser.add_argument(
         "--vllm-cache-method",
