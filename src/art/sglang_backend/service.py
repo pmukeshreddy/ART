@@ -1739,7 +1739,31 @@ class SGLangMegatronService:
                         raise RuntimeError("Server not healthy after update_weights_from_disk")
                     print(f"  ✓ Server healthy", flush=True)
                     
-                    # Step 3: Hot-reload LoRA
+                    # Step 3: Unload existing LoRA adapter before loading new one
+                    lora_name = self._get_fixed_lora_name()
+                    print(f"[SGLang] Unloading old LoRA '{lora_name}' before reload...", flush=True)
+                    unloaded = False
+                    async with aiohttp.ClientSession() as session:
+                        for endpoint in ("/unload_lora_adapter", "/delete_lora_adapter"):
+                            try:
+                                async with session.post(
+                                    f"http://{self._server_host}:{self._server_port}{endpoint}",
+                                    json={"lora_name": lora_name},
+                                    timeout=aiohttp.ClientTimeout(total=10)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        print(f"  ✓ Unloaded old LoRA via {endpoint}", flush=True)
+                                        unloaded = True
+                                        break
+                                    else:
+                                        resp_text = await resp.text()
+                                        print(f"  {endpoint} returned {resp.status}: {resp_text}", flush=True)
+                            except Exception as e:
+                                print(f"  {endpoint} failed: {e}", flush=True)
+                    if not unloaded:
+                        print(f"  ⚠️ Could not unload old LoRA (may not exist yet — first iteration)", flush=True)
+                    
+                    # Step 4: Hot-reload LoRA with new checkpoint
                     print(f"[SGLang] Hot-reloading LoRA for step {next_step}...", flush=True)
                     await asyncio.wait_for(
                         self._hot_reload_lora(new_checkpoint_dir, next_step),
