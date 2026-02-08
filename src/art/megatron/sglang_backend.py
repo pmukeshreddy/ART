@@ -113,8 +113,8 @@ class SGLangMegatronBackend(LocalBackend):
                 preserve_cache_during_training=self._sglang_config.get("preserve_cache_during_training", True),
                 sglang_gpu_ids=self._sglang_config.get("sglang_gpu_ids"),  # None = auto
                 training_gpu_ids=self._sglang_config.get("training_gpu_ids"),  # None = auto (use non-SGLang GPUs)
-                # Cache method: "sleep_wake" (default) | "freeze" | "hot_reload" | "restart"
-                cache_method=self._sglang_config.get("cache_method", "freeze"),
+                # Cache method: "verl" (default) | "freeze" | "sleep_wake" | "hot_reload" | "restart"
+                cache_method=self._sglang_config.get("cache_method", "verl"),
                 # Performance optimization flags
                 schedule_policy=self._sglang_config.get("schedule_policy", "lpm"),
                 chunked_prefill_size=self._sglang_config.get("chunked_prefill_size"),
