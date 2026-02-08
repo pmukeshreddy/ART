@@ -473,6 +473,11 @@ class BackendManager:
         # vLLM AsyncLLM instance for sleep/wake operations
         self._vllm_engine = None
         self._is_sleeping = False
+        
+        # vLLM prometheus counter snapshots for per-iteration delta computation.
+        # Without this, cumulative counters inflate the hit rate over time.
+        self._prev_vllm_hits: int = 0
+        self._prev_vllm_queries: int = 0
     
     async def initialize(self):
         """Initialize the backend."""
@@ -505,9 +510,12 @@ class BackendManager:
             "enable_torch_compile": True,       # Auto-skipped when flashinfer + CUDA graphs active (incompatible on MoE)
         }
         
-        # Set tensor parallelism for SGLang (for fair comparison with vLLM)
+        # Set tensor parallelism for SGLang
         if self.vllm_tp_size is not None and not self.preserve_cache:
             sglang_config["tensor_parallel_size"] = self.vllm_tp_size
+        elif not self.preserve_cache:
+            # Auto-detect: use all available GPUs
+            sglang_config["tensor_parallel_size"] = torch.cuda.device_count() or 1
         
         # Configure GPU isolation for cache preservation
         if self.preserve_cache:
@@ -557,14 +565,13 @@ class BackendManager:
             from art import TrainableModel
             import torch
             
-            # Use specified TP size or default to 1 for fair comparison with SGLang
-            # SGLang uses GPU 0 for inference, rest for training
-            # For fair comparison, vLLM should also use limited GPUs for inference
+            # Use specified TP size or auto-detect from available GPUs.
+            # vLLM inference uses ALL GPUs via tensor parallelism (same as
+            # ART's MegatronService which auto-detects via torch.cuda.device_count).
             if self.vllm_tp_size is not None:
                 tp_size = self.vllm_tp_size
             else:
-                # Default to 1 GPU for fair comparison with SGLang
-                tp_size = 1
+                tp_size = torch.cuda.device_count() or 1
             
             available_gpus = torch.cuda.device_count() or 1
             if tp_size > available_gpus:
@@ -613,11 +620,16 @@ class BackendManager:
                 in_process=self.in_process,
             )
             
-            # Create and register model
+            # Create and register model with auto-detected TP
             model_obj = TrainableModel(
                 name=f"benchmark-{self.backend_type}",
                 base_model=self.model,
                 project="benchmark",
+                _internal_config={
+                    "engine_args": {
+                        "tensor_parallel_size": tp_size,
+                    }
+                },
             )
             await self.backend.register(model_obj)
             
@@ -894,11 +906,10 @@ class BackendManager:
                 
         elif self.backend_type == "vllm":
             # vLLM v1 provides metrics endpoint (Prometheus format)
-            # Metric names changed across versions:
-            #   v0: vllm:gpu_prefix_cache_hit_rate (gauge, 0-1)
-            #   v1: vllm:prefix_cache_hits / vllm:prefix_cache_queries (counters)
-            #   v1: vllm:gpu_prefix_cache_hits / vllm:gpu_prefix_cache_queries (counters)
-            # Note: Prometheus text format uses the colon in metric names
+            # IMPORTANT: vLLM exposes CUMULATIVE counters (monotonically increasing).
+            # We track snapshots and compute deltas so each call returns the
+            # per-iteration rate, not the cumulative rate since server start.
+            # This makes the metric comparable with SGLang's instantaneous gauge.
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
@@ -907,25 +918,25 @@ class BackendManager:
                     ) as resp:
                         if resp.status == 200:
                             text = await resp.text()
-                            hits = 0
-                            queries = 0
+                            cum_hits = 0
+                            cum_queries = 0
                             hit_rate_gauge = -1.0
                             for line in text.splitlines():
                                 if line.startswith("#"):
                                     continue
                                 # v1 counters (preferred)
                                 if "prefix_cache_hits" in line and "gpu_prefix_cache_hits" not in line:
-                                    try: hits = max(hits, int(float(line.split()[-1])))
+                                    try: cum_hits = max(cum_hits, int(float(line.split()[-1])))
                                     except: pass
                                 elif "prefix_cache_queries" in line and "gpu_prefix_cache_queries" not in line:
-                                    try: queries = max(queries, int(float(line.split()[-1])))
+                                    try: cum_queries = max(cum_queries, int(float(line.split()[-1])))
                                     except: pass
                                 # GPU-specific counters
                                 elif "gpu_prefix_cache_hits" in line:
-                                    try: hits = max(hits, int(float(line.split()[-1])))
+                                    try: cum_hits = max(cum_hits, int(float(line.split()[-1])))
                                     except: pass
                                 elif "gpu_prefix_cache_queries" in line:
-                                    try: queries = max(queries, int(float(line.split()[-1])))
+                                    try: cum_queries = max(cum_queries, int(float(line.split()[-1])))
                                     except: pass
                                 # v0 deprecated gauge (fallback)
                                 elif "gpu_prefix_cache_hit_rate" in line:
@@ -933,20 +944,41 @@ class BackendManager:
                                     except: pass
                                 # Legacy names (underscore separator)
                                 elif line.startswith("vllm_prefix_cache_hit_count"):
-                                    try: hits = max(hits, int(float(line.split()[-1])))
+                                    try: cum_hits = max(cum_hits, int(float(line.split()[-1])))
                                     except: pass
                                 elif line.startswith("vllm_prefix_cache_miss_count"):
                                     try:
                                         miss = int(float(line.split()[-1]))
-                                        queries = max(queries, hits + miss)
+                                        cum_queries = max(cum_queries, cum_hits + miss)
                                     except: pass
                             
-                            if queries > 0:
+                            if cum_queries > 0:
+                                # Compute delta since last snapshot
+                                delta_hits = cum_hits - self._prev_vllm_hits
+                                delta_queries = cum_queries - self._prev_vllm_queries
+                                
+                                # Guard: if counters went backwards (server restarted), use raw values
+                                if delta_hits < 0 or delta_queries < 0:
+                                    delta_hits = cum_hits
+                                    delta_queries = cum_queries
+                                
+                                # Update snapshot for next call
+                                self._prev_vllm_hits = cum_hits
+                                self._prev_vllm_queries = cum_queries
+                                
+                                if delta_queries > 0:
+                                    hit_rate = delta_hits / delta_queries
+                                else:
+                                    # No new queries since last call, return cumulative as fallback
+                                    hit_rate = cum_hits / cum_queries
+                                
                                 return {
-                                    "hit_rate": hits / queries,
-                                    "hit_count": hits,
-                                    "miss_count": queries - hits,
-                                    "source": "prometheus",
+                                    "hit_rate": hit_rate,
+                                    "hit_count": delta_hits,
+                                    "miss_count": delta_queries - delta_hits,
+                                    "cum_hits": cum_hits,
+                                    "cum_queries": cum_queries,
+                                    "source": "prometheus_delta",
                                 }
                             elif hit_rate_gauge >= 0:
                                 return {
@@ -2001,6 +2033,13 @@ class BenchmarkRunner:
             if self.preserve_cache:
                 print("\n--- Initial cache warmup ---")
                 await manager.warmup_prefix_cache(self.dataset)
+                # Snapshot prometheus counters after warmup so iteration 1
+                # delta doesn't include warmup-only hits
+                if self.backend_type == "vllm":
+                    try:
+                        _ = await manager.get_real_cache_stats()
+                    except Exception:
+                        pass
             
             for iteration in range(self.num_iterations):
                 print(f"\n--- Iteration {iteration + 1}/{self.num_iterations} [mode: {gen_method}, batch={batch_size}] ---")
@@ -2008,6 +2047,16 @@ class BenchmarkRunner:
                 
                 # Phase 1: Generate rollouts (with batching support)
                 inference_start = time.perf_counter()
+                
+                # Snapshot vLLM prometheus counters before inference so the
+                # post-inference delta covers ONLY this iteration's requests
+                # (excludes between-iteration warmup hits)
+                if self.backend_type == "vllm":
+                    try:
+                        _ = await manager.get_real_cache_stats()
+                    except Exception:
+                        pass
+                
                 trajectories = []  # For training: list of Trajectory objects
                 trajectory_dicts = []  # For metrics
                 ttft_values = []
@@ -2139,7 +2188,8 @@ class BenchmarkRunner:
                 if per_response_rate > 0:
                     print(f"  Cache (from response): {per_response_rate:.2%} ({iter_cached_tokens}/{iter_prompt_tokens} tokens cached)")
                 if server_rate > 0:
-                    print(f"  Cache (from server {server_source}): {server_rate:.2%}")
+                    granularity = "token-level" if self.backend_type == "sglang" else "block-level (~16 tok)"
+                    print(f"  Cache (from server {server_source}, {granularity}): {server_rate:.2%}")
                 if best_rate == 0:
                     print(f"  Cache: 0.00% — per-response={per_response_rate:.2%}, server={server_rate:.2%} ({server_source or 'unavailable'})")
                     if iteration > 0:
@@ -2336,17 +2386,24 @@ class BenchmarkRunner:
                     print(f"    Per-iteration rates:  {', '.join(f'{r:.1%}' for r in per_iteration_cache_rates)}")
             
             if cache_hit_rate == 0.0:
-                # Priority 2: Server-side counters (Prometheus /metrics or /get_server_info)
-                cache_stats = await manager.get_real_cache_stats()
-                if "hit_rate" in cache_stats:
-                    cache_hit_rate = cache_stats["hit_rate"]
-                    cache_source = f"server_{cache_stats.get('source', 'unknown')}"
-                    print(f"\n  Cache hit rate (from server {cache_source}): {cache_hit_rate:.2%}")
-                elif all_ttft_values:
-                    # Priority 3: TTFT estimation (fallback, clearly labeled as estimate)
-                    cache_hit_rate = self._estimate_cache_hit_rate(all_ttft_values)
-                    cache_source = "ttft_estimate"
-                    print(f"\n  Cache hit rate (TTFT estimate - less reliable): {cache_hit_rate:.2%}")
+                # Priority 2: Use averaged per-iteration rates if available
+                # (these were already collected with proper deltas during the loop)
+                if per_iteration_cache_rates and any(r > 0 for r in per_iteration_cache_rates):
+                    cache_hit_rate = sum(per_iteration_cache_rates) / len(per_iteration_cache_rates)
+                    cache_source = "avg_per_iteration"
+                    print(f"\n  Cache hit rate (avg of per-iteration): {cache_hit_rate:.2%}")
+                    print(f"    Per-iteration rates: {', '.join(f'{r:.1%}' for r in per_iteration_cache_rates)}")
+                else:
+                    # Priority 3: One-shot server query (last resort)
+                    cache_stats = await manager.get_real_cache_stats()
+                    if "hit_rate" in cache_stats:
+                        cache_hit_rate = cache_stats["hit_rate"]
+                        cache_source = f"server_{cache_stats.get('source', 'unknown')}"
+                        print(f"\n  Cache hit rate (from server {cache_source}): {cache_hit_rate:.2%}")
+                    elif all_ttft_values:
+                        cache_hit_rate = self._estimate_cache_hit_rate(all_ttft_values)
+                        cache_source = "ttft_estimate"
+                        print(f"\n  Cache hit rate (TTFT estimate, less reliable): {cache_hit_rate:.2%}")
             
             result.inference_metrics.prefix_cache_hit_rate = cache_hit_rate
             
@@ -2793,7 +2850,7 @@ Examples:
         "--vllm-tp-size",
         type=int,
         default=None,
-        help="Tensor parallel size for vLLM (default: 1 for fair comparison with SGLang)",
+        help="Tensor parallel size for vLLM (default: auto-detect from available GPUs)",
     )
     parser.add_argument(
         "--enable-training",
@@ -2920,6 +2977,8 @@ Examples:
     print(f"CUDA devices: {torch.cuda.device_count()}")
     if args.vllm_tp_size:
         print(f"vLLM TP size: {args.vllm_tp_size}")
+    else:
+        print(f"vLLM TP size: auto ({torch.cuda.device_count()} GPUs detected)")
     if args.enable_training:
         print(f"Training: ENABLED (lr={args.learning_rate})")
     else:
