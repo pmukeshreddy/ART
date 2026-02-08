@@ -739,24 +739,54 @@ class BackendManager:
         
         # Extract per-request cache info from response usage
         # vLLM uses prompt_tokens_details.cached_tokens (OpenAI standard).
-        # SGLang may use different field names or not report at all.
+        # SGLang uses the same field BUT requires --enable-cache-report on server.
+        # The OpenAI Python client may strip unknown fields via Pydantic, so we
+        # also check model_extra and the raw dict representation.
         cache_info = {"prompt_tokens": 0, "cached_tokens": 0}
         if response.usage:
             cache_info["prompt_tokens"] = response.usage.prompt_tokens or 0
             
-            # Method 1: OpenAI standard — prompt_tokens_details.cached_tokens (vLLM)
+            # Debug: print raw usage on first request to diagnose cache reporting
+            if not hasattr(self, '_cache_debug_printed'):
+                self._cache_debug_printed = True
+                try:
+                    usage_dict = response.usage.model_dump() if hasattr(response.usage, 'model_dump') else vars(response.usage)
+                    print(f"\n  [DEBUG] Raw usage dict from {self.backend_type}: {usage_dict}")
+                    # Also check model_extra for fields Pydantic didn't parse
+                    if hasattr(response.usage, 'model_extra') and response.usage.model_extra:
+                        print(f"  [DEBUG] model_extra: {response.usage.model_extra}")
+                    # Check response-level extra fields too
+                    if hasattr(response, 'model_extra') and response.model_extra:
+                        print(f"  [DEBUG] Response model_extra: {response.model_extra}")
+                except Exception as e:
+                    print(f"  [DEBUG] Could not dump usage: {e}")
+            
+            # Method 1: OpenAI standard — prompt_tokens_details.cached_tokens (vLLM & SGLang with --enable-cache-report)
             if hasattr(response.usage, 'prompt_tokens_details') and response.usage.prompt_tokens_details:
                 details = response.usage.prompt_tokens_details
                 if hasattr(details, 'cached_tokens') and details.cached_tokens:
                     cache_info["cached_tokens"] = details.cached_tokens
             
-            # Method 2: Direct field — some SGLang versions
+            # Method 2: Direct field — some SGLang versions put cached_tokens at top level of usage
             if cache_info["cached_tokens"] == 0 and hasattr(response.usage, 'cached_tokens'):
                 ct = response.usage.cached_tokens
                 if ct:
                     cache_info["cached_tokens"] = ct
             
-            # Method 3: SGLang may report in completion_tokens_details or other fields
+            # Method 3: Check model_extra (Pydantic v2 stores unrecognized fields here)
+            if cache_info["cached_tokens"] == 0 and hasattr(response.usage, 'model_extra') and response.usage.model_extra:
+                extra = response.usage.model_extra
+                if isinstance(extra, dict):
+                    # SGLang may put cached_tokens directly in extra
+                    if 'cached_tokens' in extra and extra['cached_tokens']:
+                        cache_info["cached_tokens"] = extra['cached_tokens']
+                    # Or inside prompt_tokens_details in extra
+                    elif 'prompt_tokens_details' in extra:
+                        ptd = extra['prompt_tokens_details']
+                        if isinstance(ptd, dict) and ptd.get('cached_tokens'):
+                            cache_info["cached_tokens"] = ptd['cached_tokens']
+            
+            # Method 4: SGLang may report in completion_tokens_details or other fields
             if cache_info["cached_tokens"] == 0:
                 # Try extra_body or additional fields that SGLang might set
                 for attr_name in ('completion_tokens_details', 'extra'):
@@ -768,7 +798,7 @@ class BackendManager:
                                 cache_info["cached_tokens"] = ct
                                 break
                 
-                # Method 4: Check raw dict representation (handles unknown fields)
+                # Method 5: Check raw dict representation (handles unknown fields)
                 if cache_info["cached_tokens"] == 0:
                     try:
                         usage_dict = response.usage.model_dump() if hasattr(response.usage, 'model_dump') else {}
@@ -2019,15 +2049,130 @@ class BenchmarkRunner:
                 inference_times.append(inference_time)
                 all_ttft_values.extend(ttft_values)
                 
-                # Track per-iteration cache stats from response usage
+                # =========================================================
+                # Cache hit rate measurement — multi-source approach
+                # =========================================================
+                # Source 1: Per-response cached_tokens (from OpenAI client)
+                #   - Requires --enable-cache-report on SGLang server
+                #   - May be stripped by OpenAI Python client Pydantic model
+                # Source 2: Prometheus /metrics endpoint (most reliable)
+                #   - Requires --enable-metrics on SGLang server (already enabled)
+                #   - Reports server-wide aggregate cache_hit_rate
+                # Source 3: Raw HTTP to /v1/chat/completions (bypasses OpenAI client)
+                #   - Diagnostic: shows exact JSON SGLang returns
+                # Source 4: SGLang native /generate API (always has cached_tokens)
+                # =========================================================
+                
                 total_prompt_tokens += iter_prompt_tokens
                 total_cached_tokens += iter_cached_tokens
-                if iter_prompt_tokens > 0:
-                    iter_cache_rate = iter_cached_tokens / iter_prompt_tokens
-                    per_iteration_cache_rates.append(iter_cache_rate)
-                    print(f"  Cache (from response): {iter_cache_rate:.2%} ({iter_cached_tokens}/{iter_prompt_tokens} tokens cached)")
+                
+                # Per-response rate (may be 0 if --enable-cache-report not on server)
+                per_response_rate = iter_cached_tokens / iter_prompt_tokens if iter_prompt_tokens > 0 else 0.0
+                
+                # Always query Prometheus metrics (most reliable source)
+                server_rate = 0.0
+                server_source = ""
+                try:
+                    server_cache = await manager.get_real_cache_stats()
+                    if server_cache:
+                        server_rate = server_cache.get("hit_rate", 0.0)
+                        server_source = server_cache.get("source", "unknown")
+                except Exception:
+                    pass
+                
+                # Use best available rate
+                if per_response_rate > 0:
+                    best_rate = per_response_rate
+                    best_source = "response"
+                elif server_rate > 0:
+                    best_rate = server_rate
+                    best_source = server_source
                 else:
-                    per_iteration_cache_rates.append(0.0)
+                    best_rate = 0.0
+                    best_source = "none"
+                
+                per_iteration_cache_rates.append(best_rate)
+                
+                # Print cache info
+                if per_response_rate > 0:
+                    print(f"  Cache (from response): {per_response_rate:.2%} ({iter_cached_tokens}/{iter_prompt_tokens} tokens cached)")
+                if server_rate > 0:
+                    print(f"  Cache (from server {server_source}): {server_rate:.2%}")
+                if best_rate == 0:
+                    print(f"  Cache: 0.00% — per-response={per_response_rate:.2%}, server={server_rate:.2%} ({server_source or 'unavailable'})")
+                    if iteration > 0:
+                        print(f"    NOTE: update_weights_from_disk flushes SGLang RadixCache (by design).")
+                        print(f"    Within-iteration prefix caching still active for shared system prompts.")
+                
+                # One-time diagnostic: raw HTTP probe + native API check
+                if best_rate == 0 and not hasattr(self, '_cache_diag_done'):
+                    self._cache_diag_done = True
+                    try:
+                        import aiohttp
+                        host = manager.service._server_host
+                        port = manager.service._server_port
+                        
+                        # Probe 1: Raw HTTP to OpenAI-compatible endpoint
+                        probe_messages = prompts[0]["messages"] if prompts else None
+                        if probe_messages:
+                            payload = {
+                                "model": manager.model_name,
+                                "messages": probe_messages,
+                                "max_tokens": 8,
+                                "temperature": 0.0,
+                            }
+                            async with aiohttp.ClientSession() as session:
+                                # First call — primes cache
+                                async with session.post(
+                                    f"http://{host}:{port}/v1/chat/completions",
+                                    json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=30)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        raw1 = await resp.json()
+                                        u1 = raw1.get("usage", {})
+                                        print(f"  [DIAG] 1st call usage: {u1}")
+                                
+                                # Second call — same prompt, should hit cache
+                                async with session.post(
+                                    f"http://{host}:{port}/v1/chat/completions",
+                                    json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=30)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        raw2 = await resp.json()
+                                        u2 = raw2.get("usage", {})
+                                        print(f"  [DIAG] 2nd call usage (should show cached): {u2}")
+                                
+                                # Probe 2: SGLang native /generate endpoint (always reports cached_tokens)
+                                native_payload = {
+                                    "text": "What is 2+2?",
+                                    "sampling_params": {"max_new_tokens": 8, "temperature": 0.0},
+                                }
+                                async with session.post(
+                                    f"http://{host}:{port}/generate",
+                                    json=native_payload,
+                                    timeout=aiohttp.ClientTimeout(total=30)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        native_resp = await resp.json()
+                                        meta = native_resp.get("meta_info", {})
+                                        print(f"  [DIAG] Native API meta_info: cached_tokens={meta.get('cached_tokens', 'N/A')}, prompt_tokens={meta.get('prompt_tokens', 'N/A')}")
+                                
+                                # Probe 3: Check /get_server_info for enable_cache_report status
+                                async with session.get(
+                                    f"http://{host}:{port}/get_server_info",
+                                    timeout=aiohttp.ClientTimeout(total=5)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        info = await resp.json()
+                                        ecr = info.get("enable_cache_report", "NOT_FOUND")
+                                        em = info.get("enable_metrics", "NOT_FOUND")
+                                        drc = info.get("disable_radix_cache", "NOT_FOUND")
+                                        sp = info.get("schedule_policy", "N/A")
+                                        print(f"  [DIAG] Server config: enable_cache_report={ecr}, enable_metrics={em}, disable_radix_cache={drc}, schedule_policy={sp}")
+                    except Exception as e:
+                        print(f"  [DIAG] Cache diagnostic failed: {e}")
                 
                 # Phase 2: Training
                 training_start = time.perf_counter()
