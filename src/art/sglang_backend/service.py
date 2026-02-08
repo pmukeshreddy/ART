@@ -1974,9 +1974,6 @@ class SGLangMegatronService:
         for key, tensors in sharded_tensors.items():
             if len(tensors) == 1:
                 adapter_model[key] = tensors[0]
-            elif len(tensors) > 1 and torch.equal(tensors[0], tensors[1]):
-                # Duplicate: unsharded param saved by multiple TP ranks.
-                adapter_model[key] = tensors[0]
             else:
                 tensor = torch.cat(tensors, dim=1 if "lora_A" in key else 0)
                 adapter_model[key] = tensor
