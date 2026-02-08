@@ -122,6 +122,7 @@ class SGLangMegatronBackend(LocalBackend):
                 enable_torch_compile=self._sglang_config.get("enable_torch_compile", False),
                 cuda_graph_max_bs=self._sglang_config.get("cuda_graph_max_bs", 128),
                 attention_backend=self._sglang_config.get("attention_backend", "flashinfer"),
+                enable_cache_report=self._sglang_config.get("enable_cache_report", True),
             )
             
             self._services[model.name] = SGLangMegatronService(
