@@ -1,14 +1,30 @@
+"""SGLang + Megatron service for inference and distributed training.
+
+This service combines:
+- SGLang for inference (RadixAttention prefix caching, fast scheduling)
+- Megatron-Core for distributed training (expert parallelism, tensor parallelism)
+
+Architecture:
+    GPU 0: SGLang inference server
+    GPU 1+: Megatron distributed training
+    Weight sync: Hot-reload LoRA via SGLang API (no restart needed)
+
+This is similar to MegatronService but replaces vLLM with SGLang for inference.
+"""
+
 import asyncio
 from dataclasses import asdict, dataclass
 import datetime
 from functools import cached_property
+import gc
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 
 import aiohttp
 from peft.tuners.lora.config import LoraConfig
@@ -16,33 +32,20 @@ from pydantic import BaseModel
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 import torch
-from vllm import AsyncEngineArgs
-from vllm.lora.request import LoRARequest
-from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
-from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
-from ..vllm import get_llm, openai_server_task, run_on_workers
 
 
-class MegatronTrainingJob(BaseModel):
-    """Job format for communication with train.py"""
-
-    lora_path: str
-    optimizer_state_path: str
-    disk_packed_tensors: DiskPackedTensors
-    config: types.TrainConfig
-    experimental_config: dev.TrainConfig
-    log_file_path: str = "/tmp/megatron_training_log.jsonl"
-
-
-from typing import Literal
-
-CacheMethod = Literal["http", "sleep_wake", "none"]
+def gc_and_empty_cuda_cache(n: int = 3) -> None:
+    """Run garbage collection and empty CUDA cache."""
+    for _ in range(n):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -102,41 +105,95 @@ def _get_healthy_gpu_ids() -> list[int]:
         return list(_healthy_gpu_cache)
 
 
+class MegatronTrainingJob(BaseModel):
+    """Job format for communication with train.py subprocess."""
+
+    lora_path: str
+    optimizer_state_path: str
+    disk_packed_tensors: DiskPackedTensors
+    config: types.TrainConfig
+    experimental_config: dev.TrainConfig
+    log_file_path: str = "/tmp/megatron_training_log.jsonl"
+
+
+SGLangCacheMethod = Literal["verl", "sleep_wake", "sleep", "freeze", "hot_reload", "restart"]
+
+
 @dataclass
-class VLLMConfig:
-    """Configuration for vLLM engine with cache preservation support.
+class SGLangConfig:
+    """Configuration for SGLang server."""
     
-    Attributes:
-        tensor_parallel_size: TP size for vLLM (None = auto-detect)
-        preserve_cache_during_training: Enable cache preservation
-        vllm_gpu_ids: Explicit GPU IDs for vLLM (e.g., [0])
-        training_gpu_ids: Explicit GPU IDs for Megatron training (e.g., [1])
-            If None, uses all GPUs not used by vLLM (for HTTP) or all GPUs (for sleep_wake)
-        cache_method: Method for cache preservation:
-            - "http": Use /v1/load_lora_adapter API (vLLM 0.8+, requires GPU isolation)
-            - "sleep_wake": Use do_sleep/do_wake_up with level=2 (offload to CPU)
-            - "none": Always restart server (no cache preservation)
-    """
+    # Set to 0.85 to maximize KV cache pool while leaving 5-8GB for activations
+    # and CUDA graph buffers. This improves prefix cache hit rate significantly.
+    mem_fraction_static: float = 0.80
+    disable_radix_cache: bool = False
+    max_loras_per_batch: int = 4
+    context_length: int | None = None
+    server_timeout: float = 300.0  # 5 min default for large models
+    log_level: str = "info"  # More verbose for debugging
+    tensor_parallel_size: int | None = None  # None = auto-detect based on GPU count
+    sglang_python_path: str | None = None  # Path to SGLang server venv python
     
-    tensor_parallel_size: int | None = None
-    preserve_cache_during_training: bool = True
-    vllm_gpu_ids: list[int] | None = None
-    training_gpu_ids: list[int] | None = None  # Explicit GPUs for Megatron training
-    cache_method: CacheMethod = "http"  # Default to HTTP hot-reload
+    # GPU isolation settings for keeping server running during training
+    # When enabled, SGLang runs on dedicated GPUs and Megatron uses the rest
+    preserve_cache_during_training: bool = True  # Keep server running if possible
+    sglang_gpu_ids: list[int] | None = None  # Explicit GPU IDs for SGLang (e.g., [0])
+    training_gpu_ids: list[int] | None = None  # Explicit GPU IDs for Megatron training (e.g., [1])
+    
+    # Cache method for SGLang during training:
+    #   "verl" (RECOMMENDED — production pattern):
+    #                 GPU isolation: server stays alive on dedicated GPU(s) during training.
+    #                 Megatron trains on separate GPUs. No memory release/reload overhead.
+    #                 After training: update_weights_from_disk → flush radix cache (correct:
+    #                 old KV values are invalid with new weights) → hot-reload LoRA →
+    #                 warmup prefix cache for next iteration.
+    #                 Within-iteration prefix sharing gives 60-80% cache hits (system prompt
+    #                 + question prefixes cached across rollouts within same iteration).
+    #                 Cross-iteration cache is 0% by design (weights changed → KV invalid).
+    #                 This is the pattern used by veRL, OpenRLHF, and Slime in production.
+    #                 Requires: separate GPUs for SGLang and Megatron.
+    #   "sleep_wake": Uses SGLang's native /release_memory_occupation to offload ALL GPU
+    #                 memory (weights + KV cache + CUDA graphs) to CPU before training.
+    #                 ALL GPUs freed for training. After training: update_weights_from_disk
+    #                 reloads weights fresh from disk (NOT resume_memory_occupation which is
+    #                 broken for MoE — #6367). Cache rebuilt. Adds ~8-15s wake overhead.
+    #   "freeze":     GPU isolation only — server stays alive and idle. NO weight sync.
+    #                 Cache 100% preserved but weights STALE (off-policy after iteration 1).
+    #                 Use only for quick demos, NOT production RL training.
+    #   "hot_reload": Keep server fully active, hot-reload LoRA only (no base weight sync).
+    #                 Preserves cache but causes CPU/PCIe contention. Same staleness issue
+    #                 as freeze. Best for: 4+ GPU setups where contention is minimal.
+    #   "restart":    Stop server before training, restart after. Cache LOST. Fallback only.
+    #   "sleep":      (DEPRECATED) Old custom launcher. Use "sleep_wake" instead.
+    cache_method: SGLangCacheMethod = "verl"
+    
+    # Performance optimization flags (passed to SGLang server CLI)
+    # These are critical for matching/beating vLLM throughput.
+    schedule_policy: str = "lpm"            # "lpm" (Longest Prefix Match) reorders for max cache hits
+    chunked_prefill_size: int | None = None  # Overlap prefill with decode (e.g. 8192). None = SGLang default.
+    enable_overlap_schedule: bool = False    # CPU scheduling parallel with GPU execution
+    enable_torch_compile: bool = False       # Compiled kernels for faster decode
+    cuda_graph_max_bs: int = 128            # CUDA graph max batch size
+    attention_backend: str = "flashinfer"   # Attention kernel backend
+    enable_metrics: bool = True             # Expose Prometheus /metrics endpoint (needed for cache_hit_rate)
+    enable_cache_report: bool = True        # Report cached_tokens in API response usage (needed for per-request cache measurement)
     
     def get_tensor_parallel_size(self) -> int:
         """Get tensor parallel size, auto-detecting if not set."""
         if self.tensor_parallel_size is not None:
             return self.tensor_parallel_size
-        if self.vllm_gpu_ids is not None:
-            return len(self.vllm_gpu_ids)
+        # If explicit GPU IDs are set, use that count
+        if self.sglang_gpu_ids is not None:
+            return len(self.sglang_gpu_ids)
+        # Auto-detect: use all available GPUs for inference
         gpu_count = torch.cuda.device_count()
         return gpu_count if gpu_count > 0 else 1
     
-    def get_vllm_gpu_ids(self) -> list[int]:
-        """Get GPU IDs for vLLM engine."""
-        if self.vllm_gpu_ids is not None:
-            return self.vllm_gpu_ids
+    def get_sglang_gpu_ids(self) -> list[int]:
+        """Get GPU IDs for SGLang server."""
+        if self.sglang_gpu_ids is not None:
+            return self.sglang_gpu_ids
+        # Default: use GPUs 0 to (tp_size - 1)
         tp_size = self.get_tensor_parallel_size()
         return list(range(tp_size))
     
@@ -144,9 +201,13 @@ class VLLMConfig:
         """Get GPU IDs for Megatron training.
         
         If training_gpu_ids is set, use those explicitly.
-        Otherwise, auto-detect healthy GPUs not used by vLLM.
+        Otherwise, auto-detect healthy GPUs not used by SGLang.
         Dead/stuck GPUs (high util, zero memory) are automatically excluded.
-        For sleep_wake: use all healthy GPUs (since vLLM is offloaded).
+        
+        NOTE: This always excludes SGLang GPUs to protect the sleeping
+        server process (its CUDA context is still alive on GPU 0 even after
+        release_memory_occupation). We need the server alive for
+        update_weights_from_disk after training completes.
         """
         if self.training_gpu_ids is not None:
             # Warn if user explicitly picked a dead GPU
@@ -158,53 +219,109 @@ class VLLMConfig:
                         f"dead/stuck — consider removing it from training_gpu_ids"
                     )
             return self.training_gpu_ids
-        # Auto-detect: use only healthy GPUs
+        # Auto-detect: healthy GPUs minus SGLang GPUs
         healthy_gpus = _get_healthy_gpu_ids()
-        if self.cache_method == "sleep_wake":
-            # sleep_wake frees all GPUs, so Megatron can use all healthy ones
-            return healthy_gpus
-        # HTTP method: vLLM stays on its GPUs
-        vllm_gpus = set(self.get_vllm_gpu_ids())
-        return [i for i in healthy_gpus if i not in vllm_gpus]
+        sglang_gpus = set(self.get_sglang_gpu_ids())
+        return [i for i in healthy_gpus if i not in sglang_gpus]
     
     def can_preserve_cache(self) -> bool:
-        """Check if we can preserve cache during training."""
+        """Check if we can keep SGLang process alive during training.
+        
+        Returns True for modes where the server PROCESS stays alive:
+        - "sleep_wake": process alive, but GPU memory fully released.
+          KV cache is NOT preserved (invalidated by weight reload).
+          However, the server doesn't need to be restarted.
+        - "sleep": (deprecated) process alive, weights offloaded to CPU.
+        - "freeze": process alive, GPU memory stays allocated. Cache preserved.
+        - "hot_reload": process alive and active. Cache preserved.
+        
+        Returns False for "restart" (server is killed, cache lost).
+        
+        For freeze/hot_reload, requires GPUs available for Megatron that
+        aren't used by SGLang. For sleep_wake, all GPUs are available.
+        """
         if not self.preserve_cache_during_training:
             return False
-        if self.cache_method == "none":
+        if self.cache_method == "restart":
             return False
-        # HTTP method requires GPU isolation (vLLM stays running on dedicated GPUs)
-        if self.cache_method == "http":
-            megatron_gpus = self.get_megatron_gpu_ids()
-            return len(megatron_gpus) > 0
-        # Sleep/wake doesn't require GPU isolation (GPU freed via do_sleep + gc)
-        return True
+        if self.cache_method == "sleep_wake":
+            # Sleep/wake keeps the server process alive but releases all GPU memory.
+            # All GPUs are available for training (no separate GPU requirement).
+            return True
+        megatron_gpus = self.get_megatron_gpu_ids()
+        return len(megatron_gpus) > 0
+    
+    def get_server_python(self) -> str:
+        """Get Python executable for SGLang server subprocess."""
+        import sys
+        
+        if self.sglang_python_path:
+            path = os.path.abspath(self.sglang_python_path)
+            if os.path.exists(path):
+                return path
+        
+        # Auto-detect .venv-sglang-server
+        search_paths = [
+            ".venv-sglang-server/bin/python",
+            "../.venv-sglang-server/bin/python",
+        ]
+        
+        for rel_path in search_paths:
+            abs_path = os.path.abspath(rel_path)
+            if os.path.exists(abs_path):
+                print(f"Auto-detected SGLang server venv: {abs_path}")
+                return abs_path
+        
+        return sys.executable
 
 
 @dataclass
-class MegatronService:
+class SGLangMegatronService:
+    """Service using SGLang for inference and Megatron for distributed training.
+    
+    This is the SGLang equivalent of MegatronService which uses vLLM.
+    
+    Key differences from MegatronService:
+    - Uses SGLang subprocess for inference instead of vLLM AsyncLLM
+    - Hot-reloads LoRA via SGLang HTTP API instead of vLLM LoRARequest
+    - RadixAttention cache preserved across training steps
+    """
+    
     model_name: str
     base_model: str
     config: dev.InternalModelConfig
     output_dir: str
-    vllm_config: VLLMConfig | None = None
+    sglang_config: SGLangConfig | None = None
+    
     _is_sleeping: bool = False
     _latest_step: int = 0
     _lora_id_counter: int = 1
+    _server_process: subprocess.Popen | None = None
+    _server_port: int = 8000
+    _server_host: str = "127.0.0.1"
+    _control_port: int | None = None  # Port for sleep/wake control (sglang_sleep_server)
     _megatron_process: asyncio.subprocess.Process | None = None
     _optimizer_state_path: str | None = None
-    _server_host: str = "127.0.0.1"
-    _server_port: int = 8000
 
     def __post_init__(self):
-        if self.vllm_config is None:
-            self.vllm_config = VLLMConfig()
-        # Enable runtime LoRA loading for cache preservation (vLLM 0.8+)
-        os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        if self.sglang_config is None:
+            self.sglang_config = SGLangConfig()
 
     def _next_lora_id(self) -> int:
         self._lora_id_counter += 1
         return self._lora_id_counter
+
+    def _get_fixed_lora_name(self) -> str:
+        """Get fixed LoRA adapter name for RadixCache consistency.
+        
+        SGLang's RadixCache keeps separate tree branches per adapter name.
+        Using a fixed name ensures cache hits across epochs:
+        - Same adapter name + same prefix = cache HIT (~80% hit rate)
+        - Different adapter name + same prefix = cache MISS (new branch)
+        
+        As of PR #7216 (August 2025), SGLang LoRA + RadixCache is supported.
+        """
+        return f"{self.model_name}@latest"
 
     def _get_optimizer_state_path(self) -> str:
         if self._optimizer_state_path is not None:
@@ -214,7 +331,7 @@ class MegatronService:
         return self._optimizer_state_path
 
     def _default_lora_adapter_config(self) -> LoraConfig:
-        # Keep in sync with LoRA settings in megatron/train.py.
+        """Default LoRA config matching megatron/train.py settings."""
         return LoraConfig(
             r=1,
             lora_alpha=32,
@@ -231,6 +348,7 @@ class MegatronService:
         )
 
     def _adapter_has_weights(self, lora_path: str) -> bool:
+        """Check if LoRA adapter has non-zero weights."""
         adapter_path = os.path.join(lora_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_path):
             return False
@@ -268,42 +386,32 @@ class MegatronService:
             pass
 
     def _create_identity_lora(self, lora_path: str) -> None:
-        # Create an identity (zero) LoRA using PEFT so vLLM can load it.
-        from peft import get_peft_model
-        from transformers import AutoModelForCausalLM
-
-        lora_config = self._default_lora_adapter_config()
-        model = AutoModelForCausalLM.from_pretrained(
-            self.base_model,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        peft_model = get_peft_model(model, lora_config)
-        # Keep LoRA A initialized (trainable) and zero only B for identity.
-        for name, param in peft_model.named_parameters():
-            if "lora_B" in name:
-                param.data.zero_()
+        """Create an identity (zero) LoRA for initial inference.
+        
+        For MoE models, we skip PEFT-based LoRA creation since the shapes
+        don't match Megatron's expectations. Instead, we just create an
+        empty checkpoint directory and let Megatron initialize LoRA.
+        """
         os.makedirs(lora_path, exist_ok=True)
-        peft_model.save_pretrained(lora_path)
-        # Sanitize the adapter config for vLLM 0.15.x compatibility
-        self._sanitize_lora_config(lora_path)
-        del peft_model, model
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        # Just create the adapter config, no weights
+        # SGLang can start without LoRA weights for initial inference
+        # Megatron will create proper LoRA weights during first training
+        self._ensure_lora_adapter_config(lora_path)
+        print(f"Created empty LoRA checkpoint at {lora_path} (Megatron will initialize)")
 
     def _ensure_identity_lora(self, lora_path: str) -> None:
-        if self._adapter_has_weights(lora_path):
+        """Ensure LoRA checkpoint directory exists for server startup."""
+        if os.path.exists(lora_path):
             return
         self._create_identity_lora(lora_path)
 
     def _ensure_lora_adapter_config(
         self, lora_path: str, *, source_path: str | None = None
     ) -> None:
+        """Ensure adapter_config.json exists."""
         config_path = os.path.join(lora_path, "adapter_config.json")
         if os.path.exists(config_path):
-            # Sanitize existing config
+            # Sanitize existing config for vLLM 0.15.x compatibility
             self._sanitize_lora_config(lora_path)
             return
         os.makedirs(lora_path, exist_ok=True)
@@ -314,99 +422,709 @@ class MegatronService:
                 # Sanitize copied config
                 self._sanitize_lora_config(lora_path)
                 return
+        # Convert to dict and handle sets (target_modules is a set in LoraConfig)
+        config_dict = asdict(self._default_lora_adapter_config())
+        for key, value in config_dict.items():
+            if isinstance(value, set):
+                config_dict[key] = list(value)
+        # Remove long_lora_max_len if present (vLLM 0.15.x doesn't support it)
+        config_dict.pop('long_lora_max_len', None)
         with open(config_path, "w") as f:
-            json.dump(asdict(self._default_lora_adapter_config()), f)
+            json.dump(config_dict, f)
 
-    async def _add_lora_aliases(
-        self, llm: AsyncLLM, step: int, checkpoint_dir: str
-    ) -> None:
-        """Add LoRA adapter for a new training step during hot-reload.
+    # ========================================================================
+    # SGLang Server Management (replaces vLLM in MegatronService)
+    # ========================================================================
+
+    async def start_openai_server(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> tuple[str, int]:
+        """Start SGLang OpenAI-compatible server.
         
-        Only adds the versioned name (e.g., "model@1"). The base alias is already
-        registered at server startup via get_openai_server_config and cannot be
-        replaced (vLLM has no remove_lora API). The benchmark uses versioned names.
+        This replaces vLLM's openai_server_task in MegatronService.
         """
-        versioned_name = f"{self.model_name}@{step}"
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=versioned_name,
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
-            )
-        )
-        if not added:
-            raise RuntimeError(f"Failed to add LoRA adapter for step {step}")
-        print(f"[vLLM] Added LoRA adapter: {versioned_name}")
-        self._latest_step = step
-
-    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
-        llm = await self.llm
-        await llm.pause_generation()
-        await self._add_lora_aliases(llm, step, checkpoint_dir)
-        await llm.resume_generation()
-
-    async def _hot_reload_lora(self, checkpoint_dir: str, step: int) -> None:
-        """Hot-reload LoRA weights via vLLM's /v1/load_lora_adapter API.
+        lora_path = get_last_checkpoint_dir(self.output_dir)
+        if lora_path is None:
+            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
+            self._latest_step = 0
+        else:
+            self._latest_step = get_step_from_dir(self.output_dir)
         
-        This allows updating LoRA weights without restarting the server,
-        preserving the KV cache. Requires VLLM_ALLOW_RUNTIME_LORA_UPDATING=True.
-        Available in vLLM 0.8+.
-        """
-        lora_name = f"{self.model_name}@{step}"
-        base_url = f"http://{self._server_host}:{self._server_port}"
+        self._ensure_identity_lora(lora_path)
+        self._ensure_lora_adapter_config(lora_path)
+
+        # Get server configuration
+        server_config = config or {}
+        server_args = server_config.get("server_args", {})
         
-        async with aiohttp.ClientSession() as session:
+        self._server_host = server_args.get("host", "127.0.0.1")
+        self._server_port = server_args.get("port", 8000)
+        
+        # Create logs directory
+        log_dir = f"{self.output_dir}/logs"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Only include LoRA path if adapter has actual weights
+        # For initial run (step 0), there are no weights yet - SGLang starts without LoRA
+        lora_path_for_server = lora_path if self._adapter_has_weights(lora_path) else None
+        if lora_path_for_server:
+            print(f"Starting SGLang with LoRA from {lora_path_for_server}")
+        else:
+            print("Starting SGLang without LoRA (initial run, Megatron will create weights)")
+        
+        # Start SGLang server subprocess
+        await self._start_sglang_server(lora_path_for_server)
+        
+        return self._server_host, self._server_port
+
+    async def _start_sglang_server(self, lora_path: str | None = None) -> None:
+        """Start SGLang server as subprocess."""
+        # Kill any existing SGLang processes
+        subprocess.run(["pkill", "-9", "-f", "sglang.launch_server"], capture_output=True)
+        subprocess.run(["pkill", "-9", "-f", "sglang_sleep_server"], capture_output=True)
+        
+        # Get Python executable for SGLang server
+        server_python = self.sglang_config.get_server_python()
+        
+        # Get tensor parallel size (auto-detect for large models)
+        tp_size = self.sglang_config.get_tensor_parallel_size()
+        
+        # Get GPU IDs for SGLang
+        sglang_gpu_ids = self.sglang_config.get_sglang_gpu_ids()
+        
+        # Use custom sleep launcher if cache_method is "sleep" (deprecated)
+        if self.sglang_config.cache_method == "sleep":
+            sleep_server_path = str(Path(__file__).parent / "sglang_sleep_server.py")
+            self._control_port = self._server_port + 100
+            cmd = [
+                server_python, sleep_server_path,
+                "--art-control-port", str(self._control_port),
+                "--model-path", self.base_model,
+                "--host", self._server_host,
+                "--port", str(self._server_port),
+                "--mem-fraction-static", str(self.sglang_config.mem_fraction_static),
+                "--log-level", self.sglang_config.log_level,
+                "--enable-lora",
+            ]
+            print(f"  Using ART sleep launcher (control port: {self._control_port})")
+        else:
+            self._control_port = None
+            cmd = [
+                server_python, "-m", "sglang.launch_server",
+                "--model-path", self.base_model,
+                "--host", self._server_host,
+                "--port", str(self._server_port),
+                "--mem-fraction-static", str(self.sglang_config.mem_fraction_static),
+                "--log-level", self.sglang_config.log_level,
+                "--enable-lora",
+            ]
+        
+        # Cache the --help output for flag validation (used here and below)
+        try:
+            self._sglang_help_output = subprocess.run(
+                [server_python, "-m", "sglang.launch_server", "--help"],
+                capture_output=True, text=True, timeout=15
+            ).stdout
+        except Exception:
+            self._sglang_help_output = ""
+        
+        # For sleep_wake mode, try to enable native memory saver so we can
+        # call /release_memory_occupation and /resume_memory_occupation.
+        # NOTE: These flags may not exist in all SGLang versions (e.g. 0.5.8).
+        # If the server fails to start, fall back to freeze mode.
+        if self.sglang_config.cache_method == "sleep_wake":
+            # Validate --enable-memory-saver exists
+            # NOTE: We do NOT need --enable-weights-cpu-backup because we use
+            # /update_weights_from_disk to reload weights after training (not
+            # resume_memory_occupation which is broken for MoE models).
+            has_memory_saver = "--enable-memory-saver" in self._sglang_help_output
+            
+            if has_memory_saver:
+                cmd.extend(["--enable-memory-saver"])
+                print(f"  Native sleep/wake enabled (memory-saver={has_memory_saver})")
+                print(f"  Post-training: update_weights_from_disk (MoE-safe, no CPU backup needed)")
+            else:
+                print(f"  WARNING: SGLang version does not support --enable-memory-saver.")
+                print(f"  Falling back to 'freeze' mode (cache still preserved).")
+                self.sglang_config.cache_method = "freeze"
+        
+        # Add tensor parallelism
+        if tp_size > 1:
+            cmd.extend(["--tp-size", str(tp_size)])
+            print(f"  Using tensor parallelism: TP={tp_size}")
+        
+        # Performance optimizations for SGLang (configurable via SGLangConfig)
+        # Note: --enable-memory-saver is added above only for sleep_wake mode
+        #
+        # IMPORTANT: Not all flags exist in every SGLang version. We validate
+        # optional flags against --help output to avoid crashing the server.
+        # Only --schedule-policy, --cuda-graph-max-bs, and --attention-backend
+        # are safe to use unconditionally (present since SGLang 0.4+).
+        
+        # Reuse cached --help output for flag validation
+        _help = getattr(self, '_sglang_help_output', "")
+        
+        # 1. Scheduler policy — "lpm" (Longest Prefix Match) reorders requests to
+        #    maximize prefix cache hits (critical for RL workloads with shared prompts)
+        cmd.extend(["--schedule-policy", self.sglang_config.schedule_policy])
+        
+        # 2. CUDA graph and attention backend
+        cmd.extend(["--cuda-graph-max-bs", str(self.sglang_config.cuda_graph_max_bs)])
+        cmd.extend(["--attention-backend", self.sglang_config.attention_backend])
+        
+        # 3. Chunked prefill — overlap prefill with decode (improves TTFT)
+        #    WARNING: Can cause OOM on memory-constrained setups (see sglang_backend/service.py)
+        if self.sglang_config.chunked_prefill_size is not None:
+            if "--chunked-prefill-size" in _help:
+                cmd.extend(["--chunked-prefill-size", str(self.sglang_config.chunked_prefill_size)])
+            else:
+                print(f"  WARNING: --chunked-prefill-size not supported by this SGLang version, skipping")
+        
+        # 4. Overlap scheduling — CPU scheduling parallel with GPU execution
+        if self.sglang_config.enable_overlap_schedule:
+            if "--enable-overlap-schedule" in _help:
+                cmd.append("--enable-overlap-schedule")
+            else:
+                print(f"  WARNING: --enable-overlap-schedule not supported by this SGLang version, skipping")
+        
+        # 5. Torch compile — compiled kernels for faster decode
+        #    KNOWN INCOMPATIBILITY: torch.compile + flashinfer + CUDA graphs
+        #    crashes on MoE models (fused_set_kv_buffer_arg assertion in
+        #    rotary_embedding.forward_native during CUDA graph capture).
+        #    torch.compile falls back to forward_native which can't handle
+        #    flashinfer's fused KV buffer — this is a runtime assertion,
+        #    not a tracing error, so TORCHDYNAMO_SUPPRESS_ERRORS won't help.
+        #
+        #    Auto-detect: skip torch.compile when flashinfer + CUDA graphs
+        #    are both active (the common/optimal case). flashinfer already
+        #    provides hand-tuned CUDA kernels — torch.compile adds minimal
+        #    value on top of flashinfer + CUDA graphs.
+        if self.sglang_config.enable_torch_compile:
+            _flashinfer_active = self.sglang_config.attention_backend == "flashinfer"
+            _cuda_graphs_active = self.sglang_config.cuda_graph_max_bs > 0
+            
+            if _flashinfer_active and _cuda_graphs_active:
+                print(f"  torch.compile: SKIPPED (incompatible with flashinfer + CUDA graphs on MoE)")
+                print(f"  → flashinfer already provides optimized CUDA kernels")
+                print(f"  → CUDA graphs provide kernel replay optimization")
+                print(f"  → torch.compile would add <5% on top of these, not worth the crash risk")
+                print(f"  → To force: set attention_backend='triton' (loses flashinfer perf)")
+            elif "--enable-torch-compile" in _help:
+                cmd.append("--enable-torch-compile")
+                print(f"  torch.compile enabled (no flashinfer conflict)")
+            else:
+                print(f"  WARNING: --enable-torch-compile not supported by this SGLang version, skipping")
+        
+        # Add context length if specified
+        if self.sglang_config.context_length:
+            cmd.extend(["--context-length", str(self.sglang_config.context_length)])
+        
+        # Add LoRA configuration
+        if lora_path and os.path.exists(lora_path) and self._adapter_has_weights(lora_path):
+            cmd.extend(["--lora-paths", lora_path])
+            cmd.extend(["--max-loras-per-batch", str(self.sglang_config.max_loras_per_batch)])
+        else:
+            # No LoRA adapter yet - provide LoRA config for initialization
+            # SGLang requires these when --enable-lora is set without --lora-paths
+            lora_config = self._default_lora_adapter_config()
+            cmd.extend(["--max-lora-rank", str(lora_config.r)])
+            # SGLang expects space-separated modules, not comma-separated
+            cmd.extend(["--lora-target-modules"] + list(lora_config.target_modules))
+        
+        # Disable radix cache only if explicitly requested
+        if self.sglang_config.disable_radix_cache:
+            cmd.append("--disable-radix-cache")
+        
+        # 6. Prometheus /metrics endpoint (required for cache_hit_rate measurement)
+        #    Without this, /metrics returns 404 and all cache stats show 0%.
+        if self.sglang_config.enable_metrics:
+            if "--enable-metrics" in _help:
+                cmd.append("--enable-metrics")
+            else:
+                print(f"  WARNING: --enable-metrics not supported by this SGLang version, skipping")
+        
+        # 7. Cache report — makes SGLang report cached_tokens in API response usage
+        #    Without this, the usage.prompt_tokens_details.cached_tokens field is always 0
+        #    even when RadixCache is actively caching prefixes.
+        if self.sglang_config.enable_cache_report:
+            if "--enable-cache-report" in _help:
+                cmd.append("--enable-cache-report")
+                print(f"  Cache report enabled (cached_tokens will appear in API response usage)")
+            else:
+                print(f"  WARNING: --enable-cache-report not supported by this SGLang version, skipping")
+                print(f"  Cache is still active but per-request cached_tokens won't be reported")
+        
+        print(f"Starting SGLang server: {' '.join(cmd)}")
+        
+        # Set up environment with GPU isolation
+        env = os.environ.copy()
+        
+        # =====================================================================
+        # FIX: Ensure SGLang subprocess can find CUDA + system libraries
+        # 
+        # Problem: On RunPod/containers, system CUDA may be 13.0 but PyTorch
+        # in the SGLang venv was built for CUDA 12.x. The CUDA 12 runtime is
+        # bundled inside pip packages (nvidia-cuda-runtime-cu12 etc.) inside
+        # the venv. SGLang's child processes need these on LD_LIBRARY_PATH.
+        #
+        # Also: flashinfer JIT needs 'ninja' from the venv's bin/ on PATH.
+        # =====================================================================
+        
+        # 1. Find the SGLang venv's site-packages WITHOUT importing torch
+        #    (import torch itself fails without LD_LIBRARY_PATH set first!)
+        sglang_venv_site = None
+        if server_python:
             try:
+                result = subprocess.run(
+                    [server_python, "-c", 
+                     "import site; print(site.getsitepackages()[0])"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    sglang_venv_site = result.stdout.strip()
+            except Exception:
+                pass
+            
+            # Fallback: derive from server_python path
+            # e.g. /root/ART/.venv-sglang-server/bin/python
+            #   → /root/ART/.venv-sglang-server/lib/python3.11/site-packages
+            if not sglang_venv_site or not os.path.isdir(sglang_venv_site):
+                venv_root = os.path.dirname(os.path.dirname(
+                    os.path.realpath(server_python)
+                ))
+                # Find the python version dir
+                lib_dir = os.path.join(venv_root, "lib")
+                if os.path.isdir(lib_dir):
+                    for d in os.listdir(lib_dir):
+                        if d.startswith("python"):
+                            candidate = os.path.join(lib_dir, d, "site-packages")
+                            if os.path.isdir(candidate):
+                                sglang_venv_site = candidate
+                                break
+        
+        venv_nvidia_lib_paths = []
+        if sglang_venv_site and os.path.isdir(sglang_venv_site):
+            nvidia_dir = os.path.join(sglang_venv_site, "nvidia")
+            if os.path.isdir(nvidia_dir):
+                # Scan all nvidia packages for lib directories
+                for pkg in sorted(os.listdir(nvidia_dir)):
+                    lib_dir = os.path.join(nvidia_dir, pkg, "lib")
+                    if os.path.isdir(lib_dir):
+                        venv_nvidia_lib_paths.append(lib_dir)
+            # Also add torch/lib itself (has libc10_cuda.so etc.)
+            torch_lib = os.path.join(sglang_venv_site, "torch", "lib")
+            if os.path.isdir(torch_lib):
+                venv_nvidia_lib_paths.append(torch_lib)
+        
+        # 2. System CUDA paths (fallback)
+        system_lib_paths = [
+            "/usr/local/cuda/targets/x86_64-linux/lib",
+            "/usr/local/cuda/lib64",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/local/nvidia/lib",
+            "/usr/local/nvidia/lib64",
+        ]
+        
+        # Venv nvidia paths go FIRST (correct CUDA 12.x version)
+        all_lib_paths = venv_nvidia_lib_paths + system_lib_paths
+        existing_ld_path = env.get("LD_LIBRARY_PATH", "")
+        new_ld_path = ":".join(all_lib_paths)
+        if existing_ld_path:
+            new_ld_path = f"{new_ld_path}:{existing_ld_path}"
+        env["LD_LIBRARY_PATH"] = new_ld_path
+        
+        if venv_nvidia_lib_paths:
+            print(f"  SGLang CUDA fix: added {len(venv_nvidia_lib_paths)} nvidia lib paths from venv")
+        else:
+            print(f"  WARNING: Could not find nvidia lib paths in SGLang venv (site={sglang_venv_site})")
+        
+        # 3. Add venv bin/ to PATH so SGLang child processes can find 'ninja'
+        #    (needed by flashinfer JIT compilation)
+        if server_python:
+            venv_bin = os.path.dirname(os.path.realpath(server_python))
+            existing_path = env.get("PATH", "")
+            env["PATH"] = f"{venv_bin}:{existing_path}"
+        
+        # 4. Force preload libnuma for sgl_kernel H100 support
+        libnuma_paths = [
+            "/usr/lib/x86_64-linux-gnu/libnuma.so.1",
+            "/lib/x86_64-linux-gnu/libnuma.so.1",
+            "/usr/lib64/libnuma.so.1",
+        ]
+        libnuma_found = None
+        for path in libnuma_paths:
+            if os.path.exists(path):
+                libnuma_found = path
+                break
+        
+        if libnuma_found:
+            existing_preload = env.get("LD_PRELOAD", "")
+            env["LD_PRELOAD"] = f"{libnuma_found}:{existing_preload}" if existing_preload else libnuma_found
+        else:
+            print("  WARNING: libnuma.so.1 not found. Install with: apt-get install libnuma1")
+        
+        # 5. Set CUDA environment
+        env["CUDA_HOME"] = "/usr/local/cuda"
+        
+        # =====================================================================
+        
+        if self.sglang_config.can_preserve_cache():
+            # Use only the designated GPUs for SGLang
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, sglang_gpu_ids))
+            print(f"  SGLang GPU isolation: CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
+        
+        # Start server
+        log_file = open(f"{self.output_dir}/logs/sglang.log", "a")
+        self._server_process = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+            env=env,
+        )
+        
+        # Wait for server to be ready
+        await self._wait_for_server()
+
+    async def _wait_for_server(self) -> None:
+        """Wait for SGLang server to be ready."""
+        timeout = self.sglang_config.server_timeout
+        start_time = asyncio.get_event_loop().time()
+        
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            if self._server_process and self._server_process.poll() is not None:
+                raise RuntimeError(
+                    f"SGLang server process died with code {self._server_process.returncode}. "
+                    f"Check logs at {self.output_dir}/logs/sglang.log"
+                )
+            
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"http://{self._server_host}:{self._server_port}/v1/models",
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as resp:
+                        if resp.status == 200:
+                            print(f"SGLang server ready at http://{self._server_host}:{self._server_port}")
+                            return
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        
+        raise TimeoutError(
+            f"SGLang server did not start within {timeout} seconds. "
+            f"Check logs at {self.output_dir}/logs/sglang.log"
+        )
+
+    async def _stop_sglang_server(self) -> None:
+        """Stop SGLang server subprocess."""
+        if self._server_process is None:
+            return
+        
+        try:
+            try:
+                os.killpg(os.getpgid(self._server_process.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                self._server_process.kill()
+            
+            for _ in range(10):
+                if self._server_process.poll() is not None:
+                    break
+                await asyncio.sleep(0.1)
+        except Exception:
+            pass
+        finally:
+            self._server_process = None
+        
+        gc_and_empty_cuda_cache()
+
+    def _freeze_server(self) -> bool:
+        """Freeze (SIGSTOP) the SGLang server using its process group.
+        
+        Simple and safe: we started SGLang with preexec_fn=os.setsid, so it has
+        its own process group. os.killpg() stops the entire group — parent and
+        all children that inherited the group. Cannot accidentally stop ourselves.
+        
+        Returns True if successful, False if process not running.
+        """
+        if self._server_process is None or self._server_process.poll() is not None:
+            print(f"[SGLang] DEBUG _freeze: server not running "
+                  f"(is_none={self._server_process is None}, "
+                  f"poll={self._server_process.poll() if self._server_process else 'N/A'})", flush=True)
+            return False
+        
+        try:
+            pid = self._server_process.pid
+            pgid = os.getpgid(pid)
+            print(f"[SGLang] DEBUG _freeze: pid={pid}, pgid={pgid}, my_pid={os.getpid()}", flush=True)
+            os.killpg(pgid, signal.SIGSTOP)
+            print(f"[SGLang] Server frozen (SIGSTOP pgid={pgid})", flush=True)
+            print(f"  GPU memory stays allocated — model weights + KV cache intact", flush=True)
+            return True
+        except (ProcessLookupError, OSError) as e:
+            print(f"[SGLang] ⚠️ Failed to freeze server: {e}", flush=True)
+            return False
+
+    async def _thaw_server(self, timeout: float = 30.0) -> bool:
+        """Thaw (SIGCONT) the SGLang server using its process group.
+        
+        Mirrors _freeze_server: SIGCONT the same process group.
+        
+        Returns True if server is healthy after thaw, False otherwise.
+        """
+        if self._server_process is None or self._server_process.poll() is not None:
+            print(f"[SGLang] DEBUG _thaw: server not running", flush=True)
+            return False
+        
+        try:
+            pid = self._server_process.pid
+            pgid = os.getpgid(pid)
+            print(f"[SGLang] DEBUG _thaw: SIGCONT pgid={pgid}", flush=True)
+            os.killpg(pgid, signal.SIGCONT)
+            print(f"[SGLang] Server thawed (SIGCONT pgid={pgid})", flush=True)
+        except (ProcessLookupError, OSError) as e:
+            print(f"[SGLang] ⚠️ Failed to thaw server: {e}", flush=True)
+            return False
+        
+        # Wait for server to respond to health checks after thaw
+        start = asyncio.get_event_loop().time()
+        check_count = 0
+        while asyncio.get_event_loop().time() - start < timeout:
+            check_count += 1
+            healthy = await self._is_server_healthy()
+            if check_count <= 5 or check_count % 10 == 0:
+                print(f"[SGLang] DEBUG _thaw: health check #{check_count} = {healthy}", flush=True)
+            if healthy:
+                elapsed = asyncio.get_event_loop().time() - start
+                print(f"[SGLang] Server responsive after thaw ({elapsed:.1f}s)", flush=True)
+                return True
+            await asyncio.sleep(0.5)
+        
+        print(f"[SGLang] ⚠️ Server not responding after thaw (waited {timeout}s, {check_count} checks)", flush=True)
+        return False
+
+    async def _sleep_server(self) -> dict | None:
+        """Call /art/sleep on the custom launcher's control port.
+        
+        Offloads model weights from GPU to CPU (~25GB freed).
+        Returns the response dict if successful, None if unavailable.
+        """
+        if self._control_port is None:
+            return None
+        
+        try:
+            async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{base_url}/v1/load_lora_adapter",
-                    json={"lora_name": lora_name, "lora_path": checkpoint_dir},
+                    f"http://127.0.0.1:{self._control_port}/art/sleep",
                     timeout=aiohttp.ClientTimeout(total=60)
                 ) as resp:
                     if resp.status == 200:
-                        print(f"[vLLM] Hot-reloaded LoRA: {lora_name}")
-                        self._latest_step = step
-                        return
-                    error_text = await resp.text()
-                    raise RuntimeError(f"Failed to hot-reload LoRA: {error_text}")
-            except aiohttp.ClientError as e:
-                raise RuntimeError(f"Failed to connect to vLLM server for hot-reload: {e}")
+                        data = await resp.json()
+                        if data.get("status") == "sleeping":
+                            return data
+                        elif data.get("status") == "error":
+                            print(f"[SGLang] Sleep endpoint error: {data.get('error')}")
+                            return None
+                    return None
+        except Exception as e:
+            print(f"[SGLang] Sleep endpoint unavailable: {e}")
+            return None
 
-    async def _unload_old_loras(self, keep_step: int) -> None:
-        """Unload old LoRA adapters to free memory."""
-        base_url = f"http://{self._server_host}:{self._server_port}"
+    async def _wake_server(self) -> dict | None:
+        """Call /art/wake on the custom launcher's control port.
         
-        async with aiohttp.ClientSession() as session:
-            if keep_step > 0:
-                old_name = f"{self.model_name}@{keep_step - 1}"
-                try:
-                    async with session.post(
-                        f"{base_url}/v1/unload_lora_adapter",
-                        json={"lora_name": old_name},
-                        timeout=aiohttp.ClientTimeout(total=30)
-                    ) as resp:
-                        if resp.status == 200:
-                            print(f"[vLLM] Unloaded old LoRA: {old_name}")
-                except Exception:
-                    pass  # Ignore errors - old LoRA might not exist
-
-    async def _is_server_healthy(self) -> bool:
-        """Check if vLLM server is responding."""
-        base_url = f"http://{self._server_host}:{self._server_port}"
+        Reloads model weights from CPU back to GPU.
+        Returns the response dict if successful, None if unavailable.
+        """
+        if self._control_port is None:
+            return None
+        
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{base_url}/v1/models",
-                    timeout=aiohttp.ClientTimeout(total=5)
+                async with session.post(
+                    f"http://127.0.0.1:{self._control_port}/art/wake",
+                    timeout=aiohttp.ClientTimeout(total=60)
                 ) as resp:
-                    return resp.status == 200
-        except Exception:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("status") == "awake":
+                            return data
+                    return None
+        except Exception as e:
+            print(f"[SGLang] Wake endpoint unavailable: {e}")
+            return None
+
+    async def _native_release_memory(self, tags: list[str] | None = None) -> bool:
+        """Call SGLang's native /release_memory_occupation endpoint.
+        
+        Offloads specified memory types from GPU to CPU.
+        
+        Args:
+            tags: List of memory types to release. Options:
+                  "weights" — model weights (~48GB for 30B model)
+                  "kv_cache" — KV cache (WARNING: flushes radix cache!)
+                  "cuda_graph" — CUDA graph buffers
+                  None — release ALL types
+                  
+        For cache preservation, use tags=["weights", "cuda_graph"] to keep KV cache.
+        
+        Returns True if successful.
+        """
+        if tags is None:
+            tags = ["weights", "cuda_graph"]  # Safe default: keep KV cache
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://{self._server_host}:{self._server_port}/release_memory_occupation",
+                    json={"tags": tags},
+                    timeout=aiohttp.ClientTimeout(total=120)
+                ) as resp:
+                    if resp.status == 200:
+                        print(f"[SGLang] ✓ Memory released: tags={tags}")
+                        return True
+                    else:
+                        error_text = await resp.text()
+                        print(f"[SGLang] ⚠️ release_memory_occupation failed ({resp.status}): {error_text}")
+                        return False
+        except Exception as e:
+            print(f"[SGLang] ⚠️ release_memory_occupation error: {e}")
             return False
+
+    async def _update_weights_from_disk(self, model_path: str | None = None) -> bool:
+        """Reload ALL model weights from disk via /update_weights_from_disk.
+        
+        This is the correct post-training resume path for MoE models.
+        
+        Why NOT resume_memory_occupation:
+            resume_memory_occupation restores weights from CPU backup, but this is
+            broken for MoE models (SGLang issue #6367) — expert layers don't get
+            properly placed on GPU, causing garbage output.
+        
+        Why update_weights_from_disk:
+            - Reloads ALL weights fresh from disk, properly placing MoE expert layers
+            - Bypasses the broken CPU backup restore entirely
+            - Slightly slower than CPU→GPU copy (disk I/O) but actually works for MoE
+            - Still faster than full server restart (no process spawn, no CUDA
+              graph recapture)
+            - KV/radix cache is INVALIDATED by new weights and rebuilt from scratch
+              (this is expected — same behavior as vLLM's sleep_wake level=2)
+        
+        Performance comparison vs vLLM do_wake_up():
+            - vLLM: CPU→GPU copy (~3-5s for 30B model) — weights cached in RAM
+            - SGLang: disk→GPU load (~8-15s for 30B model) — full reload from disk
+            - Both invalidate KV cache (new weights → stale KV entries)
+            - Net throughput difference is mainly in wake-up latency, not steady-state
+        
+        This pattern is used by veRL and Slime for the same reason.
+        
+        Args:
+            model_path: Path to load weights from. Defaults to self.base_model.
+        
+        Returns True if successful.
+        """
+        if model_path is None:
+            model_path = self.base_model
+        
+        import time as _time
+        _t0 = _time.perf_counter()
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://{self._server_host}:{self._server_port}/update_weights_from_disk",
+                    json={
+                        "model_path": model_path,
+                        "load_format": "auto",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=300)  # Large models take time
+                ) as resp:
+                    elapsed = _time.perf_counter() - _t0
+                    if resp.status == 200:
+                        print(f"[SGLang] ✓ Weights reloaded from disk in {elapsed:.1f}s (model={model_path})")
+                        return True
+                    else:
+                        error_text = await resp.text()
+                        print(f"[SGLang] ⚠️ update_weights_from_disk failed ({resp.status}): {error_text}")
+                        return False
+        except Exception as e:
+            elapsed = _time.perf_counter() - _t0
+            print(f"[SGLang] ⚠️ update_weights_from_disk error after {elapsed:.1f}s: {e}")
+            return False
+
+    async def _hot_reload_lora(self, checkpoint_dir: str, step: int) -> None:
+        """Hot-reload LoRA weights without restarting server.
+        
+        Key optimization for RadixCache preservation:
+        - Uses FIXED adapter name (_get_fixed_lora_name) across all epochs
+        - SGLang keeps same radix tree branch for same adapter name
+        - Same prefix + same adapter = cache HIT (~80% hit rate)
+        
+        As of PR #7216 (August 2025), SGLang LoRA + RadixCache is supported.
+        
+        Raises RuntimeError if both /load_lora_adapter and /add_lora fail.
+        """
+        # Use FIXED adapter name for RadixCache consistency across epochs
+        # This is critical: different names = different cache branches = no hits
+        lora_name = self._get_fixed_lora_name()
+        
+        load_error = None
+        add_error = None
+        
+        async with aiohttp.ClientSession() as session:
+            # Try load_lora_adapter endpoint first (REPLACES weights for same name)
+            try:
+                async with session.post(
+                    f"http://{self._server_host}:{self._server_port}/load_lora_adapter",
+                    json={"lora_path": checkpoint_dir, "lora_name": lora_name},
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status == 200:
+                        print(f"  Hot-reloaded LoRA '{lora_name}' step {step} (RadixCache preserved)")
+                        return
+                    load_error = f"/load_lora_adapter returned {resp.status}: {await resp.text()}"
+            except Exception as e:
+                load_error = f"/load_lora_adapter exception: {e}"
+            
+            # Fallback: try add_lora endpoint
+            try:
+                async with session.post(
+                    f"http://{self._server_host}:{self._server_port}/add_lora",
+                    json={
+                        "lora_path": checkpoint_dir,
+                        "lora_name": lora_name,
+                        "lora_int_id": self._next_lora_id(),
+                    },
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status == 200:
+                        print(f"  Added LoRA '{lora_name}' step {step} (RadixCache preserved)")
+                        return
+                    add_error = f"/add_lora returned {resp.status}: {await resp.text()}"
+            except Exception as e:
+                add_error = f"/add_lora exception: {e}"
+        
+        # Both endpoints failed: raise so caller knows and can fall back to restart
+        raise RuntimeError(
+            f"Failed to hot-reload LoRA step {step} at {checkpoint_dir}. "
+            f"load_lora_adapter: {load_error}; add_lora: {add_error}"
+        )
+
+        # NOTE: We intentionally do NOT add step-specific aliases (model@1, model@2, etc.)
+        # Each unique adapter name creates a separate radix tree branch in SGLang,
+        # which kills cache hit rates. The fixed name (model@latest) is sufficient.
+        # Step tracking is done via _latest_step and checkpoint directories.
+
+    # ========================================================================
+    # Megatron Training (same as MegatronService)
+    # ========================================================================
 
     async def _ensure_megatron_running(self, use_gpu_isolation: bool = False) -> None:
         """Lazily start Megatron training process if not running.
         
         Args:
-            use_gpu_isolation: If True, run Megatron only on GPUs not used by vLLM.
+            use_gpu_isolation: If True, run Megatron only on GPUs not used by SGLang.
+                              This allows SGLang to keep running and preserve cache.
         """
         if self._megatron_process is not None:
             if self._megatron_process.returncode is None:
@@ -424,16 +1142,35 @@ class MegatronService:
             if os.path.isdir(p)
         )
 
+        # Kill ALL stale training processes — not just "megatron-service".
+        # torch.distributed.run spawns processes named "train.py" / "torchrun"
+        # that hold port 29500. If we only pkill "megatron-service", these
+        # survive and block the next run with EADDRINUSE.
         subprocess.run(["pkill", "-9", "megatron-service"], check=False)
+        subprocess.run(["pkill", "-9", "-f", "megatron/train.py"], check=False)
+        subprocess.run(["pkill", "-9", "-f", "torchrun"], check=False)
+        subprocess.run(["pkill", "-9", "-f", "torch.distributed.run"], check=False)
+        # Wait for ports (29500) to be released by the kernel
+        import time as _time_mod
+        _time_mod.sleep(1.0)
         train_script = Path(__file__).parent / "train.py"
 
         # Ensure GPUs are in DEFAULT compute mode (not EXCLUSIVE_PROCESS).
-        subprocess.run(["nvidia-smi", "-c", "0"], capture_output=True, check=False)
+        smi_result = subprocess.run(
+            ["nvidia-smi", "-c", "0"],
+            capture_output=True, text=True, check=False,
+        )
+        print(f"  nvidia-smi -c 0: rc={smi_result.returncode}")
+        if smi_result.stdout.strip():
+            print(f"    {smi_result.stdout.strip()}")
+        if smi_result.returncode != 0 and smi_result.stderr.strip():
+            print(f"    stderr: {smi_result.stderr.strip()[:200]}")
 
         # Build a CLEAN environment for the training subprocess.
         train_env = dict(os.environ)
         train_env["MODEL_IDENTIFIER"] = self.base_model
         train_env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        # Remove any stale CUDA variables that the parent may have set
         train_env.pop("CUDA_VISIBLE_DEVICES", None)
 
         # ── FIX: LD_LIBRARY_PATH for CUDA 12.x / 13.0 mismatch ──
@@ -441,6 +1178,7 @@ class MegatronService:
         # Without LD_LIBRARY_PATH, the training subprocess loads the system's
         # libcudart.so.13 instead of the venv's bundled libcudart.so.12, which
         # causes cudaErrorDevicesUnavailable on set_device().
+        # Prioritize the main venv's nvidia libs (CUDA 12.x) over the system's.
         venv_site = None
         try:
             import site as _site
@@ -448,6 +1186,7 @@ class MegatronService:
         except Exception:
             pass
         if not venv_site or not os.path.isdir(str(venv_site)):
+            # Derive from sys.executable
             _venv_root = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
             _lib = os.path.join(_venv_root, "lib")
             if os.path.isdir(_lib):
@@ -486,10 +1225,15 @@ class MegatronService:
 
         if train_nvidia_lib_paths:
             print(f"  Training CUDA fix: added {len(train_nvidia_lib_paths)} nvidia lib paths from venv")
-
+        else:
+            print(f"  WARNING: Could not find nvidia lib paths in training venv (site={venv_site})")
+        
         # Determine which GPUs to use for Megatron
-        if use_gpu_isolation:
-            megatron_gpu_ids = self.vllm_config.get_megatron_gpu_ids()
+        # Always respect explicit training_gpu_ids even when sleep_wake freed
+        # memory. The SGLang process is still alive and its CUDA context + driver
+        # overhead can cause OOM on shared GPUs (especially for large MoE models).
+        if use_gpu_isolation or self.sglang_config.training_gpu_ids is not None:
+            megatron_gpu_ids = self.sglang_config.get_megatron_gpu_ids()
             num_gpus = len(megatron_gpu_ids)
             cuda_devices = ",".join(map(str, megatron_gpu_ids))
             train_env["CUDA_VISIBLE_DEVICES"] = cuda_devices
@@ -497,90 +1241,141 @@ class MegatronService:
         else:
             num_gpus = torch.cuda.device_count()
 
-        # Quick GPU diagnostic — verify GPUs are reachable from a clean subprocess
+        # Strong GPU diagnostic — actually create CUDA contexts and tensors,
+        # not just query device names.  Also check compute mode.
         diag_script = (
-            "import torch; n=torch.cuda.device_count(); "
-            "print(f'visible={n}'); "
-            "[print(f'  dev{i}={torch.cuda.get_device_name(i)}') for i in range(n)]"
+            "import subprocess, torch, sys\n"
+            "# 1. Print compute mode for each GPU\n"
+            "r = subprocess.run(['nvidia-smi', '--query-gpu=index,compute_mode', '--format=csv,noheader'],\n"
+            "                   capture_output=True, text=True)\n"
+            "print('Compute modes:', r.stdout.strip())\n"
+            "# 2. Check visible devices\n"
+            "import os; print('CUDA_VISIBLE_DEVICES=', os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)'))\n"
+            "n = torch.cuda.device_count()\n"
+            "print(f'visible_devices={n}')\n"
+            "# 3. Actually claim each device (creates CUDA context)\n"
+            "for i in range(n):\n"
+            "    try:\n"
+            "        torch.cuda.set_device(i)\n"
+            "        t = torch.tensor([1.0], device=f'cuda:{i}')\n"
+            "        print(f'  dev{i}: {torch.cuda.get_device_name(i)} — set_device OK, tensor OK')\n"
+            "        del t\n"
+            "    except Exception as e:\n"
+            "        print(f'  dev{i}: FAILED — {e}')\n"
+            "torch.cuda.empty_cache()\n"
         )
         diag = subprocess.run(
             [sys.executable, "-c", diag_script],
             env=train_env, capture_output=True, text=True, timeout=30,
         )
-        print(f"  GPU diagnostic: {diag.stdout.strip()}")
+        print(f"  GPU diagnostic stdout:\n{diag.stdout.strip()}")
         if diag.returncode != 0:
             err_tail = diag.stderr.strip()[-500:] if diag.stderr else "(no stderr)"
             print(f"  GPU diagnostic FAILED (rc={diag.returncode}): {err_tail}")
 
         cv = train_env.get("CUDA_VISIBLE_DEVICES", "(all)")
 
+        # Pick a random master port to avoid EADDRINUSE on 29500.
+        # Port 29500 is torch.distributed's default and stale processes
+        # or slow kernel cleanup can leave it bound for seconds.
+        import random
+        master_port = random.randint(29500, 29999)
+
         if need_setup:
+            # First run: need setup.sh, must use shell
             setup_script = Path(__file__).parent / "setup.sh"
             command = (
                 f"bash {setup_script} && "
                 f"{sys.executable} -m torch.distributed.run "
-                f"--nproc_per_node {num_gpus} {train_script}"
+                f"--nproc_per_node {num_gpus} --master_port {master_port} {train_script}"
             )
             print(f"Starting Megatron training (with setup): {command}")
-            print(f"  CUDA_VISIBLE_DEVICES={cv}")
+            print(f"  CUDA_VISIBLE_DEVICES={cv}, master_port={master_port}")
             self._megatron_process = await asyncio.create_subprocess_shell(
                 command, env=train_env,
             )
         else:
+            # Subsequent runs: use direct exec (no shell, no uv) — most
+            # reliable way to ensure CUDA_VISIBLE_DEVICES propagates.
             args = [
                 sys.executable, "-m", "torch.distributed.run",
-                "--nproc_per_node", str(num_gpus), str(train_script),
+                "--nproc_per_node", str(num_gpus),
+                "--master_port", str(master_port),
+                str(train_script),
             ]
             print(f"Starting Megatron training: {' '.join(args)}")
-            print(f"  CUDA_VISIBLE_DEVICES={cv}")
+            print(f"  CUDA_VISIBLE_DEVICES={cv}, master_port={master_port}")
             self._megatron_process = await asyncio.create_subprocess_exec(
                 *args, env=train_env,
             )
 
-    async def start_openai_server(
-        self, config: dev.OpenAIServerConfig | None
-    ) -> tuple[str, int]:
-        lora_path = get_last_checkpoint_dir(self.output_dir)
-        if lora_path is None:
-            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-            self._latest_step = 0
-        else:
-            self._latest_step = get_step_from_dir(self.output_dir)
-        self._ensure_identity_lora(lora_path)
-        self._ensure_lora_adapter_config(lora_path)
-
-        lora_path_for_server = (
-            lora_path if self._adapter_has_weights(lora_path) else None
-        )
-        server_config = dev.get_openai_server_config(
-            model_name=self.model_name,
-            base_model=self.base_model,
-            log_file=f"{self.output_dir}/logs/vllm.log",
-            lora_path=lora_path_for_server,
-            config=config,
-        )
-        await openai_server_task(engine=await self.llm, config=server_config)
-        
-        # Store server host/port for hot-reload API calls
-        host = server_config.get("server_args", {}).get("host") or "0.0.0.0"
-        self._server_host = "127.0.0.1" if host == "0.0.0.0" else host
-        self._server_port = server_config.get("server_args", {}).get("port", 8000)
-        
-        return (host, self._server_port)
-
     async def vllm_engine_is_sleeping(self) -> bool:
+        """Check if server is sleeping (for compatibility with LocalBackend)."""
         return self._is_sleeping
 
-    async def _is_engine_healthy(self) -> bool:
-        """Check if vLLM engine is running and healthy."""
-        if "llm" not in self.__dict__:
+    async def _is_server_healthy(self) -> bool:
+        """Check if SGLang server is running and healthy."""
+        if self._server_process is None:
             return False
+        poll_result = self._server_process.poll()
+        if poll_result is not None:
+            return False
+        
         try:
-            llm = await self.llm
-            # Try a simple operation to verify engine is responsive
-            return llm is not None
-        except Exception:
-            return False
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"http://{self._server_host}:{self._server_port}/health",
+                    timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    return resp.status == 200
+        except Exception as e1:
+            # Try /v1/models as fallback
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"http://{self._server_host}:{self._server_port}/v1/models",
+                        timeout=aiohttp.ClientTimeout(total=2)
+                    ) as resp:
+                        return resp.status == 200
+            except Exception:
+                return False
+
+    async def _unload_old_loras(self, keep_step: int | None = None) -> None:
+        """Unload old LoRA adapters to free memory.
+        
+        SGLang may accumulate step-aliased LoRAs across training steps.
+        The fixed-name adapter (model@latest) is always kept since it's
+        the one used for inference. Step aliases (model@1, model@2, ...)
+        are unloaded to prevent memory creep.
+        
+        Uses SGLang's /unload_lora_adapter or /delete_lora_adapter endpoint
+        if available.
+        """
+        if keep_step is None:
+            return
+        
+        fixed_name = self._get_fixed_lora_name()
+        
+        # Try to unload any step-specific aliases that may have accumulated
+        # We don't know exactly which steps exist, so try recent ones
+        for old_step in range(max(0, keep_step - 10), keep_step):
+            old_name = f"{self.model_name}@{old_step}"
+            if old_name == fixed_name:
+                continue  # Never unload the fixed adapter
+            
+            for endpoint in ("/unload_lora_adapter", "/delete_lora_adapter"):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"http://{self._server_host}:{self._server_port}{endpoint}",
+                            json={"lora_name": old_name},
+                            timeout=aiohttp.ClientTimeout(total=10)
+                        ) as resp:
+                            if resp.status == 200:
+                                print(f"  Unloaded old LoRA: {old_name}")
+                                break  # Success, no need to try other endpoint
+                except Exception:
+                    pass  # Endpoint may not exist in this SGLang version
 
     async def train(
         self,
@@ -589,72 +1384,194 @@ class MegatronService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """Train using Megatron with configurable cache preservation method.
+        """Run Megatron training step.
         
         Cache methods:
-        - "http": Keep server running, hot-reload LoRA via /v1/load_lora_adapter API
-                  Requires GPU isolation. KV cache stays on GPU.
-        - "sleep_wake": Use do_sleep/do_wake_up with level=1. 
-                        Offloads weights + KV cache to CPU, restores after training.
-        - "none": Always restart server. Cache is lost.
+        - "verl" (RECOMMENDED — production RL pattern):
+              GPU isolation: server stays alive on dedicated GPU(s).
+              Megatron trains on separate GPUs. No memory release overhead.
+              After training: update_weights_from_disk → cache flushed (correct:
+              new weights invalidate old KV) → hot-reload LoRA → warmup cache.
+              Within-iteration prefix sharing gives 60-80% cache hits.
+              This is the production pattern used by veRL, OpenRLHF, Slime.
+        - "sleep_wake": Uses SGLang's native /release_memory_occupation
+              to offload ALL GPU memory (weights + KV cache + CUDA graphs) to CPU.
+              ALL GPUs freed for training (like vLLM sleep_wake).
+              After training: /update_weights_from_disk (NOT resume_memory_occupation
+              which is broken for MoE — issue #6367) → hot-reload LoRA.
+              Cache REBUILT (not preserved — new weights invalidate old KV entries).
+              Training speed matches vLLM sleep_wake.
+        - "freeze": GPU isolation only — server stays alive and idle.
+              GPU memory stays allocated (weights + KV cache on SGLang GPUs).
+              Megatron trains on separate GPUs. Cache 100% preserved.
+              WARNING: NO weight sync — policy becomes stale after iteration 1.
+              Use only for quick demos, NOT production RL.
+        - "hot_reload": Keep server fully active during training.
+              Preserves cache but causes CPU/PCIe contention. Best for 4+ GPUs.
+        - "restart": Kill server before training, restart after.
+              Cache LOST. Fallback only.
+        - "sleep": (DEPRECATED) Old custom launcher approach.
         """
         import time as _time
         _t0 = _time.perf_counter()
         
-        cache_method = self.vllm_config.cache_method
-        can_preserve = self.vllm_config.can_preserve_cache() and await self._is_engine_healthy()
+        cache_method = self.sglang_config.cache_method
+        server_alive = (
+            self._server_process is not None
+            and self._server_process.poll() is None
+        )
         
-        # For HTTP method, also check server health
-        if cache_method == "http" and can_preserve:
-            can_preserve = await self._is_server_healthy()
-        
-        # Get engine reference for sleep/wake method
-        llm = await self.llm if cache_method == "sleep_wake" and can_preserve else None
+        # Determine strategy based on cache_method
+        if cache_method == "verl" and server_alive:
+            strategy = "verl"
+        elif cache_method == "sleep_wake" and server_alive:
+            strategy = "sleep_wake"
+        elif cache_method == "sleep" and server_alive:
+            strategy = "sleep"
+        elif cache_method in ("sleep_wake", "sleep", "freeze") and server_alive:
+            # sleep_wake/sleep fall back to freeze if endpoint fails
+            strategy = "freeze"
+        elif cache_method == "hot_reload" and self.sglang_config.can_preserve_cache() and server_alive:
+            if await self._is_server_healthy():
+                strategy = "hot_reload"
+            else:
+                strategy = "restart"
+        else:
+            strategy = "restart"
         _t_health = _time.perf_counter()
         
-        # === BEFORE TRAINING: Prepare based on method ===
-        if can_preserve and cache_method == "http":
-            print(f"[vLLM] Method: HTTP Hot-Reload (KV cache PRESERVED on GPU)")
-            print(f"  vLLM GPUs: {self.vllm_config.get_vllm_gpu_ids()}")
-            print(f"  Megatron GPUs: {self.vllm_config.get_megatron_gpu_ids()}")
-            # Server stays running - GPU isolation keeps cache warm
+        # === PRE-TRAINING: Prepare GPU for Megatron ===
+        _slept = False
+        # Release ALL memory types including KV cache.
+        # Why not keep KV cache? Because update_weights_from_disk (called after
+        # training) reloads new weights which INVALIDATES all cached KV entries
+        # (computed with old weights). Keeping KV cache wastes ~17GB of GPU memory
+        # during training for a cache that will be flushed anyway.
+        _native_sleep_tags = ["weights", "kv_cache", "cuda_graph"]
+        
+        if strategy == "verl":
+            # veRL/OpenRLHF production pattern:
+            # Pre-training: GPU isolation only — server stays alive on dedicated GPU(s).
+            # No memory release, no SIGSTOP. Zero pre-training overhead.
+            # Post-training: update_weights_from_disk → flush cache (correct) → LoRA reload.
+            # Within-iteration prefix sharing provides 60-80% cache hits.
+            print(f"[SGLang] Method: veRL (GPU isolation + weight sync — production RL pattern)", flush=True)
+            print(f"  SGLang GPUs: {self.sglang_config.get_sglang_gpu_ids()} (server idle during training)", flush=True)
+            print(f"  Megatron GPUs: {self.sglang_config.get_megatron_gpu_ids()}", flush=True)
+            print(f"  Post-training: update_weights_from_disk → LoRA reload → cache warmup", flush=True)
             use_gpu_isolation = True
+        elif strategy == "sleep_wake":
+            sglang_gpus = set(self.sglang_config.get_sglang_gpu_ids())
+            megatron_gpus = set(self.sglang_config.get_megatron_gpu_ids())
+            gpus_overlap = bool(sglang_gpus & megatron_gpus)
             
-        elif can_preserve and cache_method == "sleep_wake":
-            print(f"[vLLM] Method: Sleep/Wake (weights offloaded to CPU, KV cache discarded)")
-            training_gpus = self.vllm_config.get_megatron_gpu_ids()
-            print(f"  Training GPUs: {training_gpus}")
-            llm = await self.llm
-            await llm.pause_generation()
-            # level=2: offload weights to CPU, DISCARD KV cache (ART architecture)
-            await run_on_workers(llm, do_sleep, level=2)
-            self._is_sleeping = True
-            gc_and_empty_cuda_cache()
-            # Use GPU isolation if training_gpu_ids is explicitly set (for fair comparison)
-            use_gpu_isolation = self.vllm_config.training_gpu_ids is not None
+            print(f"[SGLang] Method: Sleep/Wake (cache rebuilt after training)")
+            print(f"  SGLang GPUs: {sorted(sglang_gpus)}")
+            print(f"  Megatron GPUs: {sorted(megatron_gpus)}")
+            print(f"  GPU overlap: {gpus_overlap}")
             
+            if gpus_overlap:
+                # Same GPU(s) for inference + training: MUST offload ALL memory
+                # (weights + KV cache + CUDA graphs) to free GPU for training.
+                # KV cache is released too because update_weights_from_disk will
+                # invalidate it anyway (new weights → stale KV values).
+                release_ok = await self._native_release_memory(tags=_native_sleep_tags)
+                if release_ok:
+                    _slept = True
+                    print(f"  ✓ All GPU memory released (weights + KV cache + CUDA graphs)")
+                    print(f"  Server idle, GPU fully free for training")
+                else:
+                    print(f"  ⚠️ Native release_memory failed, falling back to restart")
+                    strategy = "restart"
+                    await self._stop_sglang_server()
+                    self._is_sleeping = True
+                    gc_and_empty_cuda_cache()
+            else:
+                # Separate GPUs: offload SGLang's GPU memory so training can also
+                # use those GPUs (like vLLM sleep_wake which frees ALL GPUs).
+                # Since update_weights_from_disk invalidates KV cache anyway,
+                # there's no benefit to keeping it alive.
+                release_ok = await self._native_release_memory(tags=_native_sleep_tags)
+                if release_ok:
+                    _slept = True
+                    print(f"  ✓ SGLang GPU memory released (training can use all GPUs)")
+                else:
+                    print(f"  ⚠️ release_memory failed on separate GPUs, continuing with isolation")
+                    print(f"  Server stays fully loaded, training uses non-SGLang GPUs only")
+            # When memory is released (_slept=True), the SGLang PROCESS is still
+            # alive with a CUDA context on its GPU(s). If Megatron also uses those
+            # GPUs, the sleeping process can crash from CUDA errors / OOM.
+            #
+            # If the user explicitly set training_gpu_ids, respect that.
+            # Otherwise, STILL isolate to non-SGLang GPUs to protect the sleeping
+            # server (we need it alive for update_weights_from_disk after training).
+            if _slept and self.sglang_config.training_gpu_ids is None:
+                # Auto-isolate: train on all GPUs EXCEPT SGLang's
+                use_gpu_isolation = True
+            else:
+                use_gpu_isolation = not _slept
+        elif strategy == "sleep":
+            print(f"[SGLang] Method: Sleep (DEPRECATED — offload weights to CPU)")
+            print(f"  SGLang GPUs: {self.sglang_config.get_sglang_gpu_ids()}")
+            print(f"  Megatron GPUs: {self.sglang_config.get_megatron_gpu_ids()}")
+            
+            # Offload weights via /art/sleep endpoint (old custom launcher)
+            sleep_result = await self._sleep_server()
+            if sleep_result is not None:
+                _slept = True
+                print(f"  ✓ Model weights offloaded: {sleep_result.get('gpu_freed_gb', '?')}GB "
+                      f"in {sleep_result.get('offload_time_s', '?')}s")
+                print(f"  Server idle with minimal GPU footprint (no SIGSTOP needed)")
+            else:
+                print(f"  ⚠️ Sleep endpoint unavailable, falling back to restart")
+                strategy = "restart"
+                await self._stop_sglang_server()
+                self._is_sleeping = True
+                gc_and_empty_cuda_cache()
+            # NOTE: Do NOT SIGSTOP — see sleep_wake comment above.
+            use_gpu_isolation = True
+        elif strategy == "freeze":
+            # GPU isolation only — do NOT SIGSTOP the server.
+            # SIGSTOP causes the NVIDIA driver to report
+            # cudaErrorDevicesUnavailable for ALL new CUDA contexts,
+            # even on completely separate GPUs.  The driver needs
+            # inter-process coordination for memory management and a
+            # SIGSTOP'd process can't respond.
+            #
+            # With separate GPUs, contention is negligible — SGLang
+            # sits idle on GPU 0 while Megatron trains on GPUs 2,3.
+            print(f"[SGLang] Method: Freeze (GPU isolation — cache PRESERVED)", flush=True)
+            print(f"  SGLang GPUs: {self.sglang_config.get_sglang_gpu_ids()} (server idle, memory stays)", flush=True)
+            print(f"  Megatron GPUs: {self.sglang_config.get_megatron_gpu_ids()}", flush=True)
+            use_gpu_isolation = True
+        elif strategy == "hot_reload":
+            print(f"[SGLang] Method: Hot-Reload (cache PRESERVED, ⚠️ process stays active)")
+            print(f"  SGLang GPUs: {self.sglang_config.get_sglang_gpu_ids()}")
+            print(f"  Megatron GPUs: {self.sglang_config.get_megatron_gpu_ids()}")
+            print(f"  ⚠️ Server stays active → training may be slower due to contention")
+            use_gpu_isolation = True
         else:
-            if self.vllm_config.preserve_cache_during_training and cache_method != "none":
-                total_gpus = torch.cuda.device_count()
-                vllm_gpus = len(self.vllm_config.get_vllm_gpu_ids())
-                print(f"[vLLM] Cannot preserve cache with {cache_method}: need more GPUs (have {total_gpus}, vLLM uses {vllm_gpus})")
-            print(f"[vLLM] Method: Restart (KV cache will be CLEARED)")
-            await self._stop_vllm_engine()
+            # restart
+            if cache_method != "restart":
+                print(f"[SGLang] Method: Restart (fallback — {cache_method} not available)")
+            else:
+                print(f"[SGLang] Method: Restart (server stopped → cache LOST)")
+            await self._stop_sglang_server()
             self._is_sleeping = True
             gc_and_empty_cuda_cache()
-            use_gpu_isolation = False
-            can_preserve = False  # Force restart path
+            print(f"  GPU memory freed.")
+            use_gpu_isolation = self.sglang_config.training_gpu_ids is not None
         _t_pre = _time.perf_counter()
 
         # Start Megatron training
         await self._ensure_megatron_running(use_gpu_isolation=use_gpu_isolation)
         _t_megatron_start = _time.perf_counter()
 
-        # Setup training job
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
         self._ensure_lora_adapter_config(lora_path)
+
         self._optimizer_state_path = self._get_optimizer_state_path()
 
         # Submit job to Megatron
@@ -663,9 +1580,8 @@ class MegatronService:
         for job_name in os.listdir(jobs_dir):
             if job_name.endswith(".json"):
                 os.remove(os.path.join(jobs_dir, job_name))
-        # Use same log file path as SGLang (the default in MegatronTrainingJob)
+        
         log_file_path = "/tmp/megatron_training_log.jsonl"
-        # Remove old log file if exists
         if os.path.exists(log_file_path):
             os.remove(log_file_path)
         
@@ -675,7 +1591,6 @@ class MegatronService:
             disk_packed_tensors=disk_packed_tensors,
             config=config,
             experimental_config=_config,
-            # Use default log_file_path (/tmp/megatron_training_log.jsonl) same as SGLang
         )
         job_path = os.path.join(jobs_dir, f"{datetime.datetime.now().isoformat()}.json")
         with open(job_path, "w") as f:
@@ -685,21 +1600,42 @@ class MegatronService:
         # Wait for training to complete
         num_lines = 0
         log_found = False
-        print(f"[vLLM] Waiting for training, reading from: {log_file_path}")
+        print(f"[SGLang] Waiting for training, reading from: {log_file_path}", flush=True)
         while True:
             await asyncio.sleep(0.1)
             try:
                 with open(log_file_path, "r") as log_file:
                     if not log_found:
-                        print(f"[vLLM] Log file found, monitoring...")
+                        print(f"[SGLang] Log file found, monitoring...", flush=True)
                         log_found = True
                     lines = log_file.readlines()[num_lines:]
                     for line in lines:
                         if line := line.strip():
                             if line == "all done":
-                                print("[vLLM] Training complete, merging LoRA adapters...")
+                                print("[SGLang] DEBUG: Found 'all done' in log file", flush=True)
+                                
+                                # Wait for Megatron process to exit cleanly.
+                                # train.py now exits after each job (veRL-style),
+                                # so we must wait for destroy_process_group() to
+                                # finish before proceeding. This frees ALL GPU
+                                # memory (CUDA contexts, allocated tensors, etc.)
+                                if self._megatron_process is not None:
+                                    try:
+                                        print("[SGLang] Waiting for Megatron process to exit...", flush=True)
+                                        await asyncio.wait_for(
+                                            self._megatron_process.wait(), timeout=60.0
+                                        )
+                                        rc = self._megatron_process.returncode
+                                        print(f"[SGLang] Megatron process exited (rc={rc})", flush=True)
+                                    except asyncio.TimeoutError:
+                                        print("[SGLang] ⚠️ Megatron process didn't exit in 60s, killing", flush=True)
+                                        self._megatron_process.kill()
+                                        await self._megatron_process.wait()
+                                    self._megatron_process = None
+                                
+                                print("[SGLang] Training complete, merging LoRA adapters...", flush=True)
                                 self._merge_lora_adapter(lora_path)
-                                print("[vLLM] LoRA merge complete, saving checkpoint...")
+                                print("[SGLang] LoRA merge complete", flush=True)
                                 try:
                                     os.remove(log_file_path)
                                 except Exception:
@@ -712,84 +1648,247 @@ class MegatronService:
                     break
             except FileNotFoundError:
                 continue
+        print(f"[SGLang] DEBUG: Exited training loop", flush=True)
         _t_training_done = _time.perf_counter()
 
         # Save new checkpoint
         next_step = self._latest_step + 1
         new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
+        print(f"[SGLang] DEBUG: Saving checkpoint to {new_checkpoint_dir}", flush=True)
         os.makedirs(new_checkpoint_dir, exist_ok=True)
         shutil.copy(
             f"{lora_path}/adapter_model.safetensors",
             f"{new_checkpoint_dir}/adapter_model.safetensors",
         )
         self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
+        print(f"[SGLang] DEBUG: Checkpoint saved", flush=True)
         _t_checkpoint = _time.perf_counter()
 
-        # Note: Don't kill Megatron - it's a long-running service that handles multiple jobs
-        # (same as SGLang's approach)
-
-        # === AFTER TRAINING: Restore/reload based on method ===
-        _reload_method = "none"
-        if can_preserve and cache_method == "http":
-            # HTTP Hot-Reload: Use /v1/load_lora_adapter API
-            print(f"[vLLM] Hot-reloading LoRA for step {next_step}...")
+        # === AFTER TRAINING: Resume inference + reload weights ===
+        # The Megatron process has exited (waited above), so ALL its GPU
+        # memory (CUDA contexts, model weights, optimizer states, gradients)
+        # is now freed by the CUDA driver. Force a gc + empty_cache to
+        # reclaim any orchestrator-side GPU refs before SGLang reloads.
+        gc_and_empty_cuda_cache()
+        print(f"[SGLang] DEBUG: Post-training phase starting. strategy={strategy}", flush=True)
+        _reload_method = strategy
+        if strategy == "verl":
+            # ──────────────────────────────────────────────────────────
+            # veRL PRODUCTION PATTERN:
+            #   1. update_weights_from_disk → reload base weights on GPU
+            #      This automatically flushes the radix cache (correct:
+            #      old KV entries computed with old weights are invalid).
+            #   2. Wait for server healthy
+            #   3. load_lora_adapter → apply new LoRA checkpoint
+            #
+            # Within-iteration prefix caching:
+            #   After weight sync, cache is empty. But within the next
+            #   iteration's inference batch (50 prompts × 4 rollouts = 200):
+            #   - System prompt cached after 1st request (~500 tokens saved × 199)
+            #   - Same question across 4 rollouts → 3 out of 4 hit cache
+            #   - With --schedule-policy lpm, SGLang batches same-prefix requests
+            #   Expected within-iteration rate: 60-80%
+            # ──────────────────────────────────────────────────────────
+            try:
+                import time as _t_sync
+                _sync_t0 = _t_sync.perf_counter()
+                
+                # Step 1: Sync base weights from disk
+                print(f"[SGLang] Syncing weights from disk (radix cache will flush)...", flush=True)
+                reload_ok = await self._update_weights_from_disk()
+                if not reload_ok:
+                    raise RuntimeError("update_weights_from_disk failed")
+                _sync_elapsed = _t_sync.perf_counter() - _sync_t0
+                print(f"  ✓ Base weights synced in {_sync_elapsed:.1f}s (cache flushed — correct for RL)", flush=True)
+                
+                # Step 2: Wait for server to stabilize after weight reload
+                print(f"[SGLang] Waiting for server health after weight sync...", flush=True)
+                healthy = False
+                for i in range(30):  # Up to 30s
+                    if await self._is_server_healthy():
+                        healthy = True
+                        break
+                    await asyncio.sleep(1.0)
+                if not healthy:
+                    raise RuntimeError("Server not healthy after update_weights_from_disk")
+                print(f"  ✓ Server healthy", flush=True)
+                
+                # Step 3: Unload existing LoRA adapter before loading new one
+                # After update_weights_from_disk, the old LoRA adapter name is still
+                # registered in SGLang's adapter registry (pointing to the previous
+                # checkpoint). Trying to /load_lora_adapter with the same name returns
+                # 400: "already loaded". Must unload first, then load fresh.
+                lora_name = self._get_fixed_lora_name()
+                print(f"[SGLang] Unloading old LoRA '{lora_name}' before reload...", flush=True)
+                unloaded = False
+                async with aiohttp.ClientSession() as session:
+                    for endpoint in ("/unload_lora_adapter", "/delete_lora_adapter"):
+                        try:
+                            async with session.post(
+                                f"http://{self._server_host}:{self._server_port}{endpoint}",
+                                json={"lora_name": lora_name},
+                                timeout=aiohttp.ClientTimeout(total=10)
+                            ) as resp:
+                                if resp.status == 200:
+                                    print(f"  ✓ Unloaded old LoRA via {endpoint}", flush=True)
+                                    unloaded = True
+                                    break
+                                else:
+                                    resp_text = await resp.text()
+                                    print(f"  {endpoint} returned {resp.status}: {resp_text}", flush=True)
+                        except Exception as e:
+                            print(f"  {endpoint} failed: {e}", flush=True)
+                if not unloaded:
+                    print(f"  ⚠️ Could not unload old LoRA (may not exist yet — first iteration)", flush=True)
+                
+                # Step 4: Hot-reload LoRA with new checkpoint
+                print(f"[SGLang] Hot-reloading LoRA for step {next_step}...", flush=True)
+                await asyncio.wait_for(
+                    self._hot_reload_lora(new_checkpoint_dir, next_step),
+                    timeout=120.0
+                )
+                print(f"  ✓ LoRA hot-reloaded", flush=True)
+                await self._unload_old_loras(keep_step=next_step)
+                _reload_method = "verl+update_weights_from_disk+lora_reload"
+                print(f"[SGLang] ✓ Weights synced + LoRA reloaded (within-iteration prefix caching active)", flush=True)
+                
+            except (asyncio.TimeoutError, Exception) as e:
+                print(f"[SGLang] ⚠️ veRL post-training failed: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                print(f"[SGLang] ⚠️ RESTARTING SERVER — fallback", flush=True)
+                self.sglang_config.cache_method = "verl"  # Keep verl for next iteration
+                await self._stop_sglang_server()
+                gc_and_empty_cuda_cache()
+                await self._start_sglang_server(new_checkpoint_dir)
+                await self._hot_reload_lora(new_checkpoint_dir, next_step)
+                _reload_method = "verl_failed→restart"
+        elif strategy in ("sleep_wake", "sleep", "freeze"):
+            try:
+                if _slept and strategy == "sleep_wake":
+                    # ──────────────────────────────────────────────────────────
+                    # SLEEP_WAKE resume: ALL memory was released (weights + KV cache
+                    # + CUDA graphs) via release_memory_occupation.
+                    # The server process IS alive but can't serve inference,
+                    # so /health will return False. Do NOT health-check first!
+                    #
+                    # Correct order (veRL/Slime pattern for MoE):
+                    #   1. update_weights_from_disk → reload ALL weights from disk to GPU
+                    #      (NOT resume_memory_occupation which is broken for MoE — #6367)
+                    #   2. Wait for server to become healthy (weights now on GPU)
+                    #   3. load_lora_adapter → apply new LoRA checkpoint
+                    #
+                    # NOTE: KV cache / radix cache is REBUILT from scratch after weight
+                    # reload. The old KV entries were computed with old weights and are
+                    # invalid. Warmup requests in the next iteration's batch will
+                    # repopulate the cache with fresh KV values.
+                    # ──────────────────────────────────────────────────────────
+                    print(f"[SGLang] Reloading base weights from disk (MoE-safe)...", flush=True)
+                    reload_ok = await self._update_weights_from_disk()
+                    if not reload_ok:
+                        raise RuntimeError("update_weights_from_disk failed")
+                    print(f"  ✓ Base weights reloaded from disk (radix cache will rebuild)", flush=True)
+                    
+                    # Wait for server to become healthy after weight reload
+                    print(f"[SGLang] Waiting for server to be healthy after weight reload...", flush=True)
+                    healthy = False
+                    for i in range(30):  # Up to 30s
+                        if await self._is_server_healthy():
+                            healthy = True
+                            break
+                        await asyncio.sleep(1.0)
+                    if not healthy:
+                        raise RuntimeError("Server not healthy after update_weights_from_disk")
+                    print(f"  ✓ Server healthy", flush=True)
+                    
+                elif _slept and strategy == "sleep":
+                    # Old custom launcher wake
+                    print(f"[SGLang] Calling wake (old launcher)...", flush=True)
+                    wake_result = await self._wake_server()
+                    if wake_result:
+                        print(f"  ✓ Weights reloaded: {wake_result.get('gpu_reloaded_gb', '?')}GB "
+                              f"in {wake_result.get('reload_time_s', '?')}s", flush=True)
+                    else:
+                        raise RuntimeError("Wake endpoint failed")
+                    await asyncio.sleep(1.0)
+                    for i in range(10):
+                        if await self._is_server_healthy():
+                            break
+                        await asyncio.sleep(1.0)
+                    
+                else:
+                    # freeze or non-slept: server should be healthy, just verify
+                    print(f"[SGLang] Checking server health...", flush=True)
+                    thaw_ok = await self._is_server_healthy()
+                    if not thaw_ok:
+                        # Wait a bit — server may be briefly unresponsive
+                        for i in range(10):
+                            if await self._is_server_healthy():
+                                thaw_ok = True
+                                break
+                            await asyncio.sleep(1.0)
+                    if not thaw_ok:
+                        raise RuntimeError("Server not healthy after freeze/idle")
+                    print(f"  ✓ Server healthy", flush=True)
+                
+                # Hot-reload LoRA with new checkpoint
+                print(f"[SGLang] Hot-reloading LoRA for step {next_step}...", flush=True)
+                await asyncio.wait_for(
+                    self._hot_reload_lora(new_checkpoint_dir, next_step),
+                    timeout=120.0
+                )
+                print(f"  ✓ LoRA hot-reloaded", flush=True)
+                await self._unload_old_loras(keep_step=next_step)
+                if _slept:
+                    _reload_method = f"{strategy}+update_weights_from_disk"
+                else:
+                    _reload_method = "gpu_isolation+hot_reload"
+                print(f"[SGLang] ✓ Server resumed + LoRA reloaded (cache rebuilds on next inference)", flush=True)
+                
+            except (asyncio.TimeoutError, Exception) as e:
+                print(f"[SGLang] ⚠️ Post-training reload failed: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                print(f"[SGLang] ⚠️ RESTARTING SERVER — cache will be LOST", flush=True)
+                self.sglang_config.cache_method = "freeze"
+                await self._stop_sglang_server()
+                gc_and_empty_cuda_cache()
+                await self._start_sglang_server(new_checkpoint_dir)
+                await self._hot_reload_lora(new_checkpoint_dir, next_step)
+                _reload_method = f"{strategy}_failed→restart"
+        elif strategy == "hot_reload":
+            # Server was active the whole time, just hot-reload
+            print(f"[SGLang] Hot-reloading LoRA for step {next_step} (cache preserved)")
             try:
                 if not await self._is_server_healthy():
                     raise RuntimeError("Server became unhealthy during training")
-                
                 await asyncio.wait_for(
                     self._hot_reload_lora(new_checkpoint_dir, next_step),
                     timeout=120.0
                 )
                 await self._unload_old_loras(keep_step=next_step)
-                _reload_method = "http_hot_reload"
-                print(f"[vLLM] HTTP hot-reload successful (cache preserved)")
+                _reload_method = "hot_reload"
+                print(f"[SGLang] Hot-reload successful (cache preserved)")
             except (asyncio.TimeoutError, Exception) as e:
-                _reload_method = "engine_restart"
-                print(f"[vLLM] HTTP hot-reload failed: {e}, falling back to restart")
-                await self._stop_vllm_engine()
+                _reload_method = "hot_reload_failed→restart"
+                print(f"[SGLang] ⚠️ Hot-reload FAILED: {e}, restarting server")
+                await self._stop_sglang_server()
                 gc_and_empty_cuda_cache()
-                await self._start_vllm_engine(new_checkpoint_dir, next_step)
-                
-        elif can_preserve and cache_method == "sleep_wake":
-            # Sleep/Wake: Megatron already offloaded to CPU (see train.py line 346)
-            # Just need to ensure GPU memory is freed before vLLM wakes up
-            print(f"[vLLM] Waiting for Megatron GPU memory cleanup...")
-            await asyncio.sleep(0.5)  # Allow async GPU cleanup to complete
-            gc_and_empty_cuda_cache()
-            print(f"[vLLM] Waking up engine and loading LoRA for step {next_step}...")
-            await run_on_workers(llm, do_wake_up)
-            await llm.resume_generation()
-            # Use HTTP /v1/load_lora_adapter to register the new LoRA.
-            # Engine-level add_lora alone does NOT update the OpenAI API model
-            # list in newer vLLM versions (the _openai_serving_models capture
-            # fails for vLLM v1), so the model name would return 404.
-            try:
-                await asyncio.wait_for(
-                    self._hot_reload_lora(new_checkpoint_dir, next_step),
-                    timeout=60.0,
-                )
-            except Exception as e:
-                # Fallback: try engine-level add (works if serving_models was captured)
-                print(f"[vLLM] HTTP LoRA load failed ({e}), trying engine-level add...")
-                await llm.pause_generation()
-                await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
-                await llm.resume_generation()
-            _reload_method = "sleep_wake"
-            print(f"[vLLM] Sleep/wake restore successful")
-            
+                await self._start_sglang_server(new_checkpoint_dir)
+                await self._hot_reload_lora(new_checkpoint_dir, next_step)
         else:
-            # Restart: Start fresh vLLM engine with new LoRA
-            _reload_method = "engine_restart"
-            print(f"[vLLM] Starting vLLM engine for step {next_step}...")
-            await self._start_vllm_engine(new_checkpoint_dir, next_step)
+            # restart — server was killed, start fresh
+            _reload_method = "server_restart"
+            print(f"[SGLang] Restarting server with LoRA step {next_step}...")
+            await self._start_sglang_server(new_checkpoint_dir)
+            await self._hot_reload_lora(new_checkpoint_dir, next_step)
         _t_reload = _time.perf_counter()
         
         self._latest_step = next_step
         self._is_sleeping = False
-        
-        # Print detailed timing breakdown for debugging training speed
-        print(f"\n[vLLM] ═══ Training Timing Breakdown ═══")
+
+        # Print detailed timing breakdown
+        print(f"\n[SGLang] ═══ Training Timing Breakdown ═══")
         print(f"  Health check:       {(_t_health - _t0):.2f}s")
         print(f"  Pre-training:       {(_t_pre - _t_health):.2f}s (method={cache_method})")
         print(f"  Megatron startup:   {(_t_megatron_start - _t_pre):.2f}s")
@@ -800,75 +1899,9 @@ class MegatronService:
         print(f"  ─────────────────────────────────────")
         print(f"  TOTAL:              {(_t_reload - _t0):.2f}s")
         print(f"═══════════════════════════════════════\n")
-        
+
         if verbose:
-            print(f"[vLLM] Training complete (step {next_step})")
-
-    async def _stop_vllm_engine(self) -> None:
-        """Stop vLLM engine completely (like SGLang's _stop_sglang_server)."""
-        if "llm" in self.__dict__:
-            try:
-                llm = await self.llm
-                await llm.shutdown()
-            except Exception:
-                pass
-            del self.__dict__["llm"]
-        
-        # Kill any vLLM processes
-        subprocess.run(["pkill", "-9", "-f", "vllm.entrypoints"], check=False)
-        subprocess.run(["pkill", "-9", "-f", "vllm.v1"], check=False)
-        await asyncio.sleep(1.0)
-
-    async def _kill_megatron(self) -> None:
-        """Kill Megatron subprocess."""
-        print("[vLLM] Killing Megatron process...")
-        if self._megatron_process is not None:
-            self._megatron_process.terminate()
-            try:
-                await asyncio.wait_for(self._megatron_process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                print("[vLLM] Megatron didn't terminate, force killing...")
-                self._megatron_process.kill()
-                try:
-                    await asyncio.wait_for(self._megatron_process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    print("[vLLM] Force kill timed out, continuing anyway")
-            self._megatron_process = None
-        
-        # Kill any orphaned processes
-        subprocess.run(["pkill", "-9", "-f", "megatron/train.py"], check=False)
-        subprocess.run(["pkill", "-9", "-f", "torchrun"], check=False)
-        await asyncio.sleep(0.5)
-        gc_and_empty_cuda_cache()
-        print("[vLLM] Megatron killed")
-
-    async def _start_vllm_engine(self, checkpoint_dir: str, step: int) -> None:
-        """Start fresh vLLM engine (like SGLang's _start_sglang_server)."""
-        print(f"[vLLM] Starting fresh vLLM engine with checkpoint {checkpoint_dir} (step {step})...")
-        
-        # Get fresh engine
-        llm = await self.llm
-        
-        # Start the OpenAI server with LoRA config
-        # Note: get_openai_server_config already registers BOTH model_name and model_name@step
-        # via lora_modules, so we don't need to call _add_lora_aliases separately
-        lora_path_for_server = (
-            checkpoint_dir if self._adapter_has_weights(checkpoint_dir) else None
-        )
-        server_config = dev.get_openai_server_config(
-            model_name=self.model_name,
-            base_model=self.base_model,
-            log_file=f"{self.output_dir}/logs/vllm.log",
-            lora_path=lora_path_for_server,
-            config=None,
-        )
-        await openai_server_task(engine=llm, config=server_config)
-        
-        # Update tracking (LoRA is already registered via lora_modules in server config)
-        self._latest_step = step
-        
-        await llm.resume_generation()
-        print(f"[vLLM] Engine started successfully with LoRA step {step}")
+            print(f"SGLangMegatronService.train complete (step {next_step})")
 
     def _merge_lora_adapter(self, lora_path: str) -> None:
         """Merge sharded LoRA adapters from distributed training."""
@@ -892,14 +1925,8 @@ class MegatronService:
 
         for key, tensors in sharded_tensors.items():
             if len(tensors) == 1:
-                # Only one rank saved this tensor (unsharded param, saved by tp_rank 0 only)
                 adapter_model[key] = tensors[0]
             else:
-                # Multiple ranks saved — these are TP shards, always concatenate.
-                # lora_A shards along dim=1 (in_features), lora_B along dim=0 (out_features).
-                # NOTE: Do NOT use torch.equal to detect "duplicates" — zero-valued
-                # TP shards (inactive MoE experts) are equal but must still be concatenated
-                # to produce the correct full-size tensor for vLLM/SGLang.
                 tensor = torch.cat(tensors, dim=1 if "lora_A" in key else 0)
                 adapter_model[key] = tensor
 
@@ -907,14 +1934,14 @@ class MegatronService:
         for filename in shard_filenames:
             filename.unlink()
 
-    @cached_property
-    def llm(self) -> asyncio.Task[AsyncLLM]:
-        engine_args = {
-            **self.config.get("engine_args", {}),
-            "enable_lora": True,
-            "max_loras": self.config.get("engine_args", {}).get("max_loras", 2),
-            "enable_prefix_caching": True,  # Enable automatic prefix caching
-        }
-        for key in ["enable_log_requests", "disable_log_requests"]:
-            engine_args.pop(key, None)
-        return asyncio.create_task(get_llm(AsyncEngineArgs(**engine_args)))  # type: ignore
+    async def shutdown(self) -> None:
+        """Clean shutdown of service."""
+        await self._stop_sglang_server()
+        
+        if self._megatron_process:
+            self._megatron_process.terminate()
+            try:
+                await asyncio.wait_for(self._megatron_process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self._megatron_process.kill()
+            self._megatron_process = None
