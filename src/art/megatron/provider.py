@@ -19,49 +19,44 @@ def get_provider(model: str) -> GPTModelProvider:
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
+
     num_gpus = torch.cuda.device_count()
-    # ── Parallelism strategy for MoE-heavy models (Qwen3-30B-A3B) ──
+
+    # ── Auto-detect parallelism for MoE models ──
     #
-    # Qwen3-30B-A3B memory breakdown (bf16):
-    #   - 128 routed experts × 48 layers × (3 × 4096 × 768)   = ~58 GiB total
-    #   - 1 shared expert  × 48 layers × (3 × 4096 × 18944)   = ~21 GiB total  ← BIG
-    #   - Attention (q/k/v/o) × 48 layers                      = ~3.6 GiB total
-    #   - Embeddings                                            = ~1.2 GiB total
+    # Constraints:
+    #   world_size = TP * PP * CP * DP
+    #   EP must divide DP (expert parallelism lives inside data-parallel group)
+    #   num_experts (128 for Qwen3-30B-A3B) must be divisible by EP
+    #   TP should be power-of-2 for Megatron all-reduce efficiency
+    #   Higher TP = less weight replication = less memory, but more communication
     #
-    # KEY INSIGHT: With TP < num_gpus, some components get REPLICATED across
-    # TP groups.  E.g. TP=2 on 4 GPUs → 2 TP groups → shared expert (21 GiB)
-    # is split within each group (10.5 GiB) but COPIED to both groups.
-    # Result: 42 GiB weights per GPU → OOM on backward pass.
-    #
-    # FIX: Use TP = num_gpus (all GPUs in ONE TP group).  Zero replication:
-    #   TP=4, EP=1, ETP=4 → everything split 4 ways → ~15 GiB/GPU
-    #   Leaves ~60 GiB free for activations/backward (plenty).
-    #
-    # Trade-off: TP=4 has more all-reduce communication than TP=2, making
-    # each training step ~20-30% slower.  But TP=2 OOMs, so slower > crash.
-    #
-    # Parallelism math: world = TP × PP × CP × DP
-    #   TP=4, PP=1, CP=1 → DP=1, EP=1, ETP=4
-    #
-    # Memory per GPU with TP=4:
-    #   routed = 58/4 = 14.5 GiB   (split by ETP=4)
-    #   shared = 21/4 =  5.25 GiB  (split by TP=4, NO replication)
-    #   attn   = 3.6/4 = 0.9 GiB   (split by TP=4, NO replication)
-    #   embed  = 1.2/4 = 0.3 GiB
-    #   TOTAL  ≈ 21 GiB  → 59 GiB free for backward ✅
+    # Strategy: maximize TP (to avoid weight replication OOM on backward),
+    # then set EP to largest valid divisor of the remaining DP dimension.
+
     pp = 1
     cp = 1
-    # Use ALL GPUs in one TP group to eliminate weight replication.
-    # Round down to nearest power-of-2 for TP (Megatron requirement).
-    if num_gpus >= 4:
-        tp = 4
-    elif num_gpus >= 2:
-        tp = 2
-    else:
-        tp = 1
+    num_experts = 128  # Qwen3-30B-A3B
+
+    # Pick largest power-of-2 TP that divides num_gpus
+    tp = 1
+    for candidate in [8, 4, 2, 1]:
+        if num_gpus % candidate == 0 and num_gpus >= candidate:
+            tp = candidate
+            break
+
     dp_size = num_gpus // (tp * pp * cp)
-    ep = max(1, dp_size)       # EP=1 when TP=num_gpus (DP=1)
-    etp = tp                   # Split expert weights across all TP ranks
+
+    # EP must divide both dp_size AND num_experts
+    # Pick the largest valid EP for maximum expert distribution
+    ep = 1
+    for candidate in range(dp_size, 0, -1):
+        if dp_size % candidate == 0 and num_experts % candidate == 0:
+            ep = candidate
+            break
+
+    # ETP: split expert weights across TP ranks
+    etp = tp
 
     provider.tensor_model_parallel_size = tp
     provider.context_parallel_size = cp
@@ -70,17 +65,20 @@ def get_provider(model: str) -> GPTModelProvider:
     provider.expert_tensor_parallel_size = etp
     provider.moe_shared_expert_overlap = True
     provider.moe_router_dtype = "fp32"
-    # ── MoE token capacity: prevent routing-spike OOM across epochs ──
-    # Without a cap, the router can send disproportionately many tokens to
-    # experts on one GPU (data-dependent).  With EP, tokens are all-to-all
-    # dispatched, so one GPU can receive 2-3× the average, causing transient
-    # OOM during backward.  Setting a capacity factor caps per-expert tokens
-    # to (total_tokens / num_experts) * capacity_factor.  Tokens beyond cap
-    # are dropped (lowest-probability first) — has negligible training impact
-    # for RL/RLHF but makes memory usage bounded and deterministic.
-    provider.moe_token_drop_policy = "probs"        # drop least-confident routes
-    provider.moe_expert_capacity_factor = 1.5        # 50% headroom over uniform
-    provider.moe_pad_expert_input_to_capacity = True # deterministic memory per expert
+
+    # ── MoE token capacity: prevent routing-spike OOM ──
+    provider.moe_token_drop_policy = "probs"
+    provider.moe_expert_capacity_factor = 1.5
+    provider.moe_pad_expert_input_to_capacity = True
+
     if tp > 1:
         provider.sequence_parallel = True
+
+    # Log chosen config for debugging
+    dp_actual = num_gpus // (tp * pp * cp)
+    print(
+        f"[Megatron parallelism] GPUs={num_gpus} TP={tp} PP={pp} CP={cp} "
+        f"DP={dp_actual} EP={ep} ETP={etp}"
+    )
+
     return provider
