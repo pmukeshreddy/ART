@@ -129,6 +129,8 @@ class LoRA(torch.nn.Module):
                     ("lora_A.weight", self.A_T),
                     ("lora_B.weight", self.B_T),
                 )
+                if getattr(param, "sharded", False)
+                or ps.get_tensor_model_parallel_rank() == 0
             }
         if ps.get_data_parallel_rank() != 0 or torch.all(self.A_T == 0):
             return {}
