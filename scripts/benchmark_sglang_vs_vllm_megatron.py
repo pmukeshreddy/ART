@@ -893,7 +893,12 @@ class BackendManager:
                 pass
                 
         elif self.backend_type == "vllm":
-            # vLLM provides metrics endpoint (Prometheus format)
+            # vLLM v1 provides metrics endpoint (Prometheus format)
+            # Metric names changed across versions:
+            #   v0: vllm:gpu_prefix_cache_hit_rate (gauge, 0-1)
+            #   v1: vllm:prefix_cache_hits / vllm:prefix_cache_queries (counters)
+            #   v1: vllm:gpu_prefix_cache_hits / vllm:gpu_prefix_cache_queries (counters)
+            # Note: Prometheus text format uses the colon in metric names
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
@@ -902,20 +907,53 @@ class BackendManager:
                     ) as resp:
                         if resp.status == 200:
                             text = await resp.text()
-                            hit_count = 0
-                            miss_count = 0
+                            hits = 0
+                            queries = 0
+                            hit_rate_gauge = -1.0
                             for line in text.splitlines():
-                                if line.startswith("vllm_prefix_cache_hit_count"):
-                                    hit_count = int(float(line.split()[-1]))
+                                if line.startswith("#"):
+                                    continue
+                                # v1 counters (preferred)
+                                if "prefix_cache_hits" in line and "gpu_prefix_cache_hits" not in line:
+                                    try: hits = max(hits, int(float(line.split()[-1])))
+                                    except: pass
+                                elif "prefix_cache_queries" in line and "gpu_prefix_cache_queries" not in line:
+                                    try: queries = max(queries, int(float(line.split()[-1])))
+                                    except: pass
+                                # GPU-specific counters
+                                elif "gpu_prefix_cache_hits" in line:
+                                    try: hits = max(hits, int(float(line.split()[-1])))
+                                    except: pass
+                                elif "gpu_prefix_cache_queries" in line:
+                                    try: queries = max(queries, int(float(line.split()[-1])))
+                                    except: pass
+                                # v0 deprecated gauge (fallback)
+                                elif "gpu_prefix_cache_hit_rate" in line:
+                                    try: hit_rate_gauge = max(hit_rate_gauge, float(line.split()[-1]))
+                                    except: pass
+                                # Legacy names (underscore separator)
+                                elif line.startswith("vllm_prefix_cache_hit_count"):
+                                    try: hits = max(hits, int(float(line.split()[-1])))
+                                    except: pass
                                 elif line.startswith("vllm_prefix_cache_miss_count"):
-                                    miss_count = int(float(line.split()[-1]))
-                            total = hit_count + miss_count
-                            if total > 0:
+                                    try:
+                                        miss = int(float(line.split()[-1]))
+                                        queries = max(queries, hits + miss)
+                                    except: pass
+                            
+                            if queries > 0:
                                 return {
-                                    "hit_rate": hit_count / total,
-                                    "hit_count": hit_count,
-                                    "miss_count": miss_count,
+                                    "hit_rate": hits / queries,
+                                    "hit_count": hits,
+                                    "miss_count": queries - hits,
                                     "source": "prometheus",
+                                }
+                            elif hit_rate_gauge >= 0:
+                                return {
+                                    "hit_rate": hit_rate_gauge,
+                                    "hit_count": 0,
+                                    "miss_count": 0,
+                                    "source": "prometheus_gauge",
                                 }
             except Exception:
                 pass
