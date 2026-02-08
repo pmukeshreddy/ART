@@ -116,7 +116,7 @@ class MegatronTrainingJob(BaseModel):
     log_file_path: str = "/tmp/megatron_training_log.jsonl"
 
 
-SGLangCacheMethod = Literal["sleep_wake", "sleep", "freeze", "hot_reload", "restart"]
+SGLangCacheMethod = Literal["verl", "sleep_wake", "sleep", "freeze", "hot_reload", "restart"]
 
 
 @dataclass
@@ -141,33 +141,23 @@ class SGLangConfig:
     training_gpu_ids: list[int] | None = None  # Explicit GPU IDs for Megatron training (e.g., [1])
     
     # Cache method for SGLang during training:
-    #   "sleep_wake" (RECOMMENDED): Uses SGLang's native /release_memory_occupation
-    #                 to offload ALL GPU memory (weights + KV cache + CUDA graphs)
-    #                 to CPU before training. ALL GPUs are freed for training.
-    #                 After training: /update_weights_from_disk reloads ALL weights
-    #                 fresh from disk (NOT resume_memory_occupation which is broken
-    #                 for MoE models — SGLang issue #6367). Then /load_lora_adapter
-    #                 with the new LoRA checkpoint.
-    #                 NOTE: KV/radix cache is REBUILT (not preserved) because new
-    #                 weights invalidate all cached KV entries. Warmup requests
-    #                 repopulate the cache at the start of each inference phase.
-    #                 Requires: --enable-memory-saver on server.
-    #                 Frees ALL GPU memory. Training speed matches vLLM sleep_wake.
-    #   "freeze":     SIGSTOP the SGLang process group during training, SIGCONT after.
-    #                 Suspends ALL threads → zero CPU/PCIe contention.
-    #                 GPU memory stays allocated (model weights + KV cache on GPU 0).
-    #                 After SIGCONT: server resumes instantly, cache is 100% preserved.
-    #                 Training may be slower due to 65GB frozen allocation on GPU 0.
-    #   "hot_reload": Keep server fully active, hot-reload LoRA via HTTP API.
-    #                 Preserves RadixAttention cache but active process causes
-    #                 CPU/PCIe contention with Megatron (~2x slower training on 2-GPU).
-    #                 Best for: 4+ GPU setups where contention is minimal.
-    #   "restart":    Stop server before training, restart after with new LoRA.
-    #                 Cache is LOST. Training runs at full speed but server restart
-    #                 adds ~30-60s overhead per iteration.
-    #                 Use only as fallback when freeze/hot_reload don't work.
-    #   "sleep":      (DEPRECATED) Old custom launcher approach. Use "sleep_wake" instead.
-    cache_method: SGLangCacheMethod = "freeze"
+    #   "verl" (RECOMMENDED — production pattern):
+    #                 GPU isolation: server stays alive on dedicated GPU(s) during training.
+    #                 Megatron trains on separate GPUs. No memory release/reload overhead.
+    #                 After training: update_weights_from_disk → flush radix cache (correct:
+    #                 old KV values are invalid with new weights) → hot-reload LoRA →
+    #                 warmup prefix cache for next iteration.
+    #                 Within-iteration prefix sharing gives 60-80% cache hits.
+    #                 This is the pattern used by veRL, OpenRLHF, and Slime in production.
+    #   "sleep_wake": Uses SGLang's native /release_memory_occupation to offload ALL GPU
+    #                 memory to CPU. ALL GPUs freed for training. After training:
+    #                 update_weights_from_disk reloads weights. Cache rebuilt. ~8-15s overhead.
+    #   "freeze":     GPU isolation only — NO weight sync. Cache 100% preserved but weights
+    #                 become stale after iteration 1. Demo only, NOT production RL.
+    #   "hot_reload": Keep server active, LoRA hot-reload only. No base weight sync.
+    #   "restart":    Stop server, restart after. Cache LOST. Fallback only.
+    #   "sleep":      (DEPRECATED) Old custom launcher. Use "verl" instead.
+    cache_method: SGLangCacheMethod = "verl"
     
     # Performance optimization flags (passed to SGLang server CLI)
     # These are critical for matching/beating vLLM throughput.
@@ -1416,7 +1406,9 @@ class SGLangMegatronService:
         )
         
         # Determine strategy based on cache_method
-        if cache_method == "sleep_wake" and server_alive:
+        if cache_method == "verl" and server_alive:
+            strategy = "verl"
+        elif cache_method == "sleep_wake" and server_alive:
             strategy = "sleep_wake"
         elif cache_method == "sleep" and server_alive:
             strategy = "sleep"
@@ -1451,7 +1443,17 @@ class SGLangMegatronService:
         _native_sleep_tags_safe = ["weights", "cuda_graph"]  # Safe: no kv_cache
         _native_sleep_tags_full = ["weights", "kv_cache", "cuda_graph"]  # Aggressive: everything
         
-        if strategy == "sleep_wake":
+        if strategy == "verl":
+            # veRL/OpenRLHF production pattern:
+            # Pre-training: GPU isolation only — server stays alive on dedicated GPU(s).
+            # No memory release, no SIGSTOP. Zero pre-training overhead.
+            # Post-training: update_weights_from_disk → flush cache (correct) → LoRA reload.
+            print(f"[SGLang] Method: veRL (GPU isolation + weight sync — production RL pattern)", flush=True)
+            print(f"  SGLang GPUs: {self.sglang_config.get_sglang_gpu_ids()} (server idle during training)", flush=True)
+            print(f"  Megatron GPUs: {self.sglang_config.get_megatron_gpu_ids()}", flush=True)
+            print(f"  Post-training: update_weights_from_disk → LoRA reload → cache warmup", flush=True)
+            use_gpu_isolation = True
+        elif strategy == "sleep_wake":
             sglang_gpus = set(self.sglang_config.get_sglang_gpu_ids())
             megatron_gpus = set(self.sglang_config.get_megatron_gpu_ids())
             gpus_overlap = bool(sglang_gpus & megatron_gpus)
@@ -1693,7 +1695,73 @@ class SGLangMegatronService:
         gc_and_empty_cuda_cache()
         print(f"[SGLang] DEBUG: Post-training phase starting. strategy={strategy}", flush=True)
         _reload_method = strategy
-        if strategy in ("sleep_wake", "sleep", "freeze"):
+        if strategy == "verl":
+            # ──────────────────────────────────────────────────────────
+            # veRL PRODUCTION PATTERN:
+            #   1. update_weights_from_disk → reload base weights on GPU
+            #      This automatically flushes the radix cache (correct:
+            #      old KV entries computed with old weights are invalid).
+            #   2. Wait for server healthy
+            #   3. load_lora_adapter → apply new LoRA checkpoint
+            # ──────────────────────────────────────────────────────────
+            if _server_died_during_training or (
+                self._server_process is not None and self._server_process.poll() is not None
+            ):
+                print(f"[SGLang] ⚠️ Server died during training → full restart", flush=True)
+                self._server_process = None
+                await self._stop_sglang_server()
+                gc_and_empty_cuda_cache()
+                await self._start_sglang_server(new_checkpoint_dir)
+                await self._hot_reload_lora(new_checkpoint_dir, next_step)
+                _reload_method = "verl_server_died→restart"
+            else:
+                try:
+                    import time as _t_sync
+                    _sync_t0 = _t_sync.perf_counter()
+                    
+                    # Step 1: Sync base weights from disk
+                    print(f"[SGLang] Syncing weights from disk (radix cache will flush)...", flush=True)
+                    reload_ok = await self._update_weights_from_disk()
+                    if not reload_ok:
+                        raise RuntimeError("update_weights_from_disk failed")
+                    _sync_elapsed = _t_sync.perf_counter() - _sync_t0
+                    print(f"  ✓ Base weights synced in {_sync_elapsed:.1f}s (cache flushed — correct for RL)", flush=True)
+                    
+                    # Step 2: Wait for server to stabilize
+                    print(f"[SGLang] Waiting for server health after weight sync...", flush=True)
+                    healthy = False
+                    for i in range(30):
+                        if await self._is_server_healthy():
+                            healthy = True
+                            break
+                        await asyncio.sleep(1.0)
+                    if not healthy:
+                        raise RuntimeError("Server not healthy after update_weights_from_disk")
+                    print(f"  ✓ Server healthy", flush=True)
+                    
+                    # Step 3: Hot-reload LoRA
+                    print(f"[SGLang] Hot-reloading LoRA for step {next_step}...", flush=True)
+                    await asyncio.wait_for(
+                        self._hot_reload_lora(new_checkpoint_dir, next_step),
+                        timeout=120.0
+                    )
+                    print(f"  ✓ LoRA hot-reloaded", flush=True)
+                    await self._unload_old_loras(keep_step=next_step)
+                    _reload_method = "verl+update_weights_from_disk+lora_reload"
+                    print(f"[SGLang] ✓ Weights synced + LoRA reloaded (within-iteration prefix caching active)", flush=True)
+                    
+                except (asyncio.TimeoutError, Exception) as e:
+                    print(f"[SGLang] ⚠️ veRL post-training failed: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    print(f"[SGLang] ⚠️ RESTARTING SERVER — fallback", flush=True)
+                    self.sglang_config.cache_method = "verl"
+                    await self._stop_sglang_server()
+                    gc_and_empty_cuda_cache()
+                    await self._start_sglang_server(new_checkpoint_dir)
+                    await self._hot_reload_lora(new_checkpoint_dir, next_step)
+                    _reload_method = "verl_failed→restart"
+        elif strategy in ("sleep_wake", "sleep", "freeze"):
             # ── Pre-flight: is the server process even alive? ──
             # If the server died during training (e.g. MoE release_memory bug,
             # CUDA driver interference), skip straight to restart instead of
