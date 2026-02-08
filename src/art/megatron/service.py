@@ -892,14 +892,14 @@ class MegatronService:
 
         for key, tensors in sharded_tensors.items():
             if len(tensors) == 1:
-                adapter_model[key] = tensors[0]
-            elif len(tensors) > 1 and torch.equal(tensors[0], tensors[1]):
-                # Duplicate: unsharded param saved by multiple TP ranks.
-                # This happens when expert LoRA's sharded_lora_state_dict doesn't
-                # filter by TP rank for non-sharded params (e.g., lora_A in
-                # column-parallel MoE layers). Take one copy, don't concatenate.
+                # Only one rank saved this tensor (unsharded param, saved by tp_rank 0 only)
                 adapter_model[key] = tensors[0]
             else:
+                # Multiple ranks saved — these are TP shards, always concatenate.
+                # lora_A shards along dim=1 (in_features), lora_B along dim=0 (out_features).
+                # NOTE: Do NOT use torch.equal to detect "duplicates" — zero-valued
+                # TP shards (inactive MoE experts) are equal but must still be concatenated
+                # to produce the correct full-size tensor for vLLM/SGLang.
                 tensor = torch.cat(tensors, dim=1 if "lora_A" in key else 0)
                 adapter_model[key] = tensor
 
