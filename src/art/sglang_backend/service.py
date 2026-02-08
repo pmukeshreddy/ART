@@ -178,6 +178,7 @@ class SGLangConfig:
     cuda_graph_max_bs: int = 128            # CUDA graph max batch size
     attention_backend: str = "flashinfer"   # Attention kernel backend
     enable_metrics: bool = True             # Expose Prometheus /metrics endpoint (needed for cache_hit_rate)
+    enable_cache_report: bool = True        # Report cached_tokens in API response usage (needed for per-request cache measurement)
     
     def get_tensor_parallel_size(self) -> int:
         """Get tensor parallel size, auto-detecting if not set."""
@@ -643,6 +644,17 @@ class SGLangMegatronService:
                 cmd.append("--enable-metrics")
             else:
                 print(f"  WARNING: --enable-metrics not supported by this SGLang version, skipping")
+        
+        # 7. Cache report — makes SGLang report cached_tokens in API response usage
+        #    Without this, the usage.prompt_tokens_details.cached_tokens field is always 0
+        #    even when RadixCache is actively caching prefixes.
+        if self.sglang_config.enable_cache_report:
+            if "--enable-cache-report" in _help:
+                cmd.append("--enable-cache-report")
+                print(f"  Cache report enabled (cached_tokens will appear in API response usage)")
+            else:
+                print(f"  WARNING: --enable-cache-report not supported by this SGLang version, skipping")
+                print(f"  Cache is still active but per-request cached_tokens won't be reported")
         
         print(f"Starting SGLang server: {' '.join(cmd)}")
         
