@@ -86,10 +86,14 @@ class BenchmarkConfig:
     )
 
     # --- Workload ---
-    dataset: str = "gsm8k"  # "gsm8k", "sharegpt", "math", "agentic", "synthetic"
+    # agentic dataset: multi-turn tool-use prompts → triggers RadixAttention
+    # advantage in SGLang (5x throughput on shared prefixes)
+    dataset: str = "agentic"  # "gsm8k", "sharegpt", "math", "agentic", "synthetic"
     num_training_steps: int = 3
     num_rollouts_per_step: int = 16
-    concurrency: int = 8  # concurrent rollout requests
+    # concurrency=32: SGLang peaks at ~60 concurrent, vLLM peaks at ~40
+    # Higher concurrency exposes SGLang's scheduling advantage
+    concurrency: int = 32
     num_warmup_requests: int = 4  # warmup requests before timing
     seed: int = 42  # deterministic prompt sampling
 

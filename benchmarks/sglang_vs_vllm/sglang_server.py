@@ -153,6 +153,9 @@ class SGLangServer:
         env = os.environ.copy()
         env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        # Required for TP>1 — prevents false memory imbalance errors
+        # Ref: https://verl.readthedocs.io/en/v0.5.x/workers/sglang_worker.html
+        env["SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"] = "True"
 
         t0 = time.perf_counter()
         self._process = subprocess.Popen(

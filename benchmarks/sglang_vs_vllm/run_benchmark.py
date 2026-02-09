@@ -540,15 +540,16 @@ Examples:
 
     p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--dataset", choices=["gsm8k", "sharegpt", "agentic", "math", "synthetic"],
-                   default="gsm8k",
-                   help="Prompt dataset (default: gsm8k)")
+                   default="agentic",
+                   help="Prompt dataset — 'agentic' triggers RadixAttention advantage (default: agentic)")
     p.add_argument("--backends", nargs="+", choices=["vllm", "sglang"],
                    default=["vllm", "sglang"])
     p.add_argument("--num-steps", type=int, default=3,
                    help="Training steps (default: 3)")
     p.add_argument("--num-rollouts", type=int, default=16,
                    help="Rollout requests per step (default: 16)")
-    p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument("--concurrency", type=int, default=32,
+                   help="Concurrent requests — SGLang peaks at ~60 (default: 32)")
     p.add_argument("--max-output-tokens", type=int, default=1024)
     p.add_argument("--output", default="benchmark_results")
     p.add_argument("--sglang-python", default="")
