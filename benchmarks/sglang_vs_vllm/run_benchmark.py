@@ -380,7 +380,11 @@ def spawn_worker(backend: str, cfg: dict, results_path: str) -> int:
 
     env = os.environ.copy()
     env.pop("CUDA_LAUNCH_BLOCKING", None)
-    proc = subprocess.run(cmd, env=env)
+    # Suppress NCCL/TCPStore noise from Megatron shutdown — send stderr to log file
+    stderr_log = results_path.replace("_metrics.json", "_stderr.log")
+    with open(stderr_log, "w") as stderr_file:
+        proc = subprocess.run(cmd, env=env, stderr=stderr_file)
+    logger.info(f"  stderr log: {stderr_log}")
 
     if proc.returncode in (-9, 137):
         logger.error(f"{backend} OOM-killed. Try --gpu-memory-utilization 0.5")
