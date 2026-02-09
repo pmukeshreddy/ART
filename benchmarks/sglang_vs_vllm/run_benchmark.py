@@ -200,15 +200,17 @@ def run_worker(backend: str, config_path: str, results_path: str) -> None:
         )
 
         bk = MegatronBackend()
+        t = time.perf_counter()
         await model.register(bk, _openai_client_config={
             "server_args": {"port": config.vllm_port},
         })
-
-        t = time.perf_counter()
-        base_url, api_key = await bk._prepare_backend_for_training(model)
         run.server_startup_time = time.perf_counter() - t
-        model_name = await get_model_name(base_url, api_key)
-        logger.info(f"[vllm] server ready in {run.server_startup_time:.1f}s — model={model_name}")
+
+        # register() sets inference_model_name, inference_base_url, etc.
+        base_url = model.inference_base_url
+        api_key = model.inference_api_key or "default"
+        model_name = model.inference_model_name or model.name
+        logger.info(f"[vllm] server ready in {run.server_startup_time:.1f}s — model={model_name} at {base_url}")
 
         await warmup_server(base_url, model_name, config.num_warmup_requests)
 
@@ -240,7 +242,7 @@ def run_worker(backend: str, config_path: str, results_path: str) -> None:
 
             # -- Train (real Megatron via backend.train) -------------
             sm.training_start = time.perf_counter()
-            tgroups = _make_trajectory_groups(sm.request_metrics, prompts)
+            tgroups = await _do_rollout_for_training(model, prompts)
             try:
                 result = await bk.train(
                     model, tgroups,
@@ -327,7 +329,7 @@ def run_worker(backend: str, config_path: str, results_path: str) -> None:
 
             # -- Train (real Megatron via backend.train) -------------
             sm.training_start = time.perf_counter()
-            tgroups = _make_trajectory_groups(sm.request_metrics, prompts)
+            tgroups = await _do_rollout_for_training(model, prompts)
             try:
                 result = await bk.train(
                     model, tgroups,
@@ -349,52 +351,73 @@ def run_worker(backend: str, config_path: str, results_path: str) -> None:
             pass
         return run
 
-    def _make_trajectory_groups(
-        req_metrics: list[RequestMetrics],
-        prompts: list[list[dict[str, str]]],
-    ) -> list:
-        """Build real TrajectoryGroups from rollout results for backend.train()."""
-        import art
+    # ---- shared: build trajectory groups via real API calls -------
 
-        groups = []
-        batch: list[art.Trajectory] = []
-        for i, rm in enumerate(req_metrics):
-            user_msg = prompts[i][-1]["content"] if i < len(prompts) else "hello"
-            # We don't have the actual response text from streaming, so use a placeholder
-            # The model's response content doesn't matter for training correctness —
-            # what matters is the logprobs captured by the inference engine.
-            reward = 1.0 if not rm.error else 0.0
-            batch.append(art.Trajectory(
-                messages_and_choices=[
-                    {"role": "user", "content": user_msg},
-                    art.Choice(message={"role": "assistant", "content": f"Response {i}"}),
-                ],
-                reward=reward,
-            ))
-            if len(batch) >= 4:
-                # Need at least 2 different rewards for variance
-                if len(batch) >= 2:
-                    batch[0] = art.Trajectory(
-                        messages_and_choices=batch[0].messages_and_choices,
-                        reward=1.0,
-                    )
-                    batch[1] = art.Trajectory(
-                        messages_and_choices=batch[1].messages_and_choices,
-                        reward=0.0,
-                    )
-                groups.append(art.TrajectoryGroup(list(batch)))
-                batch = []
-        if batch:
-            if len(batch) >= 2:
-                batch[0] = art.Trajectory(
-                    messages_and_choices=batch[0].messages_and_choices,
-                    reward=1.0,
+    async def _do_rollout_for_training(
+        model, prompts: list[list[dict[str, str]]],
+    ) -> list:
+        """
+        Generate real TrajectoryGroups using the ART pattern:
+        non-streaming API call → get Choice objects → build Trajectory.
+
+        This is how ART examples (2048, tic-tac-toe) do it.
+        """
+        import art
+        from openai import AsyncOpenAI
+
+        client = model.openai_client()
+        inference_name = model.inference_model_name or model.name
+
+        async def _single(idx: int, msgs: list[dict]) -> art.Trajectory:
+            try:
+                resp = await client.chat.completions.create(
+                    model=inference_name,
+                    messages=msgs,
+                    max_tokens=256,  # short for training data
+                    temperature=1.0,
                 )
-                batch[1] = art.Trajectory(
-                    messages_and_choices=batch[1].messages_and_choices,
+                choice = resp.choices[0]
+                content = choice.message.content or ""
+                # Vary rewards so training has signal
+                reward = min(len(content) / 200.0, 1.0)
+            except Exception as e:
+                logger.warning(f"  rollout {idx} failed: {e}")
+                # Fallback: plain message dict (no Choice object)
+                return art.Trajectory(
+                    messages_and_choices=[
+                        msgs[-1],
+                        {"role": "assistant", "content": "error"},
+                    ],
                     reward=0.0,
                 )
-            groups.append(art.TrajectoryGroup(list(batch)))
+
+            return art.Trajectory(
+                messages_and_choices=[*msgs, choice],
+                reward=reward,
+            )
+
+        # Build groups of 4 trajectories each (need reward variance)
+        sem = asyncio.Semaphore(8)
+
+        async def _bounded(idx, msgs):
+            async with sem:
+                return await _single(idx, msgs)
+
+        all_trajs = await asyncio.gather(
+            *[_bounded(i, m) for i, m in enumerate(prompts)]
+        )
+
+        groups = []
+        for i in range(0, len(all_trajs), 4):
+            batch = list(all_trajs[i:i+4])
+            if len(batch) >= 2:
+                # Ensure reward variance (required by GRPO)
+                rewards = [t.reward for t in batch]
+                if len(set(rewards)) == 1:
+                    batch[0].reward = max(0.0, batch[0].reward - 0.5)
+            groups.append(art.TrajectoryGroup(batch))
+
+        logger.info(f"  built {len(groups)} trajectory groups for training")
         return groups
 
     # ---- run the chosen backend -----------------------------------
