@@ -752,11 +752,44 @@ class MegatronService:
                 await self._start_vllm_engine(new_checkpoint_dir, next_step)
                 
         elif can_preserve and cache_method == "sleep_wake":
-            # Sleep/Wake: Megatron already offloaded to CPU (see train.py line 346)
-            # Just need to ensure GPU memory is freed before vLLM wakes up
-            print(f"[vLLM] Waiting for Megatron GPU memory cleanup...")
-            await asyncio.sleep(0.5)  # Allow async GPU cleanup to complete
+            # Sleep/Wake: Wait for Megatron process to fully exit and release GPU memory
+            print(f"[vLLM] Waiting for Megatron process to exit and release GPU memory...")
+            if self._megatron_process is not None:
+                try:
+                    # Wait for process to exit cleanly (releases all GPU memory)
+                    await asyncio.wait_for(self._megatron_process.wait(), timeout=30.0)
+                    print(f"[vLLM] Megatron process exited successfully (returncode={self._megatron_process.returncode})")
+                except asyncio.TimeoutError:
+                    print(f"[vLLM] WARNING: Megatron process didn't exit in 30s, forcing cleanup")
+                    self._megatron_process.kill()
+                    await self._megatron_process.wait()
+                self._megatron_process = None
+            
+            # Additional cleanup and small delay for CUDA context cleanup
             gc_and_empty_cuda_cache()
+            await asyncio.sleep(1.0)  # Allow CUDA contexts to fully release
+            
+            # Diagnostic: Check GPU memory on training GPUs to ensure cleanup worked
+            training_gpus = self.vllm_config.get_megatron_gpu_ids()
+            if training_gpus:
+                print(f"[vLLM] Checking GPU memory on training GPUs {training_gpus}...")
+                try:
+                    result = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=5.0
+                    )
+                    if result.returncode == 0:
+                        for line in result.stdout.strip().split('\n'):
+                            gpu_id, mem_used = line.split(',')
+                            gpu_id = int(gpu_id.strip())
+                            mem_used = int(mem_used.strip())
+                            if gpu_id in training_gpus:
+                                print(f"[vLLM]   GPU {gpu_id}: {mem_used} MB used")
+                                if mem_used > 5000:  # >5GB still in use
+                                    print(f"[vLLM]   WARNING: GPU {gpu_id} still has {mem_used}MB allocated!")
+                except Exception as e:
+                    print(f"[vLLM] Could not check GPU memory: {e}")
+            
             print(f"[vLLM] Waking up engine and loading LoRA for step {next_step}...")
             await run_on_workers(llm, do_wake_up)
             await llm.resume_generation()
