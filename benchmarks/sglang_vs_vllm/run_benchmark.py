@@ -154,11 +154,12 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             try:
                 resp = await client.chat.completions.create(
                     model=inf_name, messages=msgs,
-                    max_tokens=256, temperature=1.0,
+                    max_tokens=256, temperature=1.0, logprobs=True,
                 )
                 choice = resp.choices[0]
                 content = choice.message.content or ""
                 reward = min(len(content) / 200.0, 1.0)
+                content2 = content[:50]; print(f"DEBUG choice type={type(choice).__name__} content={content2}")
                 return art.Trajectory(
                     messages_and_choices=[*msgs, choice],
                     reward=reward,
@@ -185,6 +186,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                     for j, t in enumerate(batch):
                         t.reward = t.reward + (j + 1) * 0.01
             groups.append(art.TrajectoryGroup(batch))
+            print(f"DEBUG group {i}: rewards={[t.reward for t in batch]}")
         return groups
 
     async def warmup(base_url, model_name, api_key=None, n=4):

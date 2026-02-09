@@ -410,7 +410,11 @@ class SGLangMegatronService:
                 W_base = self._base_weights[base_key]
                 A = pair["A"].to(W_base.device, dtype=W_base.dtype)
                 B = pair["B"].to(W_base.device, dtype=W_base.dtype)
-                W_merged = W_base + scaling * (B @ A)
+                delta = B @ A
+                if delta.shape != W_base.shape:
+                    logger.debug(f"Shape mismatch for {base_key}: base={W_base.shape}, delta={delta.shape}, skipping")
+                    continue
+                W_merged = W_base + scaling * delta
                 merged.append((base_key, W_merged))
             else:
                 logger.debug(f"Base weight not found for {base_key}, skipping")
@@ -588,7 +592,7 @@ class SGLangMegatronService:
             lora_path=lora_path,
             optimizer_state_path=self._get_optimizer_state_path(),
             disk_packed_tensors=disk_packed_tensors,
-            config=config,
+            config=config if isinstance(config, dict) else config.model_dump(),
             experimental_config=experimental_config,
         )
         job_path = os.path.join(jobs_dir, f"{datetime.datetime.now().isoformat()}.json")
