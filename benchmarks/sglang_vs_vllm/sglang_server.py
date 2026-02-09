@@ -319,14 +319,16 @@ class SGLangServer:
                         logger.warning(f"resume_memory_occupation failed: {r.status} {body[:200]}")
                     else:
                         self._is_sleeping = False
+                        # Flush cache AFTER successful wake to clear stale radix tree
+                        # entries that may point to deallocated KV blocks from before sleep.
+                        # verl does this: await tokenizer_manager.flush_cache()
+                        await self.flush_cache()
                         elapsed = time.perf_counter() - t0
                         logger.info(f"SGLang wake_up (resume memory) in {elapsed:.2f}s — tags={tags}")
                         return elapsed
         except Exception as e:
             logger.warning(f"wake_up() failed: {e}")
 
-        # Flush cache after wake to ensure clean state (verl does this)
-        await self.flush_cache()
         return time.perf_counter() - t0
 
     # ------------------------------------------------------------------

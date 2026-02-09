@@ -92,7 +92,8 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                             f"{base_url}/chat/completions",
                             json={"model": model_name, "messages": msgs,
                                   "max_tokens": max_tok, "temperature": 1.0,
-                                  "stream": True},
+                                  "stream": True,
+                                  "stream_options": {"include_usage": True}},
                             timeout=aiohttp.ClientTimeout(total=300),
                         ) as r:
                             if r.status != 200:
@@ -265,6 +266,8 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 tensor_parallel_size=tp or min(2, torch.cuda.device_count()),
                 gpu_memory_utilization=gpu_mem,
                 enable_lora=False,
+                max_model_len=max_seq_length,  # Avoids defaulting to 262144
+                enforce_eager=True,  # Skip torch.compile (~111s) and CUDA graph capture (~36s)
             ),
         )
 
@@ -393,26 +396,26 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             sm.gpu_memory_during_rollout = sum(mem.values())
 
             # ---- Rollout phase (verl: generate_sequences) ----
-            # Use BOTH streaming (for TTFT) and native (for accurate token counts)
+            # Run streaming + native CONCURRENTLY via asyncio.gather.
+            # This ensures:
+            #   - Both hit cold cache (no warm-cache TTFT advantage)
+            #   - Timer covers ONE concurrent pass, not two sequential passes
+            #   - Streaming gives us TTFT, native gives accurate token counts
             sm.rollout_start = time.perf_counter()
 
-            # Primary: native non-streaming for accurate token counts
-            # This mirrors verl's tokenizer_manager.generate_request() which
-            # returns actual output_ids, not SSE chunks
-            native_metrics = await native_rollout(
+            stream_task = stream_rollout(
                 base_url, mname, prompts, max_output_tokens, concurrency,
             )
-
-            # Also run streaming for TTFT measurement
-            # (verl doesn't measure TTFT in training, but we do for benchmark)
-            stream_metrics = await stream_rollout(
+            native_task = native_rollout(
                 base_url, mname, prompts, max_output_tokens, concurrency,
             )
+            stream_metrics, native_metrics = await asyncio.gather(
+                stream_task, native_task,
+            )
 
-            # Merge: use native token counts + streaming TTFT
+            # Merge: use native token counts (accurate) + streaming TTFT (cold cache)
             for nm, sm_req in zip(native_metrics, stream_metrics):
-                nm.ttft = sm_req.ttft  # TTFT from streaming
-                # Keep native's completion_tokens (accurate, server-counted)
+                nm.ttft = sm_req.ttft
 
             sm.request_metrics = native_metrics
             sm.rollout_end = time.perf_counter()
