@@ -4,14 +4,17 @@ set -euo pipefail
 export CUDA_HOME="/usr/local/cuda-12.8"
 export TORCH_CUDA_ARCH_LIST="9.0"
 
+# Use $HOME so this works for any user, not just root
+APEX_DIR="${HOME}/apex"
+
 # ------------------------------------------------------------------
 # 1. System packages — skip if already installed (~1-2 min saved)
 # ------------------------------------------------------------------
 if dpkg -s libcudnn9-headers-cuda-12 ninja-build >/dev/null 2>&1; then
   echo "[setup.sh] libcudnn9-headers-cuda-12 & ninja-build already installed, skipping apt"
 else
-  apt-get update
-  apt-get install -y libcudnn9-headers-cuda-12 ninja-build
+  sudo apt-get update
+  sudo apt-get install -y libcudnn9-headers-cuda-12 ninja-build
 fi
 
 # ------------------------------------------------------------------
@@ -20,12 +23,12 @@ fi
 if python -c "import apex" 2>/dev/null; then
   echo "[setup.sh] apex already installed, skipping build"
 else
-  if [ -d /root/apex ]; then
+  if [ -d "$APEX_DIR" ]; then
     echo "[setup.sh] apex directory already exists, skipping clone"
   else
-    git clone --depth 1 --branch 25.09 https://github.com/NVIDIA/apex.git /root/apex
+    git clone --depth 1 --branch 25.09 https://github.com/NVIDIA/apex.git "$APEX_DIR"
   fi
-  NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=16 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 APEX_FAST_LAYER_NORM=1 uv pip install --no-build-isolation /root/apex
+  NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=16 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 APEX_FAST_LAYER_NORM=1 uv pip install --no-build-isolation "$APEX_DIR"
 fi
 
 # ------------------------------------------------------------------
