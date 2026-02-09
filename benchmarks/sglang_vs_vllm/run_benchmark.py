@@ -242,17 +242,26 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
         base_url = model.inference_base_url
         mname = None
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(f"{base_url}/models", timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    data = await r.json()
-                    if data.get("data"):
-                        mname = data["data"][0]["id"]
-                        logger.info(f"[vllm] /v1/models returned: {[m['id'] for m in data['data']]}")
-        except Exception as e:
-            logger.warning(f"[vllm] /v1/models query failed: {e}")
+        # Retry /v1/models a few times — the server may need a moment after
+        # reporting "ready" before it can serve the models endpoint.
+        for attempt in range(5):
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(f"{base_url}/models", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        data = await r.json()
+                        if data.get("data"):
+                            mname = data["data"][0]["id"]
+                            logger.info(f"[vllm] /v1/models returned: {[m['id'] for m in data['data']]}")
+                            break
+            except Exception as e:
+                logger.warning(f"[vllm] /v1/models query attempt {attempt+1}/5 failed: {e}")
+            if attempt < 4:
+                await asyncio.sleep(2 * (attempt + 1))
         if not mname:
-            mname = model.inference_model_name or model.name
+            # Fallback to the HuggingFace model ID (what vLLM actually serves),
+            # NOT model.name which is ART's internal name (e.g. "bench-vllm@0").
+            mname = model_id
+            logger.warning(f"[vllm] /v1/models unavailable, falling back to model_id: {mname}")
         model.inference_model_name = mname
         logger.info(f"[vllm] ready in {run.server_startup_time:.0f}s — {mname} @ {base_url}")
 
@@ -273,10 +282,15 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             )
             sm.rollout_end = time.perf_counter()
 
-            errs = sum(1 for r in sm.request_metrics if r.error)
+            errs = [r for r in sm.request_metrics if r.error]
             logger.info(f"  rollout {sm.rollout_time:.1f}s  "
                         f"{sm.rollout_throughput:.0f} tok/s  "
-                        f"TTFT={sm.avg_ttft:.4f}s  err={errs}")
+                        f"TTFT={sm.avg_ttft:.4f}s  err={len(errs)}")
+            if errs:
+                # Log first 3 unique errors for debugging
+                unique_errs = list(dict.fromkeys(r.error for r in errs))[:3]
+                for i, e in enumerate(unique_errs):
+                    logger.error(f"  rollout error [{i+1}]: {e}")
 
             # Train (real Megatron)
             sm.training_start = time.perf_counter()
@@ -366,12 +380,16 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             )
             sm.rollout_end = time.perf_counter()
 
-            errs = sum(1 for r in sm.request_metrics if r.error)
+            errs = [r for r in sm.request_metrics if r.error]
             logger.info(
                 f"  rollout {sm.rollout_time:.1f}s  "
                 f"{sm.rollout_throughput:.0f} tok/s  "
-                f"TTFT={sm.avg_ttft:.4f}s  err={errs}"
+                f"TTFT={sm.avg_ttft:.4f}s  err={len(errs)}"
             )
+            if errs:
+                unique_errs = list(dict.fromkeys(r.error for r in errs))[:3]
+                for i, e in enumerate(unique_errs):
+                    logger.error(f"  rollout error [{i+1}]: {e}")
 
             # ---- Training phase (verl: sleep → train → update_weights → wake) ----
             sm.training_start = time.perf_counter()
