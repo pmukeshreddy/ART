@@ -68,7 +68,7 @@ def get_provider(model: str) -> GPTModelProvider:
 
     # ── MoE token capacity: prevent routing-spike OOM ──
     provider.moe_token_drop_policy = "probs"
-    provider.moe_expert_capacity_factor = 1.5
+    provider.moe_expert_capacity_factor = 1.0
     provider.moe_pad_expert_input_to_capacity = True
 
     if tp > 1:
