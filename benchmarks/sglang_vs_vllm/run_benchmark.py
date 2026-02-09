@@ -2,14 +2,15 @@
 """
 End-to-end benchmark: SGLang + Megatron vs vLLM + Megatron.
 
+Both backends use IDENTICAL rollout code: a single streaming call with
+stream_options.include_usage=true for accurate token counting + TTFT.
+
 SGLang path uses verl-style architecture:
   - Server starts ONCE and NEVER restarts
-  - sleep() / wake_up() for memory management between train/rollout
+  - sleep(kv_cache+weights) / wake_up(kv_cache) for memory management
   - Merged LoRA weights saved to disk, reloaded via /update_weights
-  - Concurrent streaming (TTFT) + native (token counts) rollout
 
 vLLM path uses existing ART MegatronBackend (sleep/wake).
-  - stream_options.include_usage for accurate streaming token counts
 
 Each step: rollout (timed) → Megatron train → next rollout with updated weights.
 """
@@ -78,7 +79,13 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         base_url: str, model_name: str,
         prompts: list, max_tok: int, conc: int,
     ) -> list[RequestMetrics]:
-        """Streaming rollout — used for TTFT measurement (both backends)."""
+        """Streaming rollout — IDENTICAL for both SGLang and vLLM.
+
+        Uses stream_options.include_usage=true to get accurate server-side
+        token counts in the final SSE chunk, while also measuring TTFT
+        from the first content chunk. One rollout, both metrics, fair
+        comparison.
+        """
         sem = asyncio.Semaphore(conc)
 
         async def _one(idx, msgs):
@@ -107,11 +114,15 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                                     d = line[6:]
                                     if d == "[DONE]":
                                         break
-                                    if not first:
-                                        ttft = time.perf_counter() - t0
-                                        first = True
                                     try:
                                         c = json.loads(d)
+                                        # TTFT: first chunk with content
+                                        if not first and c.get("choices"):
+                                            if c["choices"][0].get("delta", {}).get("content"):
+                                                ttft = time.perf_counter() - t0
+                                                first = True
+                                        # Token count: usage chunk (final, per OpenAI spec)
+                                        # Overwrites any previous chunk-based count
                                         if c.get("usage"):
                                             comp_tok = c["usage"].get("completion_tokens", 0)
                                         elif c.get("choices"):
@@ -119,59 +130,6 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                                                 comp_tok += 1
                                     except json.JSONDecodeError:
                                         pass
-                except Exception as e:
-                    err = str(e)
-                t1 = time.perf_counter()
-                return RequestMetrics(
-                    request_id=idx, start_time=t0, end_time=t1,
-                    ttft=ttft, total_time=t1 - t0,
-                    prompt_tokens=0, completion_tokens=comp_tok, error=err,
-                )
-
-        return list(await asyncio.gather(*[_one(i, m) for i, m in enumerate(prompts)]))
-
-    async def native_rollout(
-        base_url: str, model_name: str,
-        prompts: list, max_tok: int, conc: int,
-    ) -> list[RequestMetrics]:
-        """verl-style native rollout — non-streaming, returns actual token counts.
-
-        Unlike stream_rollout which parses SSE chunks and undercounts tokens,
-        this uses non-streaming /chat/completions which returns usage.completion_tokens
-        as the server-side counted value (accurate).
-
-        Mirrors verl's SGLangHttpServer.generate() → tokenizer_manager.generate_request()
-        """
-        sem = asyncio.Semaphore(conc)
-
-        async def _one(idx, msgs):
-            async with sem:
-                t0 = time.perf_counter()
-                ttft = 0.0
-                comp_tok = 0
-                err = None
-                try:
-                    async with aiohttp.ClientSession() as s:
-                        async with s.post(
-                            f"{base_url}/chat/completions",
-                            json={
-                                "model": model_name,
-                                "messages": msgs,
-                                "max_tokens": max_tok,
-                                "temperature": 1.0,
-                                "stream": False,  # NON-streaming for accurate token counts
-                            },
-                            timeout=aiohttp.ClientTimeout(total=300),
-                        ) as r:
-                            if r.status != 200:
-                                err = f"HTTP {r.status}: {(await r.text())[:200]}"
-                            else:
-                                data = await r.json()
-                                usage = data.get("usage", {})
-                                comp_tok = usage.get("completion_tokens", 0)
-                                # For non-streaming, TTFT is approximated as total time
-                                # (since we get the full response at once)
-                                # In verl, TTFT is not measured via streaming either
                 except Exception as e:
                     err = str(e)
                 t1 = time.perf_counter()
@@ -268,7 +226,10 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 gpu_memory_utilization=gpu_mem,
                 enable_lora=False,
                 max_model_len=max_seq_length,  # Avoids defaulting to 262144
-                enforce_eager=True,  # Skip torch.compile (~111s) and CUDA graph capture (~36s)
+                # NOTE: enforce_eager removed — let vLLM use CUDA graphs for
+                # fair comparison with SGLang (which also uses CUDA graphs).
+                # Startup is slower (~147s extra) but decode throughput is
+                # 15-30% higher, which is what we're benchmarking.
             ),
         )
 
@@ -345,9 +306,9 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
         Key differences from old implementation:
           1. Server starts ONCE and NEVER restarts
-          2. sleep()/wake_up() for memory management (not stop/start)
-          3. update_weights_from_tensor() for CUDA IPC weight sync
-          4. native_rollout() for accurate token counting (not SSE parsing)
+          2. sleep(kv_cache+weights)/wake_up(kv_cache) for memory management
+          3. Merged LoRA weights saved to disk, reloaded via /update_weights
+          4. IDENTICAL stream_rollout as vLLM for fair comparison
 
         This mirrors verl's RayPPOTrainer.fit() loop:
           generate_sequences() → sleep_replicas() → update_actor() →
@@ -397,28 +358,12 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             sm.gpu_memory_during_rollout = sum(mem.values())
 
             # ---- Rollout phase (verl: generate_sequences) ----
-            # Run streaming + native CONCURRENTLY via asyncio.gather.
-            # This ensures:
-            #   - Both hit cold cache (no warm-cache TTFT advantage)
-            #   - Timer covers ONE concurrent pass, not two sequential passes
-            #   - Streaming gives us TTFT, native gives accurate token counts
+            # IDENTICAL to vLLM: single streaming rollout with include_usage
+            # for accurate token counts + TTFT. One rollout, fair comparison.
             sm.rollout_start = time.perf_counter()
-
-            stream_task = stream_rollout(
+            sm.request_metrics = await stream_rollout(
                 base_url, mname, prompts, max_output_tokens, concurrency,
             )
-            native_task = native_rollout(
-                base_url, mname, prompts, max_output_tokens, concurrency,
-            )
-            stream_metrics, native_metrics = await asyncio.gather(
-                stream_task, native_task,
-            )
-
-            # Merge: use native token counts (accurate) + streaming TTFT (cold cache)
-            for nm, sm_req in zip(native_metrics, stream_metrics):
-                nm.ttft = sm_req.ttft
-
-            sm.request_metrics = native_metrics
             sm.rollout_end = time.perf_counter()
 
             errs = sum(1 for r in sm.request_metrics if r.error)
@@ -433,7 +378,8 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             tgroups = await do_rollout_for_training(model, prompts)
             try:
                 # bk.train() internally calls service.train() which does:
-                #   sleep() → megatron train → update_weights() → wake_up()
+                #   sleep(kv_cache+weights) → megatron train →
+                #   update_weights(disk) → wake_up(kv_cache)
                 # This is the verl-style loop — NO server restart
                 result = await bk.train(model, tgroups, learning_rate=lr)
                 logger.info(f"  train step={result.step} loss={result.metrics.get('loss','?')}")

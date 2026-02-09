@@ -1,17 +1,20 @@
 """
 SGLang + Megatron service — verl-style hybrid engine.
 
-Architecture matches verl-project/verl:
+Architecture:
   - SGLang server starts ONCE and NEVER restarts
-  - Before training: sleep() releases KV cache memory
-  - Training: Megatron runs in subprocess (produces LoRA adapter)
+  - Before training: sleep(kv_cache+weights) releases GPU memory
+  - Training: Megatron runs as SEPARATE subprocess (produces LoRA adapter)
   - After training: merge LoRA → save to disk → /update_weights reload
-  - After weight sync: wake_up() reallocates KV cache + flushes radix cache
-  - Generation: non-streaming /generate returns actual token IDs
+  - After weight sync: wake_up(kv_cache) reallocates KV cache + flushes radix
 
-Note: CUDA IPC weight sync (verl's sgl_update_weights) requires in-process
-SGLang Python API, not available over HTTP. We use disk-based reload instead,
-which still avoids the 60-90s cold restart.
+Key difference from verl: our Megatron subprocess is separate (not shared
+process), so we must release BOTH kv_cache and weights during sleep to give
+Megatron enough GPU memory. verl's colocated design only releases kv_cache
+because training shares the same model weights in GPU memory.
+
+Weight sync: CUDA IPC (verl's sgl_update_weights) requires in-process
+SGLang Python API, not available over HTTP. We use disk-based reload instead.
 
 Reference:
   - verl/workers/rollout/sglang_rollout/sglang_rollout.py (ServerAdapter)
@@ -56,14 +59,19 @@ class SGLangMegatronService:
 
     Key difference from old implementation:
       OLD: stop SGLang → train → restart SGLang (60-90s overhead)
-      NEW: sleep → train → update_weights → wake_up (<2s overhead)
+      NEW: sleep(kv+weights) → train → update_weights(disk) → wake(kv)
 
-    Mirrors verl's RayPPOTrainer.fit() loop:
-      1. generate_sequences()  — SGLang active, KV cache allocated
-      2. sleep_replicas()      — release KV cache, free GPU for training
-      3. update_actor()        — Megatron training step
-      4. update_weights()      — push new weights to SGLang via CUDA IPC
-                                  + resume KV cache
+    Key difference from verl:
+      verl: training + inference share same process, same GPU memory
+      ours: Megatron is a SEPARATE subprocess, needs its own GPU memory
+      → we must release weights too, not just KV cache
+
+    Loop:
+      1. generate()      — SGLang active, KV cache + weights on GPU
+      2. sleep()         — release KV cache AND weights (for Megatron)
+      3. Megatron train  — uses freed GPU memory
+      4. update_weights()— merge LoRA, save to disk, SGLang reloads
+      5. wake_up()       — reallocate KV cache only (weights already loaded)
     """
 
     model_name: str
@@ -144,8 +152,17 @@ class SGLangMegatronService:
     async def sleep(self) -> float:
         """Release GPU memory for training — verl's sleep().
 
-        Flushes KV cache, then releases memory so Megatron can use GPUs.
-        SGLang process stays alive: CUDA graphs, NCCL, tokenizer all survive.
+        Releases BOTH KV cache AND model weights from GPU. This is critical
+        because Megatron runs as a SEPARATE subprocess and needs GPU memory
+        for its own copy of model weights, optimizer states, and activations.
+
+        Unlike verl (where training and inference share the same process and
+        same GPU memory), our architecture runs them in separate processes on
+        the same GPUs. Only releasing KV cache (~35GB) is not enough — SGLang's
+        model weights (~7.5GB/GPU for Qwen3-30B-A3B) must also be freed.
+
+        SGLang process stays alive: NCCL communicators, tokenizer survive.
+        Weights will be reloaded via update_weights_from_disk() after training.
 
         verl equivalent:
             obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
@@ -155,15 +172,17 @@ class SGLangMegatronService:
             return 0.0
 
         t0 = time.perf_counter()
-        elapsed = await self._server.sleep(tags=["kv_cache"])
+        # Release both KV cache and weights — Megatron needs the GPU memory
+        elapsed = await self._server.sleep(tags=["kv_cache", "weights"])
         self._is_sleeping = True
-        logger.info(f"SGLang sleeping (memory released) in {elapsed:.2f}s")
+        logger.info(f"SGLang sleeping (kv_cache + weights released) in {elapsed:.2f}s")
         return time.perf_counter() - t0
 
     async def wake_up(self) -> float:
-        """Resume GPU memory after training — verl's wake_up().
+        """Resume KV cache after training + weight sync — verl's wake_up().
 
-        Reallocates KV cache so inference can proceed.
+        Only reallocates KV cache. Model weights are already loaded by
+        update_weights_from_disk() which was called before wake_up().
 
         verl equivalent:
             obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
@@ -174,9 +193,10 @@ class SGLangMegatronService:
             return 0.0
 
         t0 = time.perf_counter()
+        # Only resume KV cache — weights already loaded by update_weights
         elapsed = await self._server.wake_up(tags=["kv_cache"])
         self._is_sleeping = False
-        logger.info(f"SGLang awake (memory resumed) in {elapsed:.2f}s")
+        logger.info(f"SGLang awake (kv_cache resumed) in {elapsed:.2f}s")
         return time.perf_counter() - t0
 
     # ------------------------------------------------------------------
@@ -240,19 +260,27 @@ class SGLangMegatronService:
     async def _save_merged_weights(
         self, merged_params: list[tuple[str, torch.Tensor]]
     ) -> str:
-        """Save merged weights to a temporary directory in safetensors format.
+        """Save merged weights to a directory in safetensors format.
 
         Copies the full base model structure (config, tokenizer, etc.) and
         overwrites only the LoRA-modified weight shards. SGLang's /update_weights
         expects a complete model directory.
+
+        Uses hard copies (not symlinks) for unaffected shards to avoid
+        cross-filesystem issues. Cleans the merged directory on each call
+        to prevent stale data from previous steps.
         """
         from safetensors.torch import save_file
         from huggingface_hub import snapshot_download
 
         merged_dir = os.path.join(self.output_dir, "merged_weights")
+
+        # Clean previous merged weights to prevent stale data
+        if os.path.exists(merged_dir):
+            shutil.rmtree(merged_dir)
         os.makedirs(merged_dir, exist_ok=True)
 
-        # Get base model path
+        # Get base model path (uses HF cache, no re-download if cached)
         base_path = snapshot_download(
             self.base_model,
             allow_patterns=["*.safetensors", "*.json"],
@@ -263,8 +291,7 @@ class SGLangMegatronService:
             if fname.endswith(".json") or fname.endswith(".py") or fname == "tokenizer.model":
                 src = os.path.join(base_path, fname)
                 dst = os.path.join(merged_dir, fname)
-                if not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst):
-                    shutil.copy2(src, dst)
+                shutil.copy2(src, dst)
 
         # Load the weight index to know which shard each weight lives in
         index_path = os.path.join(base_path, "model.safetensors.index.json")
@@ -301,14 +328,13 @@ class SGLangMegatronService:
             save_file(shard_tensors, dst_path)
             logger.info(f"Saved merged shard {shard_file} ({len(changed_keys)} updated keys)")
 
-        # Copy unaffected shard files and index
+        # Hard-copy unaffected shard files (not symlinks — avoids cross-fs issues)
         for fname in os.listdir(base_path):
             if fname.endswith(".safetensors") and fname not in affected_shards:
                 src = os.path.join(base_path, fname)
                 dst = os.path.join(merged_dir, fname)
-                if not os.path.exists(dst):
-                    # Symlink to save disk space + time
-                    os.symlink(src, dst)
+                shutil.copy2(src, dst)
+
         # Copy index file
         if os.path.exists(index_path):
             shutil.copy2(index_path, os.path.join(merged_dir, "model.safetensors.index.json"))
@@ -522,27 +548,26 @@ class SGLangMegatronService:
         experimental_config: dict,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """verl-style training step: sleep → Megatron train → weight sync → wake.
+        """verl-style training step: sleep → train → update_weights → wake.
 
         OLD architecture:
           stop SGLang (5-10s) → train → restart SGLang (60-90s)
           Total overhead: 65-100s
 
         NEW architecture (verl-style):
-          sleep (<1s) → train → update_weights (<2s) → wake_up (<1s)
-          Total overhead: <4s
+          sleep(kv_cache+weights) → train → update_weights(disk) → wake(kv_cache)
+          Total overhead: ~10-20s (mostly disk I/O for weight reload)
 
-        This mirrors verl's RayPPOTrainer.fit():
-          self.checkpoint_manager.sleep_replicas()
-          actor_output = self._update_actor(batch)
-          self.checkpoint_manager.update_weights()
+        Key: sleep releases BOTH kv_cache and weights because Megatron runs
+        as a separate subprocess and needs GPU memory. update_weights reloads
+        the merged weights BEFORE wake_up re-allocates KV cache.
         """
 
-        # Phase 1: Sleep — release KV cache memory for training
-        # verl: self.checkpoint_manager.sleep_replicas()
+        # Phase 1: Sleep — release KV cache + model weights from GPU
+        # Megatron subprocess needs the GPU memory for training
         t0 = time.perf_counter()
         sleep_time = await self.sleep()
-        logger.info(f"Phase 1 — sleep: {sleep_time:.2f}s (was: kill server 5-10s)")
+        logger.info(f"Phase 1 — sleep(kv_cache+weights): {sleep_time:.2f}s")
 
         # Phase 2: Megatron training
         # verl: actor_output = self._update_actor(batch)
@@ -605,18 +630,18 @@ class SGLangMegatronService:
                 shutil.copy(src, os.path.join(new_ckpt, cfg_name))
         self._latest_step = next_step
 
-        # Phase 4: Weight sync — push merged weights to SGLang via CUDA IPC
-        # verl: self.checkpoint_manager.update_weights()
+        # Phase 4: Weight sync — reload merged weights from disk BEFORE wake
+        # This must happen before wake_up because we released weights in sleep.
+        # update_weights_from_disk reloads the merged model into GPU memory.
         t_ws = time.perf_counter()
         weight_sync_time = await self.update_weights(new_ckpt)
         logger.info(
-            f"Phase 4 — weight sync: {weight_sync_time:.2f}s "
-            f"(was: restart server 60-90s)"
+            f"Phase 4 — update_weights (disk reload): {weight_sync_time:.2f}s"
         )
 
-        # Phase 5: Wake up — reallocate KV cache
+        # Phase 5: Wake up — reallocate KV cache only (weights already loaded)
         wake_time = await self.wake_up()
-        logger.info(f"Phase 5 — wake_up: {wake_time:.2f}s")
+        logger.info(f"Phase 5 — wake_up(kv_cache): {wake_time:.2f}s")
 
         total_overhead = time.perf_counter() - t0
         logger.info(
