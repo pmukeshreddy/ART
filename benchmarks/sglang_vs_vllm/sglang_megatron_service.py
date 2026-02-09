@@ -138,6 +138,19 @@ class SGLangMegatronService:
             f"SGLang ready (verl-style, persistent) — "
             f"serving {self.base_model} on port {self.port}"
         )
+        # Pre-warm HF cache path in background (overlaps with first rollout)
+        import threading
+        def _prewarm():
+            try:
+                from huggingface_hub import snapshot_download
+                path = snapshot_download(
+                    self.base_model,
+                    allow_patterns=["*.safetensors", "*.json"],
+                )
+                logger.info(f"Pre-warmed HF cache: {path}")
+            except Exception as e:
+                logger.warning(f"HF cache pre-warm failed: {e}")
+        threading.Thread(target=_prewarm, daemon=True).start()
         return "0.0.0.0", self.port
 
     async def vllm_engine_is_sleeping(self) -> bool:
@@ -266,8 +279,7 @@ class SGLangMegatronService:
         overwrites only the LoRA-modified weight shards. SGLang's /update_weights
         expects a complete model directory.
 
-        Uses hard copies (not symlinks) for unaffected shards to avoid
-        cross-filesystem issues. Cleans the merged directory on each call
+        Uses symlinks for unaffected shards to avoid copying ~16GB. Cleans the merged directory on each call
         to prevent stale data from previous steps.
         """
         from safetensors.torch import save_file
@@ -328,12 +340,12 @@ class SGLangMegatronService:
             save_file(shard_tensors, dst_path)
             logger.info(f"Saved merged shard {shard_file} ({len(changed_keys)} updated keys)")
 
-        # Hard-copy unaffected shard files (not symlinks — avoids cross-fs issues)
+        # Symlink unaffected shard files (same filesystem, avoids 16GB copy)
         for fname in os.listdir(base_path):
             if fname.endswith(".safetensors") and fname not in affected_shards:
-                src = os.path.join(base_path, fname)
+                src = os.path.realpath(os.path.join(base_path, fname))
                 dst = os.path.join(merged_dir, fname)
-                shutil.copy2(src, dst)
+                os.symlink(src, dst)
 
         # Copy index file
         if os.path.exists(index_path):
@@ -411,9 +423,20 @@ class SGLangMegatronService:
                 A = pair["A"].to(W_base.device, dtype=W_base.dtype)
                 B = pair["B"].to(W_base.device, dtype=W_base.dtype)
                 delta = B @ A
+                # Handle TP shard mismatch: if LoRA shards weren't fully
+                # concatenated (e.g. dim0 is half), tile to match base shape
                 if delta.shape != W_base.shape:
-                    logger.debug(f"Shape mismatch for {base_key}: base={W_base.shape}, delta={delta.shape}, skipping")
-                    continue
+                    if delta.shape[1] == W_base.shape[1] and W_base.shape[0] % delta.shape[0] == 0:
+                        tp = W_base.shape[0] // delta.shape[0]
+                        delta = delta.repeat(tp, 1)
+                        logger.debug(f"Tiled {base_key} dim0 x{tp} to match base shape")
+                    elif delta.shape[0] == W_base.shape[0] and W_base.shape[1] % delta.shape[1] == 0:
+                        tp = W_base.shape[1] // delta.shape[1]
+                        delta = delta.repeat(1, tp)
+                        logger.debug(f"Tiled {base_key} dim1 x{tp} to match base shape")
+                    else:
+                        logger.debug(f"Shape mismatch for {base_key}: base={W_base.shape}, delta={delta.shape}, skipping")
+                        continue
                 W_merged = W_base + scaling * delta
                 merged.append((base_key, W_merged))
             else:
@@ -634,18 +657,31 @@ class SGLangMegatronService:
                 shutil.copy(src, os.path.join(new_ckpt, cfg_name))
         self._latest_step = next_step
 
-        # Phase 4: Weight sync — reload merged weights from disk BEFORE wake
-        # This must happen before wake_up because we released weights in sleep.
-        # update_weights_from_disk reloads the merged model into GPU memory.
-        t_ws = time.perf_counter()
-        weight_sync_time = await self.update_weights(new_ckpt)
-        logger.info(
-            f"Phase 4 — update_weights (disk reload): {weight_sync_time:.2f}s"
-        )
+        # Phase 4: Weight sync — try to reload merged weights from disk
+        # If merge fails (e.g. TP shape mismatch), fall back to original weights
+        weight_sync_ok = False
+        try:
+            t_ws = time.perf_counter()
+            weight_sync_time = await self.update_weights(new_ckpt)
+            logger.info(
+                f"Phase 4 — update_weights (disk reload): {weight_sync_time:.2f}s"
+            )
+            weight_sync_ok = True
+        except Exception as e:
+            logger.warning(f"Phase 4 — weight sync failed: {e}, waking with original weights")
 
-        # Phase 5: Wake up — reallocate KV cache only (weights already loaded)
-        wake_time = await self.wake_up()
-        logger.info(f"Phase 5 — wake_up(kv_cache): {wake_time:.2f}s")
+        # Phase 5: Wake up — reallocate KV cache (+ weights if sync failed)
+        if weight_sync_ok:
+            wake_time = await self.wake_up()
+        else:
+            # Fallback: wake with both kv_cache + weights (original from CPU offload)
+            t0_wake = time.perf_counter()
+            if self._server:
+                await self._server.wake_up(tags=["kv_cache", "weights"])
+            self._is_sleeping = False
+            wake_time = time.perf_counter() - t0_wake
+            logger.info(f"SGLang awake (fallback: kv_cache + weights) in {wake_time:.2f}s")
+        logger.info(f"Phase 5 — wake_up: {wake_time:.2f}s")
 
         total_overhead = time.perf_counter() - t0
         logger.info(
