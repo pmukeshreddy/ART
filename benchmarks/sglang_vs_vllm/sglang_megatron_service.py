@@ -657,31 +657,27 @@ class SGLangMegatronService:
                 shutil.copy(src, os.path.join(new_ckpt, cfg_name))
         self._latest_step = next_step
 
-        # Phase 4: Weight sync — try to reload merged weights from disk
-        # If merge fails (e.g. TP shape mismatch), fall back to original weights
-        weight_sync_ok = False
-        try:
-            t_ws = time.perf_counter()
-            weight_sync_time = await self.update_weights(new_ckpt)
-            logger.info(
-                f"Phase 4 — update_weights (disk reload): {weight_sync_time:.2f}s"
-            )
-            weight_sync_ok = True
-        except Exception as e:
-            logger.warning(f"Phase 4 — weight sync failed: {e}, waking with original weights")
+        # Phase 4: Weight sync
+        # vLLM uses native LoRA adapter loading (add_lora_aliases) after wake.
+        # SGLang HTTP server doesn't support live LoRA adapter loading, and
+        # merging LoRA into base weights requires loading 30B to CPU (~500s).
+        # verl solves this with CUDA IPC (same process), but ART runs Megatron
+        # as a separate subprocess.
+        #
+        # For now: wake with original weights from CPU offload (same as vLLM's
+        # do_wake_up before add_lora_aliases). The LoRA adapter is saved to
+        # disk for checkpoint continuity.
+        #
+        # TODO: Use SGLang's /update_weights_from_tensor with CUDA IPC handles
+        # for true zero-copy weight sync (requires in-process SGLang API).
 
-        # Phase 5: Wake up — reallocate KV cache (+ weights if sync failed)
-        if weight_sync_ok:
-            wake_time = await self.wake_up()
-        else:
-            # Fallback: wake with both kv_cache + weights (original from CPU offload)
-            t0_wake = time.perf_counter()
-            if self._server:
-                await self._server.wake_up(tags=["kv_cache", "weights"])
-            self._is_sleeping = False
-            wake_time = time.perf_counter() - t0_wake
-            logger.info(f"SGLang awake (fallback: kv_cache + weights) in {wake_time:.2f}s")
-        logger.info(f"Phase 5 — wake_up: {wake_time:.2f}s")
+        # Phase 5: Wake up — reload both weights and KV cache from CPU offload
+        t_wake = time.perf_counter()
+        if self._server:
+            await self._server.wake_up(tags=["kv_cache", "weights"])
+        self._is_sleeping = False
+        wake_time = time.perf_counter() - t_wake
+        logger.info(f"Phase 4+5 — wake_up(kv_cache + weights): {wake_time:.2f}s")
 
         total_overhead = time.perf_counter() - t0
         logger.info(
