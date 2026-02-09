@@ -78,6 +78,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
     async def stream_rollout(
         base_url: str, model_name: str,
         prompts: list, max_tok: int, conc: int,
+        api_key: str | None = None,
     ) -> list[RequestMetrics]:
         """Streaming rollout — IDENTICAL for both SGLang and vLLM.
 
@@ -87,6 +88,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         comparison.
         """
         sem = asyncio.Semaphore(conc)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
         async def _one(idx, msgs):
             async with sem:
@@ -98,6 +100,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                     async with aiohttp.ClientSession() as s:
                         async with s.post(
                             f"{base_url}/chat/completions",
+                            headers=headers,
                             json={"model": model_name, "messages": msgs,
                                   "max_tokens": max_tok, "temperature": 1.0,
                                   "stream": True,
@@ -183,12 +186,14 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             groups.append(art.TrajectoryGroup(batch))
         return groups
 
-    async def warmup(base_url, model_name, n=4):
+    async def warmup(base_url, model_name, api_key=None, n=4):
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         for _ in range(n):
             try:
                 async with aiohttp.ClientSession() as s:
                     async with s.post(
                         f"{base_url}/chat/completions",
+                        headers=headers,
                         json={"model": model_name,
                               "messages": [{"role": "user", "content": "Hi"}],
                               "max_tokens": 8, "temperature": 0},
@@ -241,31 +246,39 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         run.server_startup_time = time.perf_counter() - t0
 
         base_url = model.inference_base_url
+        api_key = model.inference_api_key  # Set by register(), typically "default"
+        auth_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         mname = None
         # Retry /v1/models a few times — the server may need a moment after
         # reporting "ready" before it can serve the models endpoint.
         for attempt in range(5):
             try:
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(f"{base_url}/models", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    async with s.get(
+                        f"{base_url}/models",
+                        headers=auth_headers,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as r:
                         data = await r.json()
                         if data.get("data"):
                             mname = data["data"][0]["id"]
                             logger.info(f"[vllm] /v1/models returned: {[m['id'] for m in data['data']]}")
                             break
+                        else:
+                            logger.warning(f"[vllm] /v1/models attempt {attempt+1}/5: {data}")
             except Exception as e:
                 logger.warning(f"[vllm] /v1/models query attempt {attempt+1}/5 failed: {e}")
             if attempt < 4:
                 await asyncio.sleep(2 * (attempt + 1))
         if not mname:
-            # Fallback to the HuggingFace model ID (what vLLM actually serves),
-            # NOT model.name which is ART's internal name (e.g. "bench-vllm@0").
-            mname = model_id
-            logger.warning(f"[vllm] /v1/models unavailable, falling back to model_id: {mname}")
+            # Fallback to inference_model_name set by register() (the ART
+            # served_model_name, e.g. "bench-vllm"), or model.name as last resort.
+            mname = model.inference_model_name or model.name
+            logger.warning(f"[vllm] /v1/models unavailable, falling back to: {mname}")
         model.inference_model_name = mname
         logger.info(f"[vllm] ready in {run.server_startup_time:.0f}s — {mname} @ {base_url}")
 
-        await warmup(base_url, mname)
+        await warmup(base_url, mname, api_key=api_key)
 
         prompts = generate_benchmark_prompts(num_rollouts, dataset=dataset, seed=seed)
 
@@ -279,6 +292,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             sm.rollout_start = time.perf_counter()
             sm.request_metrics = await stream_rollout(
                 base_url, mname, prompts, max_output_tokens, concurrency,
+                api_key=api_key,
             )
             sm.rollout_end = time.perf_counter()
 
@@ -355,13 +369,14 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         run.server_startup_time = time.perf_counter() - t0
 
         base_url = model.inference_base_url
+        api_key = model.inference_api_key
         mname = model.inference_model_name or model.name
         logger.info(
             f"[sglang] ready in {run.server_startup_time:.0f}s — "
             f"{mname} @ {base_url} (verl-style, will NOT restart)"
         )
 
-        await warmup(base_url, mname)
+        await warmup(base_url, mname, api_key=api_key)
 
         prompts = generate_benchmark_prompts(num_rollouts, dataset=dataset, seed=seed)
 
@@ -377,6 +392,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             sm.rollout_start = time.perf_counter()
             sm.request_metrics = await stream_rollout(
                 base_url, mname, prompts, max_output_tokens, concurrency,
+                api_key=api_key,
             )
             sm.rollout_end = time.perf_counter()
 
