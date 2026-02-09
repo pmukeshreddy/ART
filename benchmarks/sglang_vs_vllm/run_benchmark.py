@@ -538,7 +538,8 @@ Examples:
     p.add_argument("--_config", help=argparse.SUPPRESS)
     p.add_argument("--_results", help=argparse.SUPPRESS)
 
-    p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    p.add_argument("--model", default="Qwen/Qwen3-30B-A3B-Instruct-2507",
+                   help="Model (Megatron requires Qwen3 MoE, default: Qwen3-30B-A3B)")
     p.add_argument("--dataset", choices=["gsm8k", "sharegpt", "agentic", "math", "synthetic"],
                    default="agentic",
                    help="Prompt dataset — 'agentic' triggers RadixAttention advantage (default: agentic)")

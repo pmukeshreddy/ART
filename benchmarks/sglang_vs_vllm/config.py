@@ -19,8 +19,8 @@ from typing import Literal
 class ModelConfig:
     """Model configuration shared across both backends."""
 
-    # Model identity
-    base_model: str = "Qwen/Qwen2.5-7B-Instruct"
+    # Model identity — Megatron backend requires Qwen3 MoE
+    base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     model_name: str = "benchmark-model"
     project: str = "sglang-vs-vllm-benchmark"
 
