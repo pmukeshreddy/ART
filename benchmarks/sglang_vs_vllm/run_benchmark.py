@@ -222,7 +222,10 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         run.server_startup_time = time.perf_counter() - t0
 
         base_url = model.inference_base_url
-        mname = model.inference_model_name or model.name
+        # With enable_lora=False, vLLM serves under the HF model name,
+        # not the ART "name@step" format. Override to match.
+        mname = model_id
+        model.inference_model_name = mname
         logger.info(f"[vllm] ready in {run.server_startup_time:.0f}s — {mname} @ {base_url}")
 
         await warmup(base_url, mname)
