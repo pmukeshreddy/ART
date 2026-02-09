@@ -5,10 +5,11 @@ End-to-end benchmark: SGLang + Megatron vs vLLM + Megatron.
 SGLang path uses verl-style architecture:
   - Server starts ONCE and NEVER restarts
   - sleep() / wake_up() for memory management between train/rollout
-  - update_weights_from_tensor() for CUDA IPC weight sync
-  - Non-streaming /generate for proper token counting
+  - Merged LoRA weights saved to disk, reloaded via /update_weights
+  - Concurrent streaming (TTFT) + native (token counts) rollout
 
 vLLM path uses existing ART MegatronBackend (sleep/wake).
+  - stream_options.include_usage for accurate streaming token counts
 
 Each step: rollout (timed) → Megatron train → next rollout with updated weights.
 """

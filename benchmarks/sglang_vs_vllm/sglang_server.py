@@ -3,13 +3,14 @@ SGLang server lifecycle management — verl-style.
 
 The server is started ONCE and NEVER restarted. Between training steps,
 memory is managed via release_memory_occupation / resume_memory_occupation
-(matching verl's sleep/wake pattern). Weights are synced in-place via
-update_weights_from_tensor using CUDA IPC handles — no disk round-trip.
+(matching verl's sleep/wake pattern). Weights are synced via
+/update_weights (disk-based reload) since CUDA IPC requires in-process
+SGLang Python API (not available over HTTP).
 
 Architecture (mirrors verl/workers/rollout/sglang_rollout/):
   - SGLang process stays alive across all RL steps
   - KV cache is freed before training, reallocated after
-  - Model weights are updated in-place on GPU
+  - Model weights are reloaded from merged safetensors on disk
   - CUDA graphs, NCCL communicators, tokenizer all survive
   - Native /generate endpoint returns actual token IDs (no SSE parsing)
 
@@ -17,7 +18,7 @@ Key SGLang HTTP endpoints used:
   - POST /flush_cache           — flush RadixAttention KV cache
   - POST /release_memory_occupation — free GPU memory (kv_cache, weights)
   - POST /resume_memory_occupation  — reallocate GPU memory
-  - POST /update_weights_from_tensor — CUDA IPC weight sync
+  - POST /update_weights        — reload weights from disk path
   - POST /generate              — native generation (returns token IDs)
   - GET  /health                — health check
 """
@@ -25,7 +26,6 @@ Key SGLang HTTP endpoints used:
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -86,8 +86,8 @@ class SGLangServer:
     verl-style lifecycle:
       - start() launches the server ONCE
       - sleep() releases GPU memory (KV cache + optionally weights)
-      - wake_up() resumes GPU memory
-      - update_weights() syncs weights in-place via CUDA IPC
+      - wake_up() resumes GPU memory (+ flushes stale radix cache)
+      - update_weights_from_disk() reloads merged weights from safetensors
       - flush_cache() clears KV cache
       - generate_native() returns actual token IDs (not SSE streaming)
       - stop() is only called at the very end of the benchmark
@@ -332,74 +332,8 @@ class SGLangServer:
         return time.perf_counter() - t0
 
     # ------------------------------------------------------------------
-    # verl-style weight sync: update_weights_from_tensor
-    # Mirrors: verl/workers/rollout/sglang_rollout/sglang_rollout.py
+    # Weight sync via disk reload
     # ------------------------------------------------------------------
-
-    async def update_weights_from_tensor(
-        self,
-        named_tensors: list[tuple[str, Any]],
-    ) -> float:
-        """Push updated weights to SGLang via CUDA IPC — verl's sgl_update_weights.
-
-        This sends CUDA IPC handles over HTTP so SGLang can copy weights
-        directly from GPU memory. No disk I/O, no process restart.
-
-        Args:
-            named_tensors: List of (param_name, tensor) pairs to update.
-                           Tensors must be on CUDA (same device as SGLang).
-        """
-        import torch
-
-        t0 = time.perf_counter()
-
-        # Build serialized tensor descriptors with CUDA IPC handles
-        # This mirrors SGLang's weight_sync protocol
-        tensor_data = []
-        for name, tensor in named_tensors:
-            if not tensor.is_cuda:
-                tensor = tensor.cuda()
-            # Make tensor contiguous for IPC
-            tensor = tensor.contiguous()
-
-            # Get CUDA IPC handle
-            handle = tensor.storage()._share_cuda_()
-            # handle is a tuple: (device, handle_bytes, storage_size_bytes, storage_offset_bytes)
-            device_idx, handle_bytes, storage_size, storage_offset = handle
-
-            tensor_data.append({
-                "name": name,
-                "dtype": str(tensor.dtype).replace("torch.", ""),
-                "shape": list(tensor.shape),
-                "device": device_idx,
-                "ipc_handle": base64.b64encode(handle_bytes).decode("ascii"),
-                "storage_size": storage_size,
-                "storage_offset": storage_offset,
-            })
-
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    f"{self.base_url}/update_weights_from_tensor",
-                    json={"tensor_data": tensor_data},
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        logger.warning(
-                            f"update_weights_from_tensor failed: {r.status} {body[:300]}"
-                        )
-                    else:
-                        elapsed = time.perf_counter() - t0
-                        logger.info(
-                            f"Weight sync via CUDA IPC: {len(named_tensors)} params "
-                            f"in {elapsed:.2f}s"
-                        )
-                        return elapsed
-        except Exception as e:
-            logger.warning(f"update_weights_from_tensor failed: {e}")
-
-        return time.perf_counter() - t0
 
     async def update_weights_from_disk(
         self,
