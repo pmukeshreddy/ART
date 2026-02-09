@@ -452,18 +452,19 @@ def cleanup_gpus() -> None:
     for pat in ["model-service", "megatron-service", "sglang.launch_server",
                 "vllm.entrypoints", "vllm.v1", "torchrun"]:
         subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=10)
-    # Give OS time to reclaim GPU memory — 10s to be safe
-    time.sleep(10)
-    # Verify GPUs are free
+    # Kill any remaining GPU-holding processes (except this one)
     try:
         r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,nounits,noheader"],
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         )
-        logger.info(f"GPU memory after cleanup: {r.stdout.strip()}")
+        my_pid = str(os.getpid())
+        for pid in r.stdout.strip().split("\n"):
+            pid = pid.strip()
+            if pid and pid != my_pid:
+                subprocess.run(["kill", "-9", pid], capture_output=True, timeout=5)
     except Exception:
         pass
-
 
 def spawn_worker(backend: str, cfg: dict, results_path: str) -> int:
     script = os.path.abspath(__file__)
