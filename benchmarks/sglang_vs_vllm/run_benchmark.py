@@ -431,17 +431,43 @@ def spawn_worker(backend: str, config_path: str, results_path: str) -> int:
     Fork a subprocess for one backend.  Returns exit code.
     The subprocess gets a completely fresh CUDA context.
     """
+    # Use uv run to ensure the ART .venv is activated in the subprocess
+    # sys.executable might be the venv python, but uv run is safer
+    # because it handles PATH and env correctly.
+    script = os.path.abspath(__file__)
     cmd = [
-        sys.executable, __file__,
+        "uv", "run", "python", script,
         "--_worker", backend,
         "--_config", config_path,
         "--_results", results_path,
     ]
     logger.info(f"Spawning {backend} worker: {' '.join(cmd)}")
     env = os.environ.copy()
-    # Ensure clean CUDA state
     env.pop("CUDA_LAUNCH_BLOCKING", None)
+    # Reduce CPU RAM pressure: tell PyTorch not to pre-allocate
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # Print available RAM before spawning
+    try:
+        import shutil
+        mem = shutil.disk_usage("/")
+        r = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            logger.info(f"System RAM:\n{r.stdout}")
+    except Exception:
+        pass
+
     proc = subprocess.run(cmd, env=env)
+
+    if proc.returncode == -9 or proc.returncode == 137:
+        logger.error(
+            f"{backend} worker was KILLED (exit code {proc.returncode}). "
+            f"This usually means the OS OOM killer terminated the process. "
+            f"Try: --gpu-memory-utilization 0.6 or a smaller model."
+        )
+    elif proc.returncode != 0:
+        logger.error(f"{backend} worker exited with code {proc.returncode}")
+
     return proc.returncode
 
 
@@ -487,7 +513,8 @@ Examples:
     p.add_argument("--vllm-port", type=int, default=8100)
     p.add_argument("--sglang-port", type=int, default=8200)
     p.add_argument("--tp", type=int, default=0, help="Tensor parallel (0=auto)")
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.7,
+                   help="GPU memory fraction (default: 0.7, lower if OOM)")
     p.add_argument("--skip-preflight", action="store_true")
     return p.parse_args()
 
