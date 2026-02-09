@@ -117,18 +117,19 @@ else
 
     info "Installing SGLang and dependencies..."
 
-    # Using pip within the venv for maximum compatibility
-    "$SGLANG_ENV/bin/pip" install --upgrade pip
-
+    # uv venv doesn't include pip — use "uv pip install --python <path>"
     # Install PyTorch first (matching CUDA version)
-    "$SGLANG_ENV/bin/pip" install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    uv pip install --python "$SGLANG_ENV/bin/python" \
+        torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
     # Install SGLang with all extras (server, router, all backends)
     # Ref: https://docs.sglang.ai/start/install.html
-    "$SGLANG_ENV/bin/pip" install "sglang[all]>=0.4.6.post1"
+    uv pip install --python "$SGLANG_ENV/bin/python" \
+        "sglang[all]>=0.4.6.post1"
 
     # Install additional dependencies for benchmark + bench_serving.py
-    "$SGLANG_ENV/bin/pip" install aiohttp openai numpy tqdm datasets
+    uv pip install --python "$SGLANG_ENV/bin/python" \
+        aiohttp openai numpy tqdm datasets
 
     # Verify installation
     if "$SGLANG_ENV/bin/python" -c "import sglang; print(f'SGLang {sglang.__version__}')" 2>/dev/null; then
