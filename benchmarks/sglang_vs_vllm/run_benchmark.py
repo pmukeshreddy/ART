@@ -181,7 +181,17 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
     async def _run_vllm() -> BenchmarkRun:
         import art
+        import shutil
         from art.megatron.backend import MegatronBackend
+
+        # Clean stale checkpoints from previous runs — the identity LoRA
+        # created by PEFT has HF-format names (model.layers.X.mlp.gate_proj)
+        # which are incompatible with vLLM's MoE expert names.
+        # Fresh start ensures no bad LoRA gets loaded.
+        stale_dir = os.path.join(".art", "sglang-vs-vllm", "models")
+        if os.path.exists(stale_dir):
+            shutil.rmtree(stale_dir)
+            logger.info(f"[vllm] cleaned stale checkpoints at {stale_dir}")
 
         run = BenchmarkRun(backend="vllm", model=model_id, dataset=dataset)
         run.start_time = time.perf_counter()
@@ -196,7 +206,11 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 model=model_id,
                 tensor_parallel_size=tp or min(2, torch.cuda.device_count()),
                 gpu_memory_utilization=gpu_mem,
-                enable_lora=True, max_loras=2,
+                # Disable LoRA for initial startup — PEFT creates HF-format
+                # LoRA names (model.layers.X) which are incompatible with
+                # vLLM's MoE expert names (experts.X). After first Megatron
+                # training step, the proper LoRA format will be created.
+                enable_lora=False,
             ),
         )
 
