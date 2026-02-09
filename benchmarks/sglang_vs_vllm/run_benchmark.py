@@ -195,12 +195,14 @@ def run_worker(backend: str, config_path: str, results_path: str) -> None:
                 max_num_seqs=config.inference.max_num_seqs,
                 enable_lora=True,
                 max_loras=2,
-                port=config.vllm_port,
+                # Note: 'port' is set in openai_server config, NOT engine_args
             ),
         )
 
         bk = MegatronBackend()
-        await model.register(bk)
+        await model.register(bk, _openai_client_config={
+            "server_args": {"port": config.vllm_port},
+        })
 
         t = time.perf_counter()
         base_url, api_key = await bk._prepare_backend_for_training(model)
