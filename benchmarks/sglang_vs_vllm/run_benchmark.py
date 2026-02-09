@@ -222,9 +222,20 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         run.server_startup_time = time.perf_counter() - t0
 
         base_url = model.inference_base_url
-        # With enable_lora=False, vLLM serves under the HF model name,
-        # not the ART "name@step" format. Override to match.
-        mname = model_id
+        # Query /v1/models to get the actual served name
+        # (ART may register it as "bench-vllm@0", not the HF name)
+        mname = None
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"{base_url}/models", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    data = await r.json()
+                    if data.get("data"):
+                        mname = data["data"][0]["id"]
+                        logger.info(f"[vllm] /v1/models returned: {[m['id'] for m in data['data']]}")
+        except Exception as e:
+            logger.warning(f"[vllm] /v1/models query failed: {e}")
+        if not mname:
+            mname = model.inference_model_name or model.name
         model.inference_model_name = mname
         logger.info(f"[vllm] ready in {run.server_startup_time:.0f}s — {mname} @ {base_url}")
 
@@ -363,9 +374,19 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
 def cleanup_gpus() -> None:
     for pat in ["model-service", "megatron-service", "sglang.launch_server",
-                "vllm.entrypoints", "torchrun"]:
+                "vllm.entrypoints", "vllm.v1", "torchrun"]:
         subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=10)
-    time.sleep(5)
+    # Give OS time to reclaim GPU memory — 10s to be safe
+    time.sleep(10)
+    # Verify GPUs are free
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,nounits,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        logger.info(f"GPU memory after cleanup: {r.stdout.strip()}")
+    except Exception:
+        pass
 
 
 def spawn_worker(backend: str, cfg: dict, results_path: str) -> int:
