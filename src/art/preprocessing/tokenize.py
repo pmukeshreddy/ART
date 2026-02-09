@@ -1,5 +1,3 @@
-# ruff: noqa: I001
-# Import order is intentional - unsloth MUST be imported before transformers
 import math
 import random
 from dataclasses import dataclass
@@ -25,6 +23,7 @@ class TokenizedResult:
     logprobs: list[float]
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
+    trajectory: Trajectory
     weight: float = 0.0
     prompt_id: int = 0
     prompt_length: int = 0
@@ -40,6 +39,7 @@ class TokenizedResult:
             logprobs=self.logprobs[self.prompt_length :],
             pixel_values=None,
             image_grid_thw=None,
+            trajectory=self.trajectory,
             weight=self.weight,
             prompt_id=self.prompt_id,
             prompt_length=0,
@@ -103,6 +103,7 @@ def tokenize_trajectory_groups(
                     history,
                     advantage,
                     allow_training_without_logprobs,
+                    trajectory,
                 ):
                     trajectory_results.append(result)
             weight = 1 / (
@@ -151,6 +152,7 @@ def tokenize_trajectory(
     history: History,
     advantage: float,
     allow_training_without_logprobs: bool,
+    trajectory: Trajectory,
 ) -> TokenizedResult | None:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
@@ -165,7 +167,8 @@ def tokenize_trajectory(
         ):
             last_assistant_index = i
         elif not isinstance(message, dict) and (
-            message.logprobs or allow_training_without_logprobs  # ty:ignore[possibly-missing-attribute]
+            message.logprobs
+            or allow_training_without_logprobs  # ty:ignore[possibly-missing-attribute]
         ):
             last_assistant_index = i
     # If there are no trainable assistant messages, return None
@@ -238,7 +241,9 @@ def tokenize_trajectory(
                 continue
             if not allow_training_without_logprobs:
                 continue
-        elif message.logprobs is None and not allow_training_without_logprobs:  # ty:ignore[possibly-missing-attribute]
+        elif (
+            message.logprobs is None and not allow_training_without_logprobs
+        ):  # ty:ignore[possibly-missing-attribute]
             continue
         start = token_ids.index(sentinal_token_id)
         end = start + 1
@@ -263,12 +268,16 @@ def tokenize_trajectory(
             assistant_mask[start:end] = [1] * len(content_token_ids)
         else:
             choice = message
-            assert choice.logprobs or allow_training_without_logprobs, (  # ty:ignore[possibly-missing-attribute]
+            assert (
+                choice.logprobs or allow_training_without_logprobs
+            ), (  # ty:ignore[possibly-missing-attribute]
                 "Chat completion choices must have logprobs"
             )
             if not choice.logprobs:  # ty:ignore[possibly-missing-attribute]
                 continue
-            token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []  # ty:ignore[possibly-missing-attribute]
+            token_logprobs = (
+                choice.logprobs.content or choice.logprobs.refusal or []
+            )  # ty:ignore[possibly-missing-attribute]
             if (
                 bytes(token_logprobs[0].bytes or []).decode("utf-8")
                 == "<think>"
@@ -349,6 +358,7 @@ def tokenize_trajectory(
         logprobs=logprobs,
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
+        trajectory=trajectory,
     )
 
 
