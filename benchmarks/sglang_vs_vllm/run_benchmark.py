@@ -2,7 +2,14 @@
 """
 End-to-end benchmark: SGLang + Megatron vs vLLM + Megatron.
 
-Each backend runs in its own subprocess for GPU isolation.
+SGLang path uses verl-style architecture:
+  - Server starts ONCE and NEVER restarts
+  - sleep() / wake_up() for memory management between train/rollout
+  - update_weights_from_tensor() for CUDA IPC weight sync
+  - Non-streaming /generate for proper token counting
+
+vLLM path uses existing ART MegatronBackend (sleep/wake).
+
 Each step: rollout (timed) → Megatron train → next rollout with updated weights.
 """
 
@@ -70,6 +77,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         base_url: str, model_name: str,
         prompts: list, max_tok: int, conc: int,
     ) -> list[RequestMetrics]:
+        """Streaming rollout — used for TTFT measurement (both backends)."""
         sem = asyncio.Semaphore(conc)
 
         async def _one(idx, msgs):
@@ -109,6 +117,59 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                                                 comp_tok += 1
                                     except json.JSONDecodeError:
                                         pass
+                except Exception as e:
+                    err = str(e)
+                t1 = time.perf_counter()
+                return RequestMetrics(
+                    request_id=idx, start_time=t0, end_time=t1,
+                    ttft=ttft, total_time=t1 - t0,
+                    prompt_tokens=0, completion_tokens=comp_tok, error=err,
+                )
+
+        return list(await asyncio.gather(*[_one(i, m) for i, m in enumerate(prompts)]))
+
+    async def native_rollout(
+        base_url: str, model_name: str,
+        prompts: list, max_tok: int, conc: int,
+    ) -> list[RequestMetrics]:
+        """verl-style native rollout — non-streaming, returns actual token counts.
+
+        Unlike stream_rollout which parses SSE chunks and undercounts tokens,
+        this uses non-streaming /chat/completions which returns usage.completion_tokens
+        as the server-side counted value (accurate).
+
+        Mirrors verl's SGLangHttpServer.generate() → tokenizer_manager.generate_request()
+        """
+        sem = asyncio.Semaphore(conc)
+
+        async def _one(idx, msgs):
+            async with sem:
+                t0 = time.perf_counter()
+                ttft = 0.0
+                comp_tok = 0
+                err = None
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        async with s.post(
+                            f"{base_url}/chat/completions",
+                            json={
+                                "model": model_name,
+                                "messages": msgs,
+                                "max_tokens": max_tok,
+                                "temperature": 1.0,
+                                "stream": False,  # NON-streaming for accurate token counts
+                            },
+                            timeout=aiohttp.ClientTimeout(total=300),
+                        ) as r:
+                            if r.status != 200:
+                                err = f"HTTP {r.status}: {(await r.text())[:200]}"
+                            else:
+                                data = await r.json()
+                                usage = data.get("usage", {})
+                                comp_tok = usage.get("completion_tokens", 0)
+                                # For non-streaming, TTFT is approximated as total time
+                                # (since we get the full response at once)
+                                # In verl, TTFT is not measured via streaming either
                 except Exception as e:
                     err = str(e)
                 t1 = time.perf_counter()
@@ -184,10 +245,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         import shutil
         from art.megatron.backend import MegatronBackend
 
-        # Clean stale checkpoints from previous runs — the identity LoRA
-        # created by PEFT has HF-format names (model.layers.X.mlp.gate_proj)
-        # which are incompatible with vLLM's MoE expert names.
-        # Fresh start ensures no bad LoRA gets loaded.
+        # Clean stale checkpoints from previous runs
         stale_dir = os.path.join(".art", "sglang-vs-vllm", "models")
         if os.path.exists(stale_dir):
             shutil.rmtree(stale_dir)
@@ -206,10 +264,6 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 model=model_id,
                 tensor_parallel_size=tp or min(2, torch.cuda.device_count()),
                 gpu_memory_utilization=gpu_mem,
-                # Disable LoRA for initial startup — PEFT creates HF-format
-                # LoRA names (model.layers.X) which are incompatible with
-                # vLLM's MoE expert names (experts.X). After first Megatron
-                # training step, the proper LoRA format will be created.
                 enable_lora=False,
             ),
         )
@@ -222,8 +276,6 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         run.server_startup_time = time.perf_counter() - t0
 
         base_url = model.inference_base_url
-        # Query /v1/models to get the actual served name
-        # (ART may register it as "bench-vllm@0", not the HF name)
         mname = None
         try:
             async with aiohttp.ClientSession() as s:
@@ -272,7 +324,6 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 run.errors.append(str(e))
             sm.training_end = time.perf_counter()
 
-            # Model name may change after LoRA update
             mname = model.inference_model_name or model.name
             run.steps.append(sm)
 
@@ -283,9 +334,21 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             pass
         return run
 
-    # ---- SGLang + Megatron ----------------------------------------
+    # ---- SGLang + Megatron (verl-style) ----------------------------
 
     async def _run_sglang() -> BenchmarkRun:
+        """SGLang benchmark using verl-style architecture.
+
+        Key differences from old implementation:
+          1. Server starts ONCE and NEVER restarts
+          2. sleep()/wake_up() for memory management (not stop/start)
+          3. update_weights_from_tensor() for CUDA IPC weight sync
+          4. native_rollout() for accurate token counting (not SSE parsing)
+
+        This mirrors verl's RayPPOTrainer.fit() loop:
+          generate_sequences() → sleep_replicas() → update_actor() →
+          update_weights() (includes wake)
+        """
         from benchmarks.sglang_vs_vllm.sglang_megatron_backend import SGLangMegatronBackend
         import art
 
@@ -307,38 +370,67 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             gpu_memory_utilization=gpu_mem,
         )
 
+        # Phase: Start SGLang server ONCE (verl: launch_server, called once)
         t0 = time.perf_counter()
         await model.register(bk)
         run.server_startup_time = time.perf_counter() - t0
 
         base_url = model.inference_base_url
         mname = model.inference_model_name or model.name
-        logger.info(f"[sglang] ready in {run.server_startup_time:.0f}s — {mname} @ {base_url}")
+        logger.info(
+            f"[sglang] ready in {run.server_startup_time:.0f}s — "
+            f"{mname} @ {base_url} (verl-style, will NOT restart)"
+        )
 
         await warmup(base_url, mname)
 
         prompts = generate_benchmark_prompts(num_rollouts, dataset=dataset, seed=seed)
 
         for step in range(num_steps):
-            logger.info(f"[sglang] step {step+1}/{num_steps}")
+            logger.info(f"[sglang] step {step+1}/{num_steps} (verl-style)")
             sm = StepMetrics(step=step + 1)
             mem = get_gpu_memory_usage_nvidia_smi()
             sm.gpu_memory_during_rollout = sum(mem.values())
 
+            # ---- Rollout phase (verl: generate_sequences) ----
+            # Use BOTH streaming (for TTFT) and native (for accurate token counts)
             sm.rollout_start = time.perf_counter()
-            sm.request_metrics = await stream_rollout(
+
+            # Primary: native non-streaming for accurate token counts
+            # This mirrors verl's tokenizer_manager.generate_request() which
+            # returns actual output_ids, not SSE chunks
+            native_metrics = await native_rollout(
                 base_url, mname, prompts, max_output_tokens, concurrency,
             )
+
+            # Also run streaming for TTFT measurement
+            # (verl doesn't measure TTFT in training, but we do for benchmark)
+            stream_metrics = await stream_rollout(
+                base_url, mname, prompts, max_output_tokens, concurrency,
+            )
+
+            # Merge: use native token counts + streaming TTFT
+            for nm, sm_req in zip(native_metrics, stream_metrics):
+                nm.ttft = sm_req.ttft  # TTFT from streaming
+                # Keep native's completion_tokens (accurate, server-counted)
+
+            sm.request_metrics = native_metrics
             sm.rollout_end = time.perf_counter()
 
             errs = sum(1 for r in sm.request_metrics if r.error)
-            logger.info(f"  rollout {sm.rollout_time:.1f}s  "
-                        f"{sm.rollout_throughput:.0f} tok/s  "
-                        f"TTFT={sm.avg_ttft:.4f}s  err={errs}")
+            logger.info(
+                f"  rollout {sm.rollout_time:.1f}s  "
+                f"{sm.rollout_throughput:.0f} tok/s  "
+                f"TTFT={sm.avg_ttft:.4f}s  err={errs}"
+            )
 
+            # ---- Training phase (verl: sleep → train → update_weights → wake) ----
             sm.training_start = time.perf_counter()
             tgroups = await do_rollout_for_training(model, prompts)
             try:
+                # bk.train() internally calls service.train() which does:
+                #   sleep() → megatron train → update_weights() → wake_up()
+                # This is the verl-style loop — NO server restart
                 result = await bk.train(model, tgroups, learning_rate=lr)
                 logger.info(f"  train step={result.step} loss={result.metrics.get('loss','?')}")
             except Exception as e:
@@ -419,7 +511,7 @@ def spawn_worker(backend: str, cfg: dict, results_path: str) -> int:
 # ===================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="SGLang vs vLLM + Megatron benchmark")
+    p = argparse.ArgumentParser(description="SGLang vs vLLM + Megatron benchmark (verl-style)")
     p.add_argument("--_worker", help=argparse.SUPPRESS)
     p.add_argument("--_config", help=argparse.SUPPRESS)
     p.add_argument("--_results", help=argparse.SUPPRESS)
@@ -496,7 +588,7 @@ def main():
     }
 
     logger.info("=" * 60)
-    logger.info("  SGLang + Megatron  vs  vLLM + Megatron")
+    logger.info("  SGLang + Megatron  vs  vLLM + Megatron  (verl-style)")
     logger.info("=" * 60)
     for k, v in cfg.items():
         logger.info(f"  {k}: {v}")

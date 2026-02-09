@@ -1,8 +1,14 @@
 """
-SGLang + Megatron backend — drop-in for MegatronBackend.
+SGLang + Megatron backend — verl-style hybrid engine.
 
-Uses SGLang for inference, Megatron for training.
+Uses SGLang for inference (persistent, never restarts) and Megatron for training.
 Inherits all training/checkpoint logic from LocalBackend.
+
+Architecture matches verl-project/verl:
+  - SGLang server starts once, stays alive across all RL steps
+  - Weight sync via CUDA IPC (update_weights_from_tensor), not restart
+  - Memory managed via sleep/wake (release/resume_memory_occupation)
+  - Native generation returns actual token IDs, not SSE chunks
 """
 
 from __future__ import annotations
@@ -18,7 +24,13 @@ from .sglang_megatron_service import SGLangMegatronService
 
 
 class SGLangMegatronBackend(LocalBackend):
-    """Backend: SGLang inference + Megatron training."""
+    """Backend: SGLang inference + Megatron training (verl-style).
+
+    Key difference from old implementation:
+      - SGLang server NEVER restarts between training steps
+      - Weights are synced in-place via CUDA IPC
+      - KV cache is managed via sleep/wake, not stop/start
+    """
 
     def __init__(
         self,
@@ -39,7 +51,11 @@ class SGLangMegatronBackend(LocalBackend):
         self._max_reqs = max_running_requests
 
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
-        """SGLang serves the model under its HF path, not the ART name@step."""
+        """SGLang serves the model under its HF path, not the ART name@step.
+
+        verl's ServerAdapter does the same: it uses the base model path
+        as the served_model_name.
+        """
         return model.base_model if hasattr(model, "base_model") else model.name
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
