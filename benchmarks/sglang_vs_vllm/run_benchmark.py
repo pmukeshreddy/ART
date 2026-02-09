@@ -182,7 +182,8 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             if len(batch) >= 2:
                 rs = [t.reward for t in batch]
                 if len(set(rs)) == 1:
-                    batch[0].reward = max(0.0, batch[0].reward - 0.5)
+                    for j, t in enumerate(batch):
+                        t.reward = t.reward + (j + 1) * 0.01
             groups.append(art.TrajectoryGroup(batch))
         return groups
 
