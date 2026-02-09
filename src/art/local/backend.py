@@ -202,9 +202,7 @@ class LocalBackend(Backend):
                 image_processor=self._image_processors[model.base_model],
             )
         )
-        print(f"DEBUG tokenized_results: {len(tokenized_results)}")
         if not tokenized_results:
-            print(f"DEBUG tokenized_results count: {len(tokenized_results)}")
             return None
         max_tokens = max(len(result.tokens) for result in tokenized_results)
         # Round up max_tokens to the nearest multiple of 2048
