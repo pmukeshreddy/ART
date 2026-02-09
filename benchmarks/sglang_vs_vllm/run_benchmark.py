@@ -417,10 +417,27 @@ def run_worker(backend: str, config_path: str, results_path: str) -> None:
 # ===================================================================
 
 def cleanup_gpus() -> None:
-    """Kill all inference/training processes to get a clean GPU state."""
-    for name in ["model-service", "megatron-service", "sglang", "vllm", "torchrun"]:
-        subprocess.run(["pkill", "-9", "-f", name],
-                       capture_output=True, timeout=10)
+    """Kill leftover inference/training processes to get a clean GPU state.
+
+    IMPORTANT: patterns must NOT match our own benchmark process.
+    Our script path contains 'sglang_vs_vllm' so naive 'pkill -f vllm'
+    would kill ourselves.  Use specific process patterns instead.
+    """
+    my_pid = os.getpid()
+    # Kill specific server/training processes — NOT our benchmark script
+    patterns = [
+        "model-service",
+        "megatron-service",
+        "sglang.launch_server",     # SGLang server process (not our script)
+        "vllm.entrypoints",         # vLLM server process (not our script)
+        "torchrun",
+    ]
+    for pattern in patterns:
+        # pkill with a specific enough pattern to avoid self-kill
+        subprocess.run(
+            ["pkill", "-9", "-f", pattern],
+            capture_output=True, timeout=10,
+        )
     # Wait for OS to reclaim GPU memory
     import time as _t
     _t.sleep(5)
