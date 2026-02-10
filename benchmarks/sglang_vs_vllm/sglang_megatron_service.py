@@ -5,24 +5,25 @@ Architecture:
   - SGLang server starts ONCE and NEVER restarts
   - Before training: sleep(kv_cache+weights) releases GPU memory
   - Training: Megatron runs as SEPARATE subprocess (produces LoRA adapter)
-  - After training: wake_up(kv_cache+weights) restores GPU memory
-  - Weight sync: single-pass LoRA merge (B@A deltas → affected shards) + /update_weights
-  - Result: SGLang serves with LoRA-updated weights, CUDA graphs intact
+  - After training: wake_up(kv_cache+weights) restores base weights
+  - Weight sync: hot-reload LoRA adapter via /load_lora_adapter (<2s)
+  - Result: SGLang serves base + LoRA on-the-fly, CUDA graphs intact
 
-Weight sync pipeline (single-pass, eliminates 500s+ bottleneck):
-  1. Compute deltas B@A from LoRA adapter (tiny CPU matmuls, r=1)
-  2. One pass per affected shard: read base → apply delta → save merged
-  3. Symlink unaffected shards (zero copy for ~50% of model)
-  4. POST /update_weights → SGLang reloads from merged dir (~10-20s)
+Weight sync (ART's recommended weight_sync_method="lora"):
+  1. _merge_lora_shards() — combine TP-sharded adapters into one (~2MB)
+  2. POST /load_lora_adapter — SGLang loads adapter, applies during inference
+  3. Generate with model=lora_name — SGLang uses base + adapter
+
+  vs old approach (464s): build 60GB merged model dir + SGLang reload
 
 Key difference from verl: our Megatron subprocess is separate (not shared
 process), so we must release BOTH kv_cache and weights during sleep to give
 Megatron enough GPU memory. verl's colocated design uses CUDA IPC (zero-copy).
 
 Reference:
+  - src/art/sglang_backend/service.py :: _hot_reload_lora()
+  - src/art/sglang_backend/config.py :: weight_sync_method="lora" (recommended)
   - verl/workers/rollout/sglang_rollout/sglang_rollout.py (ServerAdapter)
-  - verl/workers/rollout/sglang_rollout/async_sglang_server.py (SGLangHttpServer)
-  - verl/trainer/ppo/ray_trainer.py (fit loop: generate → sleep → train → wake → update_weights)
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ class SGLangMegatronService:
 
     Key difference from old implementation:
       OLD: stop SGLang → train → restart SGLang (60-90s overhead)
-      NEW: sleep → train → wake → update_weights (single-pass merge)
+      NEW: sleep → train → wake → load_lora (ART recommended)
 
     Key difference from verl:
       verl: training + inference share same process, same GPU memory (CUDA IPC)
@@ -74,7 +75,7 @@ class SGLangMegatronService:
       2. sleep()         — release KV cache AND weights (for Megatron)
       3. Megatron train  — uses freed GPU memory, saves LoRA adapter
       4. wake_up()       — restore base weights + KV cache from CPU
-      5. update_weights()— single-pass merge (B@A deltas), SGLang reloads
+      5. load_lora()     — hot-reload ~2MB adapter (ART recommended method)
     """
 
     model_name: str
@@ -92,10 +93,6 @@ class SGLangMegatronService:
     _megatron_process: asyncio.subprocess.Process | None = None
     _optimizer_state_path: str | None = None
     _is_sleeping: bool = False
-    # Pre-warmed HF model path — resolved once at startup, reused for merging
-    _hf_model_path: str | None = None
-    # Weight index: maps HF weight names → shard filenames
-    _weight_map: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not self.log_dir:
@@ -107,10 +104,11 @@ class SGLangMegatronService:
     # ------------------------------------------------------------------
 
     def _create_server(self) -> SGLangServer:
-        """Create SGLang server — no LoRA on initial start.
+        """Create SGLang server with LoRA support for dynamic adapter loading.
 
-        verl starts the base model and syncs weights in-place.
-        We do the same: start clean, push LoRA-merged weights after training.
+        Starts base model with --enable-lora so /load_lora_adapter works.
+        No adapters loaded initially — they're hot-reloaded after training.
+        Mirrors ART's weight_sync_method="lora" (recommended).
         """
         return SGLangServer(SGLangServerConfig(
             model_path=self.base_model,
@@ -126,6 +124,10 @@ class SGLangMegatronService:
             enable_p2p_check=True,
             chunked_prefill_size=32768,
             enable_memory_saver=True,  # Required for sleep/wake
+            # LoRA: required for dynamic /load_lora_adapter after training
+            # Modules match src/art/megatron/service.py LoraConfig.target_modules
+            enable_lora=True,
+            max_lora_rank=8,  # Megatron trains rank=1, headroom for future
         ))
 
     async def start_openai_server(
@@ -135,57 +137,17 @@ class SGLangMegatronService:
 
         Mirrors verl's SGLangHttpServer.launch_server() which launches
         subprocesses once and keeps them alive across all RL steps.
-
-        Also pre-warms the HF model cache and weight index so the first
-        update_weights call doesn't pay the snapshot_download cost.
         """
         self._latest_step = 0
 
-        # Pre-warm HF cache in background while SGLang starts
-        import concurrent.futures
-        warmup_future = concurrent.futures.ThreadPoolExecutor(1).submit(
-            self._prewarm_hf_cache
-        )
-
         self._server = self._create_server()
         await self._server.start()
-
-        # Ensure pre-warm completed (should be done by now — SGLang startup is slow)
-        try:
-            warmup_future.result(timeout=120)
-            logger.info(f"HF cache pre-warmed: {self._hf_model_path}")
-        except Exception as e:
-            logger.warning(f"HF cache pre-warm failed (will retry on first merge): {e}")
 
         logger.info(
             f"SGLang ready (verl-style, persistent) — "
             f"serving {self.base_model} on port {self.port}"
         )
         return "0.0.0.0", self.port
-
-    def _prewarm_hf_cache(self) -> None:
-        """Download and index the base model — runs once at startup.
-
-        Resolves the HF model path and loads the weight index so the first
-        update_weights doesn't block on snapshot_download.
-        """
-        from huggingface_hub import snapshot_download
-
-        t0 = time.perf_counter()
-        self._hf_model_path = snapshot_download(
-            self.base_model,
-            allow_patterns=["*.safetensors", "*.json"],
-        )
-        index_path = os.path.join(self._hf_model_path, "model.safetensors.index.json")
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                self._weight_map = json.load(f).get("weight_map", {})
-        else:
-            self._weight_map = {}
-        logger.info(
-            f"HF cache pre-warmed in {time.perf_counter() - t0:.1f}s — "
-            f"{len(self._weight_map)} weights indexed"
-        )
 
     async def vllm_engine_is_sleeping(self) -> bool:
         """Compat: check if inference engine is sleeping."""
@@ -209,7 +171,7 @@ class SGLangMegatronService:
         model weights (~7.5GB/GPU for Qwen3-30B-A3B) must also be freed.
 
         SGLang process stays alive: NCCL communicators, tokenizer survive.
-        Weights will be reloaded via update_weights_from_disk() after training.
+        Weights will be restored via wake_up(), then LoRA loaded via /load_lora_adapter.
 
         verl equivalent:
             obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
@@ -229,8 +191,8 @@ class SGLangMegatronService:
         """Resume GPU memory after training — verl's wake_up().
 
         Restores BOTH KV cache and model weights from CPU backup.
-        After wake, update_weights() will overwrite the base weights
-        with LoRA-merged weights via /update_weights endpoint.
+        After wake, _hot_reload_lora() will load the LoRA adapter
+        on top of these restored base weights.
 
         verl equivalent:
             obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
@@ -241,7 +203,7 @@ class SGLangMegatronService:
             return 0.0
 
         t0 = time.perf_counter()
-        # Resume both KV cache and weights — we'll overwrite weights via /update_weights
+        # Resume both KV cache and weights — LoRA adapter loaded separately after
         elapsed = await self._server.wake_up(tags=["kv_cache", "weights"])
         self._is_sleeping = False
         logger.info(f"SGLang awake (kv_cache + weights resumed) in {elapsed:.2f}s")
@@ -252,179 +214,51 @@ class SGLangMegatronService:
     # Mirrors: verl/workers/rollout/sglang_rollout/sglang_rollout.py
     # ------------------------------------------------------------------
 
-    async def update_weights(self, lora_path: str) -> float:
-        """Single-pass LoRA merge + disk reload for SGLang weight sync.
+    async def _hot_reload_lora(self, lora_path: str, step: int) -> float:
+        """Hot-reload LoRA adapter — ART's recommended weight_sync_method.
 
-        Architecture (eliminates triple I/O bottleneck):
-          1. Compute deltas B@A directly from LoRA adapter (tiny CPU matmuls, r=1)
-          2. Single pass per affected shard: read base → apply delta → save merged
-          3. Symlink unaffected shards (zero copy)
-          4. POST /update_weights → SGLang reloads from merged dir
+        Mirrors: src/art/sglang_backend/service.py :: _hot_reload_lora()
+        Config:  src/art/sglang_backend/config.py :: weight_sync_method="lora"
 
-        Old architecture loaded base weights separately (25GB), merged on CPU,
-        then loaded the SAME shards again to build the merged dir. That's 75GB
-        of I/O for what should be ~25GB.
+        Instead of building a 60GB merged model dir and reloading all weights,
+        SGLang loads the ~2MB adapter and applies it on-the-fly during inference.
+        Base weights stay UNTOUCHED on GPU after wake_up().
+
+        Old path (464s):
+          read 60GB base → compute B@A deltas → write 60GB merged → SGLang reloads 60GB
+        New path (<2s):
+          POST /load_lora_adapter with 2MB adapter → done
         """
-        t0 = time.perf_counter()
-
-        # Step 1: Load LoRA adapter + compute deltas
-        adapter_file = os.path.join(lora_path, "adapter_model.safetensors")
-        if not os.path.exists(adapter_file):
-            logger.warning("No LoRA adapter found, skipping weight sync")
+        if self._server is None:
+            logger.warning("No server — skipping LoRA hot-reload")
             return 0.0
 
-        from safetensors.torch import load_file
-        lora_tensors = load_file(adapter_file)
+        adapter_file = os.path.join(lora_path, "adapter_model.safetensors")
+        if not os.path.exists(adapter_file):
+            logger.warning(f"No adapter at {adapter_file}, skipping")
+            return 0.0
 
-        # Read LoRA config for scaling
-        config_path = os.path.join(lora_path, "adapter_config.json")
-        alpha, r = 32, 1  # defaults matching src/art/megatron/service.py
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                cfg = json.load(f)
-                alpha = cfg.get("lora_alpha", alpha)
-                r = cfg.get("r", r)
-        scaling = alpha / r
-
-        # Group LoRA tensors → compute delta per base weight
-        # Keys: "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
-        # Strip prefix + suffix → HF name: "model.layers.0.self_attn.q_proj.weight"
-        lora_pairs: dict[str, dict[str, torch.Tensor]] = {}
-        for key, tensor in lora_tensors.items():
-            if "lora_A" in key:
-                base_key = key.replace(".lora_A.weight", ".weight").replace(
-                    "base_model.model.", "", 1
-                )
-                lora_pairs.setdefault(base_key, {})["A"] = tensor
-            elif "lora_B" in key:
-                base_key = key.replace(".lora_B.weight", ".weight").replace(
-                    "base_model.model.", "", 1
-                )
-                lora_pairs.setdefault(base_key, {})["B"] = tensor
-
-        deltas: dict[str, torch.Tensor] = {}
-        for base_key, pair in lora_pairs.items():
-            if "A" in pair and "B" in pair:
-                # delta = scaling * B @ A (outer product when r=1, instant)
-                deltas[base_key] = scaling * (pair["B"] @ pair["A"])
-
-        t_delta = time.perf_counter() - t0
-        logger.info(
-            f"Computed {len(deltas)} LoRA deltas (scaling={scaling}) in {t_delta:.2f}s"
+        lora_name = f"{self.model_name}@step{step}"
+        elapsed = await self._server.load_lora_adapter(
+            lora_path=lora_path,
+            lora_name=lora_name,
+            flush_cache=True,
         )
 
-        # Step 2: Build merged model dir — single pass through affected shards
-        merged_dir = self._build_merged_model_dir(deltas)
-
-        t_build = time.perf_counter() - t0 - t_delta
-        logger.info(f"Built merged model dir in {t_build:.2f}s")
-
-        # Step 3: Tell SGLang to reload weights from merged path
-        if self._server and merged_dir:
-            t_reload = time.perf_counter()
-            elapsed = await self._server.update_weights_from_disk(
-                model_path=merged_dir,
-                load_format="auto",
+        if elapsed < 0:
+            # Fallback: if load_lora_adapter not supported, log and continue
+            # Base weights are still correct (just without LoRA update)
+            logger.error(
+                "load_lora_adapter failed — SGLang may not support dynamic "
+                "LoRA loading. Base weights are intact but NOT updated."
             )
-            logger.info(
-                f"SGLang reloaded {len(deltas)} merged weights in {elapsed:.2f}s"
-            )
-            await self._server.flush_cache()
-
-        total = time.perf_counter() - t0
-        logger.info(f"Total weight sync: {total:.2f}s (was 500s+ with old pipeline)")
-        return total
-
-    def _build_merged_model_dir(self, deltas: dict[str, torch.Tensor]) -> str:
-        """Build a model directory with LoRA-merged weights for SGLang reload.
-
-        Single-pass I/O: each affected shard is read once, deltas applied
-        in-memory, written once. Unaffected shards are symlinked (zero copy).
-
-        Args:
-            deltas: {hf_weight_name: delta_tensor} — pre-computed B@A*scaling
-        Returns:
-            Path to the merged model directory
-        """
-        from safetensors import safe_open
-        from safetensors.torch import save_file
-
-        merged_dir = os.path.join(self.output_dir, "merged_weights")
-        if os.path.exists(merged_dir):
-            shutil.rmtree(merged_dir)
-        os.makedirs(merged_dir)
-
-        # Ensure HF cache is resolved
-        if self._hf_model_path is None or self._weight_map is None:
-            self._prewarm_hf_cache()
-        base_path = self._hf_model_path
-        weight_map = self._weight_map
-        assert base_path is not None and weight_map is not None
-
-        # Map delta keys → affected shard files
-        affected_shards: dict[str, set[str]] = {}
-        for key in deltas:
-            shard = weight_map.get(key)
-            if shard:
-                affected_shards.setdefault(shard, set()).add(key)
-            else:
-                logger.debug(f"Delta key {key} not in weight index, skipping")
+            return 0.0
 
         logger.info(
-            f"LoRA affects {len(affected_shards)} shard files "
-            f"({sum(len(v) for v in affected_shards.values())} weights)"
+            f"LoRA hot-reload: '{lora_name}' loaded in {elapsed:.2f}s "
+            f"(was 464s with disk merge)"
         )
-
-        # Copy config/tokenizer files (small, instant)
-        for fname in os.listdir(base_path):
-            if fname.endswith((".json", ".py")) or fname == "tokenizer.model":
-                shutil.copy2(
-                    os.path.join(base_path, fname),
-                    os.path.join(merged_dir, fname),
-                )
-
-        # Single-pass per affected shard: read → apply deltas → write
-        for shard_file, changed_keys in affected_shards.items():
-            src_path = os.path.join(base_path, shard_file)
-            dst_path = os.path.join(merged_dir, shard_file)
-            shard_tensors: dict[str, torch.Tensor] = {}
-
-            with safe_open(src_path, framework="pt", device="cpu") as sf:
-                for k in sf.keys():
-                    t = sf.get_tensor(k)
-                    if k in deltas:
-                        delta = deltas[k].to(dtype=t.dtype)
-                        if delta.shape == t.shape:
-                            t = t + delta
-                        else:
-                            logger.warning(
-                                f"Shape mismatch {k}: base={t.shape} delta={delta.shape}, "
-                                f"skipping merge"
-                            )
-                    shard_tensors[k] = t
-
-            save_file(shard_tensors, dst_path)
-            logger.debug(
-                f"Merged shard {shard_file}: {len(changed_keys)} deltas applied"
-            )
-
-        # Symlink unaffected shards — zero copy, same filesystem
-        for fname in os.listdir(base_path):
-            if fname.endswith(".safetensors") and fname not in affected_shards:
-                src = os.path.join(base_path, fname)
-                dst = os.path.join(merged_dir, fname)
-                try:
-                    os.symlink(src, dst)
-                except OSError:
-                    # Cross-filesystem fallback (e.g., HF cache on different mount)
-                    shutil.copy2(src, dst)
-
-        logger.info(
-            f"Merged model dir ready: {merged_dir} "
-            f"({len(affected_shards)} merged + "
-            f"{sum(1 for f in os.listdir(base_path) if f.endswith('.safetensors') and f not in affected_shards)} symlinked)"
-        )
-        return merged_dir
+        return elapsed
 
     # ------------------------------------------------------------------
     # Checkpoint management
@@ -476,7 +310,7 @@ class SGLangMegatronService:
         self._megatron_process = await asyncio.create_subprocess_shell(command)
 
     # ------------------------------------------------------------------
-    # Training step — verl-style: sleep → train → update_weights → wake
+    # Training step — verl-style: sleep → train → wake → load_lora
     # ------------------------------------------------------------------
 
     async def train(
@@ -486,18 +320,16 @@ class SGLangMegatronService:
         experimental_config: dict,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """verl-style training step: sleep → train → wake → update_weights.
+        """verl-style training step: sleep → train → wake → load_lora.
 
-        OLD architecture:
-          stop SGLang (5-10s) → train → restart SGLang (60-90s)
-          Total overhead: 65-100s
+        OLD architecture (464s weight sync):
+          sleep → train → wake → build 60GB merged dir → SGLang reloads 60GB
+          wake_up restores base weights... immediately overwritten by merged
 
-        NEW architecture (verl-style):
-          sleep(kv+weights) → train → wake(kv+weights) → update_weights(single-pass)
-          Total overhead: ~20-35s (wake ~5-10s + merge+reload ~15-25s)
-
-        Key: wake restores original base weights first, then update_weights
-        overwrites them with LoRA-merged weights via single-pass disk merge.
+        NEW architecture (<2s weight sync, ART recommended):
+          sleep → train → wake → load_lora_adapter (2MB)
+          wake_up restores base weights → they STAY as base
+          SGLang applies LoRA on-the-fly during inference
         """
 
         # Phase 1: Sleep — release KV cache + model weights from GPU
@@ -568,26 +400,24 @@ class SGLangMegatronService:
         self._latest_step = next_step
 
         # Phase 4: Wake up — restore base weights + KV cache to GPU
-        # Must happen BEFORE update_weights because SGLang needs GPU memory
-        # mapped before it can load new weights into it.
+        # Base weights come back UNTOUCHED — no more "restore then overwrite"
         t_wake = time.perf_counter()
         wake_time = await self.wake_up()
         logger.info(f"Phase 4 — wake_up(kv_cache+weights): {wake_time:.2f}s")
 
-        # Phase 5: Weight sync — merge LoRA into base, reload in SGLang
-        # Builds merged model dir (single-pass I/O) then POSTs /update_weights.
-        # SGLang replaces its in-GPU weights with the LoRA-merged version.
+        # Phase 5: Hot-reload LoRA adapter (~2MB, <2s)
+        # ART's recommended weight_sync_method="lora"
+        # vs old: build 60GB merged dir + SGLang reload = 464s
         t_ws = time.perf_counter()
-        weight_sync_time = await self.update_weights(new_ckpt)
+        weight_sync_time = await self._hot_reload_lora(new_ckpt, next_step)
         logger.info(
-            f"Phase 5 — update_weights (single-pass merge + reload): "
-            f"{weight_sync_time:.2f}s"
+            f"Phase 5 — _hot_reload_lora: {weight_sync_time:.2f}s"
         )
 
         total_overhead = time.perf_counter() - t0
         logger.info(
             f"Total transition overhead: {total_overhead:.2f}s "
-            f"(verl-style, was 65-100s with restart)"
+            f"(was 464s+ with disk merge)"
         )
 
     def _merge_lora_shards(self, lora_path: str) -> None:
