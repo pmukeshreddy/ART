@@ -311,7 +311,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             sm.training_start = time.perf_counter()
             tgroups = await do_rollout_for_training(model, prompts)
             try:
-                result = await bk.train(model, tgroups, learning_rate=lr)
+                result = await bk.train(model, tgroups, learning_rate=lr,on_policy_correction=True)
                 logger.info(f"  train step={result.step} loss={result.metrics.get('loss','?')}")
             except Exception as e:
                 logger.error(f"  train failed: {e}", exc_info=True)
@@ -416,7 +416,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 #   sleep(kv_cache+weights) → megatron train →
                 #   update_weights(disk) → wake_up(kv_cache)
                 # This is the verl-style loop — NO server restart
-                result = await bk.train(model, tgroups, learning_rate=lr, on_policy_correction=False)
+                result = await bk.train(model, tgroups, learning_rate=lr, on_policy_correction=True)
                 logger.info(f"  train step={result.step} loss={result.metrics.get('loss','?')}")
             except Exception as e:
                 logger.error(f"  train failed: {e}", exc_info=True)
