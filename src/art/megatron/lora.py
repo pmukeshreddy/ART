@@ -49,18 +49,12 @@ class LoRA(torch.nn.Module):
             ).squeeze(0)
         )
         self._expert_offset = ps.get_expert_model_parallel_rank() * num_local_experts
-        # Mark TP-sharded params at construction time so sharded_lora_state_dict()
-        # works correctly on the FIRST training step (before any load_weight call).
-        # load_weight() will overwrite these when loading from checkpoint.
+        # Store TP shard topology as instance variables — NOT on tensors.
+        # load_weight() unconditionally resets tensor.sharded=False, so storing
+        # on the tensor was silently overwritten on every checkpoint load.
         _is_tp = ps.get_tensor_model_parallel_world_size() > 1
-        if tp_shard in ("B", "column"):
-            # Column-parallel: B_T has TP-sharded out_features
-            setattr(self.B_T, "sharded", _is_tp)
-            setattr(self.A_T, "sharded", False)
-        elif tp_shard in ("A", "row"):
-            # Row-parallel: A_T has TP-sharded in_features
-            setattr(self.A_T, "sharded", _is_tp)
-            setattr(self.B_T, "sharded", False)
+        self._a_is_tp_sharded = _is_tp and tp_shard in ("A", "row")
+        self._b_is_tp_sharded = _is_tp and tp_shard in ("B", "column")
         self.reset_lora_parameters()
 
     @property
@@ -150,11 +144,11 @@ class LoRA(torch.nn.Module):
             return {}
         return {
             f"{self.adapter_model_prefix}.{key}": param.data.T
-            for key, param in (
-                ("lora_A.weight", self.A_T),
-                ("lora_B.weight", self.B_T),
+            for key, param, is_sharded in (
+                ("lora_A.weight", self.A_T, self._a_is_tp_sharded),
+                ("lora_B.weight", self.B_T, self._b_is_tp_sharded),
             )
-            if getattr(param, "sharded", False)
+            if is_sharded
             or ps.get_tensor_model_parallel_rank() == 0
         }
 
