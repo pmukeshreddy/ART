@@ -148,7 +148,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         """Non-streaming rollout that returns real TrajectoryGroups for Megatron."""
         import art
         client = model.openai_client()
-        inf_name = model.inference_model_name or model.name
+        inf_name = model.get_inference_name()
 
         async def _one(idx, msgs):
             try:
@@ -371,7 +371,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
         base_url = model.inference_base_url
         api_key = model.inference_api_key
-        mname = model.inference_model_name or model.name
+        mname = model.get_inference_name()
         logger.info(
             f"[sglang] ready in {run.server_startup_time:.0f}s — "
             f"{mname} @ {base_url} (verl-style, will NOT restart)"
@@ -423,7 +423,8 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 run.errors.append(str(e))
             sm.training_end = time.perf_counter()
 
-            mname = model.inference_model_name or model.name
+            # Re-fetch model name — after training, LoRA adapter name is active
+            mname = model.get_inference_name()
             run.steps.append(sm)
 
         run.end_time = time.perf_counter()
