@@ -5,21 +5,24 @@ Architecture:
   - SGLang server starts ONCE and NEVER restarts
   - Before training: sleep(kv_cache+weights) releases GPU memory
   - Training: Megatron runs as SEPARATE subprocess (produces LoRA adapter)
-  - After training: merge LoRA → save to disk → /update_weights reload
-  - After weight sync: wake_up(kv_cache) reallocates KV cache + flushes radix
+  - After training: wake_up(kv_cache+weights) restores GPU memory
+  - Weight sync: single-pass LoRA merge (B@A deltas → affected shards) + /update_weights
+  - Result: SGLang serves with LoRA-updated weights, CUDA graphs intact
+
+Weight sync pipeline (single-pass, eliminates 500s+ bottleneck):
+  1. Compute deltas B@A from LoRA adapter (tiny CPU matmuls, r=1)
+  2. One pass per affected shard: read base → apply delta → save merged
+  3. Symlink unaffected shards (zero copy for ~50% of model)
+  4. POST /update_weights → SGLang reloads from merged dir (~10-20s)
 
 Key difference from verl: our Megatron subprocess is separate (not shared
 process), so we must release BOTH kv_cache and weights during sleep to give
-Megatron enough GPU memory. verl's colocated design only releases kv_cache
-because training shares the same model weights in GPU memory.
-
-Weight sync: CUDA IPC (verl's sgl_update_weights) requires in-process
-SGLang Python API, not available over HTTP. We use disk-based reload instead.
+Megatron enough GPU memory. verl's colocated design uses CUDA IPC (zero-copy).
 
 Reference:
   - verl/workers/rollout/sglang_rollout/sglang_rollout.py (ServerAdapter)
   - verl/workers/rollout/sglang_rollout/async_sglang_server.py (SGLangHttpServer)
-  - verl/trainer/ppo/ray_trainer.py (fit loop: generate → sleep → train → update_weights → wake)
+  - verl/trainer/ppo/ray_trainer.py (fit loop: generate → sleep → train → wake → update_weights)
 """
 
 from __future__ import annotations
@@ -59,19 +62,19 @@ class SGLangMegatronService:
 
     Key difference from old implementation:
       OLD: stop SGLang → train → restart SGLang (60-90s overhead)
-      NEW: sleep(kv+weights) → train → update_weights(disk) → wake(kv)
+      NEW: sleep → train → wake → update_weights (single-pass merge)
 
     Key difference from verl:
-      verl: training + inference share same process, same GPU memory
+      verl: training + inference share same process, same GPU memory (CUDA IPC)
       ours: Megatron is a SEPARATE subprocess, needs its own GPU memory
       → we must release weights too, not just KV cache
 
     Loop:
       1. generate()      — SGLang active, KV cache + weights on GPU
       2. sleep()         — release KV cache AND weights (for Megatron)
-      3. Megatron train  — uses freed GPU memory
-      4. update_weights()— merge LoRA, save to disk, SGLang reloads
-      5. wake_up()       — reallocate KV cache only (weights already loaded)
+      3. Megatron train  — uses freed GPU memory, saves LoRA adapter
+      4. wake_up()       — restore base weights + KV cache from CPU
+      5. update_weights()— single-pass merge (B@A deltas), SGLang reloads
     """
 
     model_name: str
@@ -89,8 +92,10 @@ class SGLangMegatronService:
     _megatron_process: asyncio.subprocess.Process | None = None
     _optimizer_state_path: str | None = None
     _is_sleeping: bool = False
-    # Base model weights cache — loaded once, kept in memory for LoRA merging
-    _base_weights: dict[str, torch.Tensor] | None = None
+    # Pre-warmed HF model path — resolved once at startup, reused for merging
+    _hf_model_path: str | None = None
+    # Weight index: maps HF weight names → shard filenames
+    _weight_map: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not self.log_dir:
@@ -130,28 +135,57 @@ class SGLangMegatronService:
 
         Mirrors verl's SGLangHttpServer.launch_server() which launches
         subprocesses once and keeps them alive across all RL steps.
+
+        Also pre-warms the HF model cache and weight index so the first
+        update_weights call doesn't pay the snapshot_download cost.
         """
         self._latest_step = 0
+
+        # Pre-warm HF cache in background while SGLang starts
+        import concurrent.futures
+        warmup_future = concurrent.futures.ThreadPoolExecutor(1).submit(
+            self._prewarm_hf_cache
+        )
+
         self._server = self._create_server()
         await self._server.start()
+
+        # Ensure pre-warm completed (should be done by now — SGLang startup is slow)
+        try:
+            warmup_future.result(timeout=120)
+            logger.info(f"HF cache pre-warmed: {self._hf_model_path}")
+        except Exception as e:
+            logger.warning(f"HF cache pre-warm failed (will retry on first merge): {e}")
+
         logger.info(
             f"SGLang ready (verl-style, persistent) — "
             f"serving {self.base_model} on port {self.port}"
         )
-        # Pre-warm HF cache path in background (overlaps with first rollout)
-        import threading
-        def _prewarm():
-            try:
-                from huggingface_hub import snapshot_download
-                path = snapshot_download(
-                    self.base_model,
-                    allow_patterns=["*.safetensors", "*.json"],
-                )
-                logger.info(f"Pre-warmed HF cache: {path}")
-            except Exception as e:
-                logger.warning(f"HF cache pre-warm failed: {e}")
-        threading.Thread(target=_prewarm, daemon=True).start()
         return "0.0.0.0", self.port
+
+    def _prewarm_hf_cache(self) -> None:
+        """Download and index the base model — runs once at startup.
+
+        Resolves the HF model path and loads the weight index so the first
+        update_weights doesn't block on snapshot_download.
+        """
+        from huggingface_hub import snapshot_download
+
+        t0 = time.perf_counter()
+        self._hf_model_path = snapshot_download(
+            self.base_model,
+            allow_patterns=["*.safetensors", "*.json"],
+        )
+        index_path = os.path.join(self._hf_model_path, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                self._weight_map = json.load(f).get("weight_map", {})
+        else:
+            self._weight_map = {}
+        logger.info(
+            f"HF cache pre-warmed in {time.perf_counter() - t0:.1f}s — "
+            f"{len(self._weight_map)} weights indexed"
+        )
 
     async def vllm_engine_is_sleeping(self) -> bool:
         """Compat: check if inference engine is sleeping."""
@@ -192,13 +226,14 @@ class SGLangMegatronService:
         return time.perf_counter() - t0
 
     async def wake_up(self) -> float:
-        """Resume KV cache after training + weight sync — verl's wake_up().
+        """Resume GPU memory after training — verl's wake_up().
 
-        Only reallocates KV cache. Model weights are already loaded by
-        update_weights_from_disk() which was called before wake_up().
+        Restores BOTH KV cache and model weights from CPU backup.
+        After wake, update_weights() will overwrite the base weights
+        with LoRA-merged weights via /update_weights endpoint.
 
         verl equivalent:
-            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
             await tokenizer_manager.resume_memory_occupation(obj, None)
             await tokenizer_manager.flush_cache()
         """
@@ -206,10 +241,10 @@ class SGLangMegatronService:
             return 0.0
 
         t0 = time.perf_counter()
-        # Only resume KV cache — weights already loaded by update_weights
-        elapsed = await self._server.wake_up(tags=["kv_cache"])
+        # Resume both KV cache and weights — we'll overwrite weights via /update_weights
+        elapsed = await self._server.wake_up(tags=["kv_cache", "weights"])
         self._is_sleeping = False
-        logger.info(f"SGLang awake (kv_cache resumed) in {elapsed:.2f}s")
+        logger.info(f"SGLang awake (kv_cache + weights resumed) in {elapsed:.2f}s")
         return time.perf_counter() - t0
 
     # ------------------------------------------------------------------
@@ -218,167 +253,32 @@ class SGLangMegatronService:
     # ------------------------------------------------------------------
 
     async def update_weights(self, lora_path: str) -> float:
-        """Merge LoRA into base weights, save to disk, tell SGLang to reload.
+        """Single-pass LoRA merge + disk reload for SGLang weight sync.
 
-        SGLang's /update_weights_from_tensor requires in-process Python API
-        (sgl_update_weights) passing actual tensor objects — it does NOT accept
-        serialized CUDA IPC handles over HTTP. Since we run SGLang as a
-        subprocess (HTTP server), we must use the disk-based path:
+        Architecture (eliminates triple I/O bottleneck):
+          1. Compute deltas B@A directly from LoRA adapter (tiny CPU matmuls, r=1)
+          2. Single pass per affected shard: read base → apply delta → save merged
+          3. Symlink unaffected shards (zero copy)
+          4. POST /update_weights → SGLang reloads from merged dir
 
-          1. Load LoRA adapter from checkpoint
-          2. Merge LoRA deltas into base weights (only affected layers)
-          3. Save merged weights to a temp directory
-          4. POST /update_weights with the merged model path
-          5. Flush cache
-
-        This still avoids full server restart — SGLang reloads only the weight
-        tensors while keeping CUDA graphs, NCCL, tokenizer alive.
+        Old architecture loaded base weights separately (25GB), merged on CPU,
+        then loaded the SAME shards again to build the merged dir. That's 75GB
+        of I/O for what should be ~25GB.
         """
         t0 = time.perf_counter()
 
-        # Step 1: Load LoRA adapter
-        lora_tensors = self._load_lora_adapter(lora_path)
-        if not lora_tensors:
+        # Step 1: Load LoRA adapter + compute deltas
+        adapter_file = os.path.join(lora_path, "adapter_model.safetensors")
+        if not os.path.exists(adapter_file):
             logger.warning("No LoRA adapter found, skipping weight sync")
             return 0.0
 
-        # Step 2: Merge LoRA into base weights for affected layers
-        merged_params = self._merge_lora_into_base(lora_tensors, lora_path)
-        if not merged_params:
-            logger.warning("No params to update after LoRA merge")
-            return 0.0
-
-        # Step 3: Save merged weights to disk for SGLang to reload
-        merged_model_path = await self._save_merged_weights(merged_params)
-
-        # Step 4: Tell SGLang to reload weights from the merged path
-        if self._server and merged_model_path:
-            elapsed = await self._server.update_weights_from_disk(
-                model_path=merged_model_path,
-                load_format="auto",
-            )
-            logger.info(
-                f"Weight sync: {len(merged_params)} params via disk reload "
-                f"in {elapsed:.2f}s"
-            )
-
-        # Step 5: Flush cache after weight update (verl does this)
-        if self._server:
-            await self._server.flush_cache()
-
-        total = time.perf_counter() - t0
-        logger.info(f"Total weight sync: {total:.2f}s")
-        return total
-
-    async def _save_merged_weights(
-        self, merged_params: list[tuple[str, torch.Tensor]]
-    ) -> str:
-        """Save merged weights to a directory in safetensors format.
-
-        Copies the full base model structure (config, tokenizer, etc.) and
-        overwrites only the LoRA-modified weight shards. SGLang's /update_weights
-        expects a complete model directory.
-
-        Uses symlinks for unaffected shards to avoid copying ~16GB. Cleans the merged directory on each call
-        to prevent stale data from previous steps.
-        """
-        from safetensors.torch import save_file
-        from huggingface_hub import snapshot_download
-
-        merged_dir = os.path.join(self.output_dir, "merged_weights")
-
-        # Clean previous merged weights to prevent stale data
-        if os.path.exists(merged_dir):
-            shutil.rmtree(merged_dir)
-        os.makedirs(merged_dir, exist_ok=True)
-
-        # Get base model path (uses HF cache, no re-download if cached)
-        base_path = snapshot_download(
-            self.base_model,
-            allow_patterns=["*.safetensors", "*.json"],
-        )
-
-        # Copy config/tokenizer files so SGLang can load the directory
-        for fname in os.listdir(base_path):
-            if fname.endswith(".json") or fname.endswith(".py") or fname == "tokenizer.model":
-                src = os.path.join(base_path, fname)
-                dst = os.path.join(merged_dir, fname)
-                shutil.copy2(src, dst)
-
-        # Load the weight index to know which shard each weight lives in
-        index_path = os.path.join(base_path, "model.safetensors.index.json")
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                index = json.load(f)
-            weight_map = index.get("weight_map", {})
-        else:
-            weight_map = {}
-
-        # Build a dict of merged param names → tensors
-        merged_dict = {name: tensor for name, tensor in merged_params}
-
-        # Figure out which shard files are affected
-        affected_shards: dict[str, set[str]] = {}
-        for name in merged_dict:
-            shard_file = weight_map.get(name)
-            if shard_file:
-                affected_shards.setdefault(shard_file, set()).add(name)
-
-        # For each affected shard: load original, overwrite changed tensors, save
-        from safetensors import safe_open
-
-        for shard_file, changed_keys in affected_shards.items():
-            src_path = os.path.join(base_path, shard_file)
-            dst_path = os.path.join(merged_dir, shard_file)
-            shard_tensors: dict[str, torch.Tensor] = {}
-            with safe_open(src_path, framework="pt", device="cpu") as sf:
-                for k in sf.keys():
-                    if k in merged_dict:
-                        shard_tensors[k] = merged_dict[k].cpu()
-                    else:
-                        shard_tensors[k] = sf.get_tensor(k)
-            save_file(shard_tensors, dst_path)
-            logger.info(f"Saved merged shard {shard_file} ({len(changed_keys)} updated keys)")
-
-        # Symlink unaffected shard files (same filesystem, avoids 16GB copy)
-        for fname in os.listdir(base_path):
-            if fname.endswith(".safetensors") and fname not in affected_shards:
-                src = os.path.realpath(os.path.join(base_path, fname))
-                dst = os.path.join(merged_dir, fname)
-                os.symlink(src, dst)
-
-        # Copy index file
-        if os.path.exists(index_path):
-            shutil.copy2(index_path, os.path.join(merged_dir, "model.safetensors.index.json"))
-
-        logger.info(f"Merged model saved to {merged_dir}")
-        return merged_dir
-
-    def _load_lora_adapter(self, lora_path: str) -> dict[str, torch.Tensor]:
-        """Load LoRA adapter tensors from checkpoint."""
-        adapter_file = os.path.join(lora_path, "adapter_model.safetensors")
-        if not os.path.exists(adapter_file):
-            return {}
-
         from safetensors.torch import load_file
-        return load_file(adapter_file)
+        lora_tensors = load_file(adapter_file)
 
-    def _merge_lora_into_base(
-        self,
-        lora_tensors: dict[str, torch.Tensor],
-        lora_path: str,
-    ) -> list[tuple[str, torch.Tensor]]:
-        """Merge LoRA A/B into base model weights for affected layers.
-
-        For each LoRA pair (lora_A, lora_B), computes:
-            W_merged = W_base + (alpha/r) * B @ A
-
-        Only returns the layers that were modified by LoRA.
-        """
-        # Load adapter config
+        # Read LoRA config for scaling
         config_path = os.path.join(lora_path, "adapter_config.json")
-        alpha = 32  # default
-        r = 1       # default
+        alpha, r = 32, 1  # defaults matching src/art/megatron/service.py
         if os.path.exists(config_path):
             with open(config_path) as f:
                 cfg = json.load(f)
@@ -386,134 +286,145 @@ class SGLangMegatronService:
                 r = cfg.get("r", r)
         scaling = alpha / r
 
-        # Group LoRA tensors by layer
-        # Keys look like: "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
-        merged: list[tuple[str, torch.Tensor]] = []
+        # Group LoRA tensors → compute delta per base weight
+        # Keys: "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        # Strip prefix + suffix → HF name: "model.layers.0.self_attn.q_proj.weight"
         lora_pairs: dict[str, dict[str, torch.Tensor]] = {}
-
         for key, tensor in lora_tensors.items():
             if "lora_A" in key:
-                base_key = key.replace(".lora_A.weight", ".weight")
-                # Strip PEFT prefix
-                base_key = base_key.replace("base_model.model.", "", 1)
+                base_key = key.replace(".lora_A.weight", ".weight").replace(
+                    "base_model.model.", "", 1
+                )
                 lora_pairs.setdefault(base_key, {})["A"] = tensor
             elif "lora_B" in key:
-                base_key = key.replace(".lora_B.weight", ".weight")
-                base_key = base_key.replace("base_model.model.", "", 1)
+                base_key = key.replace(".lora_B.weight", ".weight").replace(
+                    "base_model.model.", "", 1
+                )
                 lora_pairs.setdefault(base_key, {})["B"] = tensor
 
-        # BUG 6 fix: Build the set of needed base keys BEFORE loading weights,
-        # so _load_base_weights only loads the shards containing these keys.
-        needed_base_keys = {k for k, p in lora_pairs.items() if "A" in p and "B" in p}
-
-        # Ensure base weights are loaded (cached, only LoRA-targeted shards)
-        if self._base_weights is None:
-            self._base_weights = self._load_base_weights(needed_keys=needed_base_keys)
-
-        if not self._base_weights:
-            logger.warning("Could not load base model weights for merging")
-            return []
-
+        deltas: dict[str, torch.Tensor] = {}
         for base_key, pair in lora_pairs.items():
-            if "A" not in pair or "B" not in pair:
-                continue
+            if "A" in pair and "B" in pair:
+                # delta = scaling * B @ A (outer product when r=1, instant)
+                deltas[base_key] = scaling * (pair["B"] @ pair["A"])
 
-            if base_key in self._base_weights:
-                W_base = self._base_weights[base_key]
-                A = pair["A"].to(W_base.device, dtype=W_base.dtype)
-                B = pair["B"].to(W_base.device, dtype=W_base.dtype)
-                delta = B @ A
-                # Handle TP shard mismatch: if LoRA shards weren't fully
-                # concatenated (e.g. dim0 is half), tile to match base shape
-                if delta.shape != W_base.shape:
-                    if delta.shape[1] == W_base.shape[1] and W_base.shape[0] % delta.shape[0] == 0:
-                        tp = W_base.shape[0] // delta.shape[0]
-                        delta = delta.repeat(tp, 1)
-                        logger.debug(f"Tiled {base_key} dim0 x{tp} to match base shape")
-                    elif delta.shape[0] == W_base.shape[0] and W_base.shape[1] % delta.shape[1] == 0:
-                        tp = W_base.shape[1] // delta.shape[1]
-                        delta = delta.repeat(1, tp)
-                        logger.debug(f"Tiled {base_key} dim1 x{tp} to match base shape")
-                    else:
-                        logger.debug(f"Shape mismatch for {base_key}: base={W_base.shape}, delta={delta.shape}, skipping")
-                        continue
-                W_merged = W_base + scaling * delta
-                merged.append((base_key, W_merged))
-            else:
-                logger.debug(f"Base weight not found for {base_key}, skipping")
+        t_delta = time.perf_counter() - t0
+        logger.info(
+            f"Computed {len(deltas)} LoRA deltas (scaling={scaling}) in {t_delta:.2f}s"
+        )
 
-        logger.info(f"Merged {len(merged)} LoRA layers (scaling={scaling})")
-        return merged
+        # Step 2: Build merged model dir — single pass through affected shards
+        merged_dir = self._build_merged_model_dir(deltas)
 
-    def _load_base_weights(
-        self, needed_keys: set[str] | None = None
-    ) -> dict[str, torch.Tensor]:
-        """Load base model weights from HuggingFace cache.
+        t_build = time.perf_counter() - t0 - t_delta
+        logger.info(f"Built merged model dir in {t_build:.2f}s")
 
-        Only loads the shard files that contain weights targeted by LoRA,
-        avoiding loading the full 30GB model into CPU RAM.
+        # Step 3: Tell SGLang to reload weights from merged path
+        if self._server and merged_dir:
+            t_reload = time.perf_counter()
+            elapsed = await self._server.update_weights_from_disk(
+                model_path=merged_dir,
+                load_format="auto",
+            )
+            logger.info(
+                f"SGLang reloaded {len(deltas)} merged weights in {elapsed:.2f}s"
+            )
+            await self._server.flush_cache()
+
+        total = time.perf_counter() - t0
+        logger.info(f"Total weight sync: {total:.2f}s (was 500s+ with old pipeline)")
+        return total
+
+    def _build_merged_model_dir(self, deltas: dict[str, torch.Tensor]) -> str:
+        """Build a model directory with LoRA-merged weights for SGLang reload.
+
+        Single-pass I/O: each affected shard is read once, deltas applied
+        in-memory, written once. Unaffected shards are symlinked (zero copy).
 
         Args:
-            needed_keys: Set of base weight names that LoRA targets.
-                         If None, loads ALL weights (slow, avoid).
+            deltas: {hf_weight_name: delta_tensor} — pre-computed B@A*scaling
+        Returns:
+            Path to the merged model directory
         """
-        try:
-            from huggingface_hub import snapshot_download
-            from safetensors import safe_open
+        from safetensors import safe_open
+        from safetensors.torch import save_file
 
-            # Get cached model path
-            model_path = snapshot_download(
-                self.base_model,
-                allow_patterns=["*.safetensors", "*.json"],
+        merged_dir = os.path.join(self.output_dir, "merged_weights")
+        if os.path.exists(merged_dir):
+            shutil.rmtree(merged_dir)
+        os.makedirs(merged_dir)
+
+        # Ensure HF cache is resolved
+        if self._hf_model_path is None or self._weight_map is None:
+            self._prewarm_hf_cache()
+        base_path = self._hf_model_path
+        weight_map = self._weight_map
+        assert base_path is not None and weight_map is not None
+
+        # Map delta keys → affected shard files
+        affected_shards: dict[str, set[str]] = {}
+        for key in deltas:
+            shard = weight_map.get(key)
+            if shard:
+                affected_shards.setdefault(shard, set()).add(key)
+            else:
+                logger.debug(f"Delta key {key} not in weight index, skipping")
+
+        logger.info(
+            f"LoRA affects {len(affected_shards)} shard files "
+            f"({sum(len(v) for v in affected_shards.values())} weights)"
+        )
+
+        # Copy config/tokenizer files (small, instant)
+        for fname in os.listdir(base_path):
+            if fname.endswith((".json", ".py")) or fname == "tokenizer.model":
+                shutil.copy2(
+                    os.path.join(base_path, fname),
+                    os.path.join(merged_dir, fname),
+                )
+
+        # Single-pass per affected shard: read → apply deltas → write
+        for shard_file, changed_keys in affected_shards.items():
+            src_path = os.path.join(base_path, shard_file)
+            dst_path = os.path.join(merged_dir, shard_file)
+            shard_tensors: dict[str, torch.Tensor] = {}
+
+            with safe_open(src_path, framework="pt", device="cpu") as sf:
+                for k in sf.keys():
+                    t = sf.get_tensor(k)
+                    if k in deltas:
+                        delta = deltas[k].to(dtype=t.dtype)
+                        if delta.shape == t.shape:
+                            t = t + delta
+                        else:
+                            logger.warning(
+                                f"Shape mismatch {k}: base={t.shape} delta={delta.shape}, "
+                                f"skipping merge"
+                            )
+                    shard_tensors[k] = t
+
+            save_file(shard_tensors, dst_path)
+            logger.debug(
+                f"Merged shard {shard_file}: {len(changed_keys)} deltas applied"
             )
 
-            # Load weight index
-            index_path = os.path.join(model_path, "model.safetensors.index.json")
-            if os.path.exists(index_path):
-                with open(index_path) as f:
-                    index = json.load(f)
-                weight_map = index.get("weight_map", {})
-            else:
-                # Single shard model
-                weight_map = {}
-                for fn in os.listdir(model_path):
-                    if fn.endswith(".safetensors"):
-                        with safe_open(os.path.join(model_path, fn), framework="pt") as sf:
-                            for k in sf.keys():
-                                weight_map[k] = fn
+        # Symlink unaffected shards — zero copy, same filesystem
+        for fname in os.listdir(base_path):
+            if fname.endswith(".safetensors") and fname not in affected_shards:
+                src = os.path.join(base_path, fname)
+                dst = os.path.join(merged_dir, fname)
+                try:
+                    os.symlink(src, dst)
+                except OSError:
+                    # Cross-filesystem fallback (e.g., HF cache on different mount)
+                    shutil.copy2(src, dst)
 
-            # Determine which shard files we actually need
-            if needed_keys is not None:
-                needed_shards: set[str] = set()
-                for key in needed_keys:
-                    shard = weight_map.get(key)
-                    if shard:
-                        needed_shards.add(shard)
-                logger.info(
-                    f"LoRA targets {len(needed_keys)} base weights across "
-                    f"{len(needed_shards)} shard files (skipping the rest)"
-                )
-            else:
-                needed_shards = set(weight_map.values())
-
-            # Load only the needed shards, and only the needed keys from each
-            weights: dict[str, torch.Tensor] = {}
-            for shard_file in needed_shards:
-                full_path = os.path.join(model_path, shard_file)
-                with safe_open(full_path, framework="pt", device="cpu") as sf:
-                    for k in sf.keys():
-                        if needed_keys is None or k in needed_keys:
-                            weights[k] = sf.get_tensor(k)
-
-            logger.info(f"Loaded {len(weights)} base model weights for LoRA merging")
-            return weights
-
-        except Exception as e:
-            logger.warning(f"Failed to load base weights: {e}")
-            return {}
-
-    # _weight_sync_disk_fallback removed — update_weights() now always uses
-    # the disk-based path since CUDA IPC requires in-process SGLang API.
+        logger.info(
+            f"Merged model dir ready: {merged_dir} "
+            f"({len(affected_shards)} merged + "
+            f"{sum(1 for f in os.listdir(base_path) if f.endswith('.safetensors') and f not in affected_shards)} symlinked)"
+        )
+        return merged_dir
 
     # ------------------------------------------------------------------
     # Checkpoint management
@@ -575,19 +486,18 @@ class SGLangMegatronService:
         experimental_config: dict,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """verl-style training step: sleep → train → update_weights → wake.
+        """verl-style training step: sleep → train → wake → update_weights.
 
         OLD architecture:
           stop SGLang (5-10s) → train → restart SGLang (60-90s)
           Total overhead: 65-100s
 
         NEW architecture (verl-style):
-          sleep(kv_cache+weights) → train → update_weights(disk) → wake(kv_cache)
-          Total overhead: ~10-20s (mostly disk I/O for weight reload)
+          sleep(kv+weights) → train → wake(kv+weights) → update_weights(single-pass)
+          Total overhead: ~20-35s (wake ~5-10s + merge+reload ~15-25s)
 
-        Key: sleep releases BOTH kv_cache and weights because Megatron runs
-        as a separate subprocess and needs GPU memory. update_weights reloads
-        the merged weights BEFORE wake_up re-allocates KV cache.
+        Key: wake restores original base weights first, then update_weights
+        overwrites them with LoRA-merged weights via single-pass disk merge.
         """
 
         # Phase 1: Sleep — release KV cache + model weights from GPU
@@ -657,27 +567,22 @@ class SGLangMegatronService:
                 shutil.copy(src, os.path.join(new_ckpt, cfg_name))
         self._latest_step = next_step
 
-        # Phase 4: Weight sync
-        # vLLM uses native LoRA adapter loading (add_lora_aliases) after wake.
-        # SGLang HTTP server doesn't support live LoRA adapter loading, and
-        # merging LoRA into base weights requires loading 30B to CPU (~500s).
-        # verl solves this with CUDA IPC (same process), but ART runs Megatron
-        # as a separate subprocess.
-        #
-        # For now: wake with original weights from CPU offload (same as vLLM's
-        # do_wake_up before add_lora_aliases). The LoRA adapter is saved to
-        # disk for checkpoint continuity.
-        #
-        # TODO: Use SGLang's /update_weights_from_tensor with CUDA IPC handles
-        # for true zero-copy weight sync (requires in-process SGLang API).
-
-        # Phase 5: Wake up — reload both weights and KV cache from CPU offload
+        # Phase 4: Wake up — restore base weights + KV cache to GPU
+        # Must happen BEFORE update_weights because SGLang needs GPU memory
+        # mapped before it can load new weights into it.
         t_wake = time.perf_counter()
-        if self._server:
-            await self._server.wake_up(tags=["kv_cache", "weights"])
-        self._is_sleeping = False
-        wake_time = time.perf_counter() - t_wake
-        logger.info(f"Phase 4+5 — wake_up(kv_cache + weights): {wake_time:.2f}s")
+        wake_time = await self.wake_up()
+        logger.info(f"Phase 4 — wake_up(kv_cache+weights): {wake_time:.2f}s")
+
+        # Phase 5: Weight sync — merge LoRA into base, reload in SGLang
+        # Builds merged model dir (single-pass I/O) then POSTs /update_weights.
+        # SGLang replaces its in-GPU weights with the LoRA-merged version.
+        t_ws = time.perf_counter()
+        weight_sync_time = await self.update_weights(new_ckpt)
+        logger.info(
+            f"Phase 5 — update_weights (single-pass merge + reload): "
+            f"{weight_sync_time:.2f}s"
+        )
 
         total_overhead = time.perf_counter() - t0
         logger.info(
