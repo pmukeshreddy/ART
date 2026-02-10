@@ -93,6 +93,7 @@ class SGLangMegatronService:
     _megatron_process: asyncio.subprocess.Process | None = None
     _optimizer_state_path: str | None = None
     _is_sleeping: bool = False
+    _active_lora_name: str | None = None
 
     def __post_init__(self) -> None:
         if not self.log_dir:
@@ -259,6 +260,7 @@ class SGLangMegatronService:
             )
             return 0.0
 
+        self._active_lora_name = lora_name
         logger.info(
             f"LoRA hot-reload: '{lora_name}' loaded in {elapsed:.2f}s "
             f"(was 464s with disk merge)"
