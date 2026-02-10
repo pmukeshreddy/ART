@@ -58,6 +58,14 @@ class SGLangServerConfig:
 
     # LoRA — format must be "name=path"
     lora_paths: list[str] = field(default_factory=list)
+    # Dynamic LoRA: required for /load_lora_adapter at runtime
+    enable_lora: bool = False
+    max_lora_rank: int = 8  # must >= max rank of any adapter loaded dynamically
+    # Space-separated modules — SGLang uses nargs='+'. Use ["all"] for every module.
+    lora_target_modules: list[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ])
 
     # Performance
     chunked_prefill_size: int = 32768
@@ -100,6 +108,8 @@ class SGLangServer:
         self._shutdown_time: float = 0.0
         self._log_fh: Any = None
         self._is_sleeping: bool = False
+        # LoRA hot-reload state — mirrors ART's _hot_reload_lora pattern
+        self._active_lora_name: str | None = None
 
     @property
     def is_running(self) -> bool:
@@ -152,6 +162,12 @@ class SGLangServer:
         # verl-style: enable memory saver for sleep/wake support
         if c.enable_memory_saver:
             cmd.append("--enable-memory-saver")
+        # LoRA: enable dynamic adapter loading at runtime
+        if c.enable_lora:
+            cmd.append("--enable-lora")
+            cmd.extend(["--max-lora-rank", str(c.max_lora_rank)])
+            cmd.append("--lora-target-modules")
+            cmd.extend(c.lora_target_modules)  # nargs='+': each module is a separate arg
         # LoRA paths: each must be "name=path"
         for lp in c.lora_paths:
             cmd.extend(["--lora-paths", lp])
@@ -290,6 +306,9 @@ class SGLangServer:
                         logger.warning(f"release_memory_occupation failed: {r.status} {body[:200]}")
                     else:
                         self._is_sleeping = True
+                        # LoRA adapter won't survive sleep/wake — base weights
+                        # get restored on wake, adapter must be re-loaded
+                        self._active_lora_name = None
                         elapsed = time.perf_counter() - t0
                         logger.info(f"SGLang sleep (release memory) in {elapsed:.2f}s — tags={tags}")
                         return elapsed
@@ -368,8 +387,64 @@ class SGLangServer:
 
         return time.perf_counter() - t0
 
-    # ------------------------------------------------------------------
-    # verl-style native generation (non-streaming, returns token IDs)
+    async def load_lora_adapter(
+        self,
+        lora_path: str,
+        lora_name: str,
+        flush_cache: bool = True,
+    ) -> float:
+        """Hot-reload LoRA adapter — ART's recommended weight_sync_method.
+
+        Mirrors: src/art/sglang_backend/service.py :: _hot_reload_lora()
+
+        SGLang loads the tiny adapter (~2MB for rank-1) and applies it
+        on-the-fly during inference. Base weights stay UNTOUCHED.
+        Generate requests must use lora_name as the 'model' parameter.
+
+        vs update_weights_from_disk (464s):
+          - No 60GB merged model dir build
+          - No 60GB SGLang reload
+          - Just ~2MB adapter load → <2s
+        """
+        t0 = time.perf_counter()
+        try:
+            async with aiohttp.ClientSession() as s:
+                payload: dict[str, Any] = {
+                    "lora_path": lora_path,
+                    "lora_name": lora_name,
+                }
+                # Primary endpoint (SGLang v0.4+)
+                async with s.post(
+                    f"{self.base_url}/load_lora_adapter",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        logger.warning(
+                            f"load_lora_adapter failed: {r.status} {body[:200]}"
+                        )
+                        return -1.0
+
+                    elapsed = time.perf_counter() - t0
+                    self._active_lora_name = lora_name
+                    logger.info(
+                        f"LoRA adapter '{lora_name}' loaded in {elapsed:.2f}s"
+                    )
+
+                    if flush_cache:
+                        await self.flush_cache()
+
+                    return elapsed
+
+        except Exception as e:
+            logger.warning(f"load_lora_adapter failed: {e}")
+            return -1.0
+
+    @property
+    def active_model_name(self) -> str:
+        """Model name for generate requests — lora_name if loaded, else base."""
+        return self._active_lora_name or self.config.served_model_name
     # Mirrors: verl/workers/rollout/sglang_rollout/async_sglang_server.py
     # ------------------------------------------------------------------
 
@@ -392,21 +467,23 @@ class SGLangServer:
 
         # Build request matching SGLang's /v1/chat/completions (non-streaming)
         if isinstance(prompt, list):
-            # Chat format
+            # Chat format — OpenAI API uses model=lora_name
             body: dict[str, Any] = {
-                "model": self.config.served_model_name,
+                "model": self.active_model_name,
                 "messages": prompt,
                 "stream": False,  # NON-streaming — get actual token counts
                 **sampling_params,
             }
             endpoint = f"{self.openai_base_url}/chat/completions"
         else:
-            # Raw text
-            body = {
+            # Raw text — SGLang native API uses lora_path field
+            body: dict[str, Any] = {
                 "model": self.config.served_model_name,
                 "text": prompt,
                 "sampling_params": sampling_params,
             }
+            if self._active_lora_name:
+                body["lora_path"] = self._active_lora_name
             endpoint = f"{self.base_url}/generate"
 
         try:
