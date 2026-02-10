@@ -390,6 +390,7 @@ class LocalBackend(Backend):
         # Experimental parameters
         kimi_k2_tau: float | None = None,
         precalculate_logprobs: bool = False,
+        on_policy_correction: bool = False,
         # LocalBackend-specific parameters
         allow_training_without_logprobs: bool = False,
         plot_tensors: bool = False,
@@ -468,6 +469,7 @@ class LocalBackend(Backend):
             "plot_tensors": plot_tensors,
             "ppo": ppo,
             "precalculate_logprobs": precalculate_logprobs,
+            "on_policy_correction": on_policy_correction,
             "scale_learning_rate_by_reward_std_dev": scale_learning_rate_by_reward_std_dev,
             "scale_rewards": scale_rewards,
             "logprob_calculation_chunk_size": logprob_calculation_chunk_size,

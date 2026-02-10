@@ -1,0 +1,101 @@
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+04:04:43 [INFO] benchmark: [sglang] Worker PID=77499 GPUs=4
+04:04:51 [INFO] benchmarks.sglang_vs_vllm.sglang_server: Starting SGLang (verl-style, will NOT restart): /home/ubuntu/.venvs/sglang-bench/bin/python -m sglang.launch_server --model-path Qwen/Qwen3-30B-A3B-Instruct-2507 --served-model-name Qwen/Qwen3-30B-A3B-Instruct-2507 --port 8200 --host 0.0.0.0 --tp 2 --mem-fraction-static 0.7 --max-running-requests 256 --dtype auto --chunked-prefill-size 32768 --trust-remote-code --enable-p2p-check --enable-memory-saver --enable-lora --max-lora-rank 8 --lora-target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
+04:05:44 [INFO] benchmarks.sglang_vs_vllm.sglang_server: SGLang ready in 52.83s (pid=77640) — will stay alive for all steps
+04:05:44 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: SGLang ready (verl-style, persistent) — serving Qwen/Qwen3-30B-A3B-Instruct-2507 on port 8200
+04:05:44 [INFO] benchmark: [sglang] ready in 53s — Qwen/Qwen3-30B-A3B-Instruct-2507 @ http://0.0.0.0:8200/v1 (verl-style, will NOT restart)
+04:05:44 [INFO] benchmark: [sglang] step 1/3 (verl-style)
+04:06:00 [INFO] benchmark:   rollout 15.6s  594 tok/s  TTFT=0.3078s  err=0
+train:   0%|          | 0/3 [00:00<?, ?it/s]04:06:09 [INFO] benchmarks.sglang_vs_vllm.sglang_server: SGLang sleep (release memory) in 0.19s — tags=['kv_cache', 'weights']
+04:06:09 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: SGLang sleeping (kv_cache + weights released) in 0.19s
+04:06:09 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 1 — sleep(kv_cache+weights): 0.19s
+04:06:09 [INFO] megatron.core.msc_utils: The multistorageclient package is available.
+04:06:10 [INFO] megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp: Detected Megatron Core, using Megatron-FSDP with Megatron.
+04:06:10 [INFO] megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer: Detected Megatron Core, using Megatron-FSDP with Megatron.
+04:06:10 [WARNING] megatron.core.utils: fused_indices_to_multihot has reached end of life. Please migrate to a non-experimental function.
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+W0210 04:06:14.660000 78471 torch/distributed/run.py:803] 
+W0210 04:06:14.660000 78471 torch/distributed/run.py:803] *****************************************
+W0210 04:06:14.660000 78471 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0210 04:06:14.660000 78471 torch/distributed/run.py:803] *****************************************
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+fused_indices_to_multihot has reached end of life. Please migrate to a non-experimental function.
+fused_indices_to_multihot has reached end of life. Please migrate to a non-experimental function.
+fused_indices_to_multihot has reached end of life. Please migrate to a non-experimental function.
+fused_indices_to_multihot has reached end of life. Please migrate to a non-experimental function.
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/megatron/core/models/gpt/gpt_layer_specs.py:103: UserWarning: The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated and will be removed soon. Please update your code accordingly.
+  warnings.warn(
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/megatron/core/models/gpt/gpt_layer_specs.py:103: UserWarning: The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated and will be removed soon. Please update your code accordingly.
+  warnings.warn(
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/megatron/core/models/gpt/gpt_layer_specs.py:103: UserWarning: The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated and will be removed soon. Please update your code accordingly.
+  warnings.warn(
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/megatron/core/models/gpt/gpt_layer_specs.py:103: UserWarning: The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated and will be removed soon. Please update your code accordingly.
+  warnings.warn(
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 113721.16it/s]
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 117661.99it/s]
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 43878.87it/s]
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 91414.32it/s]
+/home/ubuntu/ART/.venv/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+train:  33%|███▎      | 1/3 [01:24<02:49, 84.90s/it]train:  33%|███▎      | 1/3 [01:24<02:49, 84.90s/it, loss=0.0596, grad_norm=1.8, probs_corr=0.177]train:  67%|██████▋   | 2/3 [01:37<00:42, 42.62s/it, loss=0.0596, grad_norm=1.8, probs_corr=0.177]train:  67%|██████▋   | 2/3 [01:37<00:42, 42.62s/it, loss=-0.0137, grad_norm=0.909, probs_corr=0.086]/home/ubuntu/ART/.venv/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+04:07:58 [INFO] benchmarks.sglang_vs_vllm.sglang_server: SGLang wake_up (resume memory) in 0.11s — tags=['kv_cache', 'weights']
+04:07:58 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: SGLang awake (kv_cache + weights resumed) in 0.11s
+04:07:58 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 4 — wake_up(kv_cache+weights): 0.11s
+04:08:00 [INFO] benchmarks.sglang_vs_vllm.sglang_server: LoRA adapter 'bench-sglang@step1' loaded in 1.52s
+04:08:00 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: LoRA hot-reload: 'bench-sglang@step1' loaded in 1.52s (was 464s with disk merge)
+04:08:00 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 5 — _hot_reload_lora: 1.52s
+04:08:00 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Total transition overhead: 110.79s (was 464s+ with disk merge)
+train:  67%|██████▋   | 2/3 [01:50<00:55, 55.40s/it, loss=-0.0137, grad_norm=0.909, probs_corr=0.086]
+04:08:00 [INFO] benchmark:   train step=1 loss=0.022938981652259827
+04:08:00 [INFO] benchmark: [sglang] step 2/3 (verl-style)
+04:08:10 [INFO] benchmark:   rollout 10.8s  1510 tok/s  TTFT=0.1942s  err=0
+train:   0%|          | 0/3 [00:00<?, ?it/s]04:08:16 [INFO] benchmarks.sglang_vs_vllm.sglang_server: SGLang sleep (release memory) in 0.18s — tags=['kv_cache', 'weights']
+04:08:16 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: SGLang sleeping (kv_cache + weights released) in 0.18s
+04:08:16 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 1 — sleep(kv_cache+weights): 0.18s
+train:  33%|███▎      | 1/3 [00:17<00:34, 17.42s/it]train:  33%|███▎      | 1/3 [00:17<00:34, 17.42s/it, loss=-0.491, grad_norm=12.2, probs_corr=nan]train:  67%|██████▋   | 2/3 [00:30<00:14, 14.96s/it, loss=-0.491, grad_norm=12.2, probs_corr=nan]train:  67%|██████▋   | 2/3 [00:30<00:14, 14.96s/it, loss=0.664, grad_norm=17.7, probs_corr=nan] 04:09:00 [INFO] benchmarks.sglang_vs_vllm.sglang_server: SGLang wake_up (resume memory) in 0.12s — tags=['kv_cache', 'weights']
+04:09:00 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: SGLang awake (kv_cache + weights resumed) in 0.12s
+04:09:00 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 4 — wake_up(kv_cache+weights): 0.12s
+04:09:02 [INFO] benchmarks.sglang_vs_vllm.sglang_server: LoRA adapter 'bench-sglang@step2' loaded in 2.48s
+04:09:02 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: LoRA hot-reload: 'bench-sglang@step2' loaded in 2.48s (was 464s with disk merge)
+04:09:02 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 5 — _hot_reload_lora: 2.48s
+04:09:02 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Total transition overhead: 46.11s (was 464s+ with disk merge)
+train:  67%|██████▋   | 2/3 [00:46<00:23, 23.06s/it, loss=0.664, grad_norm=17.7, probs_corr=nan]
+04:09:02 [INFO] benchmark:   train step=2 loss=0.08670008182525635
+04:09:02 [INFO] benchmark: [sglang] step 3/3 (verl-style)
+04:09:13 [INFO] benchmark:   rollout 10.8s  1512 tok/s  TTFT=0.1854s  err=0
+train:   0%|          | 0/3 [00:00<?, ?it/s]04:09:18 [INFO] benchmarks.sglang_vs_vllm.sglang_server: SGLang sleep (release memory) in 0.16s — tags=['kv_cache', 'weights']
+04:09:18 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: SGLang sleeping (kv_cache + weights released) in 0.16s
+04:09:18 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 1 — sleep(kv_cache+weights): 0.16s
+train:  33%|███▎      | 1/3 [00:17<00:35, 17.60s/it]train:  33%|███▎      | 1/3 [00:17<00:35, 17.60s/it, loss=-0.202, grad_norm=11, probs_corr=nan]train:  67%|██████▋   | 2/3 [00:30<00:15, 15.03s/it, loss=-0.202, grad_norm=11, probs_corr=nan]train:  67%|██████▋   | 2/3 [00:30<00:15, 15.03s/it, loss=-0.235, grad_norm=14.6, probs_corr=nan]04:10:02 [INFO] benchmarks.sglang_vs_vllm.sglang_server: SGLang wake_up (resume memory) in 0.12s — tags=['kv_cache', 'weights']
+04:10:02 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: SGLang awake (kv_cache + weights resumed) in 0.12s
+04:10:02 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 4 — wake_up(kv_cache+weights): 0.12s
+04:10:04 [INFO] benchmarks.sglang_vs_vllm.sglang_server: LoRA adapter 'bench-sglang@step3' loaded in 1.60s
+04:10:04 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: LoRA hot-reload: 'bench-sglang@step3' loaded in 1.60s (was 464s with disk merge)
+04:10:04 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Phase 5 — _hot_reload_lora: 1.60s
+04:10:04 [INFO] benchmarks.sglang_vs_vllm.sglang_megatron_service: Total transition overhead: 45.26s (was 464s+ with disk merge)
+train:  67%|██████▋   | 2/3 [00:45<00:22, 22.63s/it, loss=-0.235, grad_norm=14.6, probs_corr=nan]
+04:10:04 [INFO] benchmark:   train step=3 loss=-0.21820876002311707
+04:10:04 [INFO] benchmark: [sglang] Results → benchmark_results/sglang_metrics.json
+[W210 04:10:06.821380424 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
+/home/ubuntu/.local/share/uv/python/cpython-3.11.14-linux-x86_64-gnu/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+/home/ubuntu/.local/share/uv/python/cpython-3.11.14-linux-x86_64-gnu/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+/home/ubuntu/.local/share/uv/python/cpython-3.11.14-linux-x86_64-gnu/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+/home/ubuntu/.local/share/uv/python/cpython-3.11.14-linux-x86_64-gnu/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
