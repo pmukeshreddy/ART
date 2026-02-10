@@ -349,7 +349,7 @@ class SGLangServer:
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.post(
-                    f"{self.base_url}/update_weights",
+                    f"{self.base_url}/update_weights_from_disk",
                     json={
                         "model_path": model_path,
                         "load_format": load_format,
