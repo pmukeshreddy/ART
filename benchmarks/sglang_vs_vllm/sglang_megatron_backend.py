@@ -51,11 +51,17 @@ class SGLangMegatronBackend(LocalBackend):
         self._max_reqs = max_running_requests
 
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
-        """SGLang serves the model under its HF path, not the ART name@step.
+        """Return LoRA adapter name after hot-reload, base model before.
 
-        verl's ServerAdapter does the same: it uses the base model path
-        as the served_model_name.
+        Before any training step, SGLang serves under the base model name
+        (e.g. "Qwen/Qwen3-30B-A3B-Instruct-2507"). After hot-reload, it
+        serves the LoRA adapter under the name set by _hot_reload_lora
+        (e.g. "bench-sglang@step1"). We must return the correct name so
+        inference requests hit the LoRA-augmented model, not naked base.
         """
+        service = self._services.get(model.name)
+        if service is not None and getattr(service, "_active_lora_name", None):
+            return service._active_lora_name
         return model.base_model if hasattr(model, "base_model") else model.name
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
