@@ -238,6 +238,11 @@ class SGLangMegatronService:
             logger.warning(f"No adapter at {adapter_file}, skipping")
             return 0.0
 
+        # SGLang's LoRAConfig constructor requires adapter_config.json.
+        # Megatron doesn't create it — generate from known LoRA params.
+        # Mirrors: src/art/megatron/service.py :: _ensure_lora_adapter_config()
+        self._ensure_adapter_config(lora_path)
+
         lora_name = f"{self.model_name}@step{step}"
         elapsed = await self._server.load_lora_adapter(
             lora_path=lora_path,
@@ -419,6 +424,36 @@ class SGLangMegatronService:
             f"Total transition overhead: {total_overhead:.2f}s "
             f"(was 464s+ with disk merge)"
         )
+
+    @staticmethod
+    def _ensure_adapter_config(lora_path: str) -> None:
+        """Write adapter_config.json if missing — SGLang requires it.
+
+        Megatron saves only adapter_model.safetensors (no PEFT metadata).
+        SGLang's LoRAConfig constructor reads adapter_config.json to get
+        rank, alpha, and target_modules.
+
+        Mirrors: src/art/megatron/service.py :: _ensure_lora_adapter_config()
+        Config:  src/art/megatron/service.py :: _default_lora_adapter_config()
+        """
+        config_path = os.path.join(lora_path, "adapter_config.json")
+        if os.path.exists(config_path):
+            return
+
+        # Must match Megatron's LoraConfig exactly (service.py line 65-78)
+        adapter_config = {
+            "r": 1,
+            "lora_alpha": 32,
+            "target_modules": [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+            "peft_type": "LORA",
+        }
+        with open(config_path, "w") as f:
+            json.dump(adapter_config, f, indent=2)
 
     def _merge_lora_shards(self, lora_path: str) -> None:
         """Merge sharded LoRA adapters from distributed training."""
