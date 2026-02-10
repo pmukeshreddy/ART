@@ -220,7 +220,7 @@ while True:
         )
     )
     # pad indices
-    if num_sequences % dp_world_size <= dp_rank > 0:
+    if 0 < num_sequences % dp_world_size <= dp_rank:
         indices.append(
             (list(range(num_sequences)) * (dp_world_size // num_sequences + 1))[dp_rank]
         )
