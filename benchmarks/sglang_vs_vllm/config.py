@@ -85,10 +85,7 @@ class BenchmarkConfig:
         default_factory=lambda: ["vllm", "sglang"]
     )
 
-    # --- Workload ---
-    # agentic dataset: multi-turn tool-use prompts → triggers RadixAttention
-    # advantage in SGLang (5x throughput on shared prefixes)
-    dataset: str = "agentic"  # "gsm8k", "sharegpt", "math", "agentic", "synthetic"
+    dataset: str = "agentic"
     num_training_steps: int = 3
     num_rollouts_per_step: int = 16
     # concurrency=32: SGLang peaks at ~60 concurrent, vLLM peaks at ~40
@@ -305,8 +302,7 @@ def generate_benchmark_prompts(
     """
     rng = random.Random(seed)
 
-    if dataset == "synthetic":
-        return _generate_synthetic_prompts(num_prompts, input_tokens, rng)
+
 
     source_prompts = _get_dataset_prompts(dataset)
 
