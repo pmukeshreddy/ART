@@ -45,25 +45,67 @@ from .sglang_server import SGLangServer, SGLangServerConfig
 logger = logging.getLogger(__name__)
 
 
-def _ensure_vllm_c_importable() -> None:
-    """Ensure ``import vllm._C`` won't crash before Unsloth is imported.
-
-    Unsloth's ``__init__`` calls ``fix_vllm_guided_decoding_params()`` which
-    chains into ``vllm._C``.  On systems where vLLM's C extension was compiled
-    against a different PyTorch ABI (common on cloud GPU images), this import
-    raises ``ImportError: undefined symbol …``.
-
-    Since we use SGLang (not vLLM) for inference, we create a harmless dummy
-    module so Unsloth's init completes without error.  vLLM itself is
-    unaffected — it runs in a separate subprocess with its own import state.
-    """
-    if "vllm._C" in sys.modules:
-        return  # already loaded successfully
+def _is_vllm_healthy() -> bool:
+    """Return True if vLLM's C extension loads without ABI errors."""
     try:
-        import vllm._C  # noqa: F401 — just a presence check
-    except (ImportError, OSError) as exc:
-        logger.info(f"Mocking vllm._C to avoid ABI crash: {exc}")
-        sys.modules["vllm._C"] = types.ModuleType("vllm._C")
+        import vllm._C  # noqa: F401
+        return True
+    except (ImportError, OSError, AttributeError):
+        return False
+
+
+class _StubModule(types.ModuleType):
+    """A module whose every attribute is a no-op callable returning None.
+
+    Used to mock ``unsloth_zoo.vllm_utils`` when vLLM's C extension is broken.
+    Any function imported from the mock (e.g. ``_get_torchao_fp8_config``)
+    will be a harmless no-op.
+    """
+
+    def __getattr__(self, name: str):
+        def _noop(*args, **kwargs):
+            return None
+        return _noop
+
+
+def _patch_vllm_for_unsloth_import() -> None:
+    """Make Unsloth importable even when vLLM's C extension is broken.
+
+    Unsloth + unsloth_zoo have deep vLLM imports at module load time:
+      1. ``unsloth/__init__.py`` → ``fix_vllm_guided_decoding_params()``
+         chains into ``vllm._C`` (ABI crash).
+      2. ``unsloth_zoo/vllm_utils.py`` → ``import vllm.model_executor.layers...``
+         chains deep into vLLM quantization/fused_moe layers that call
+         ``torch.ops._C`` custom ops (which aren't registered if _C failed).
+
+    On cloud GPU images where vLLM was compiled against a different PyTorch
+    ABI (e.g. vLLM 0.15.1 + PyTorch 2.10.0), these imports crash.
+
+    Since we use SGLang (not vLLM) for inference, we:
+      1. Create a dummy ``vllm._C`` module
+      2. Pre-populate ``sys.modules["unsloth_zoo.vllm_utils"]`` with a stub
+         so the *real* module (which does ``import vllm.model_executor...``)
+         is never loaded
+
+    vLLM inference (if used in a separate process) is unaffected — each
+    subprocess has its own module state.
+    """
+    if _is_vllm_healthy():
+        return  # vLLM works fine, no mocking needed
+
+    logger.info(
+        "vLLM C extension is broken (ABI mismatch with PyTorch). "
+        "Mocking vllm internals for Unsloth import — we use SGLang, not vLLM."
+    )
+
+    # 1. Dummy vllm._C so shallow imports don't crash
+    sys.modules["vllm._C"] = types.ModuleType("vllm._C")
+
+    # 2. Mock unsloth_zoo.vllm_utils BEFORE Unsloth imports it.
+    #    This prevents the real module from loading, which means the deep
+    #    vllm.model_executor import chain never executes.
+    if "unsloth_zoo.vllm_utils" not in sys.modules:
+        sys.modules["unsloth_zoo.vllm_utils"] = _StubModule("unsloth_zoo.vllm_utils")
 
 
 def _gc_and_empty_cuda_cache(n: int = 3) -> None:
@@ -271,8 +313,8 @@ class UnslothSGLangService:
           - unsloth_triton: A100, older PyTorch (custom Triton kernels)
           - native_torch: fallback (12x slower but VRAM savings still apply)
         """
-        # Ensure vllm._C is importable before Unsloth touches it
-        _ensure_vllm_c_importable()
+        # Mock broken vLLM internals before Unsloth tries to import them
+        _patch_vllm_for_unsloth_import()
         from unsloth import FastLanguageModel
 
         logger.info(f"Loading model: {self.base_model}")

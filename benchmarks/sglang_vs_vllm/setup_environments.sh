@@ -214,16 +214,32 @@ if [ "$NEED_DS_DOWNGRADE" = "yes" ]; then
 fi
 
 # Step 3: Verify Unsloth import (show errors, don't swallow them)
-# Note: Unsloth's __init__ calls fix_vllm_guided_decoding_params() which tries
-# to import vllm._C. If vLLM's C extension has an ABI mismatch with PyTorch,
-# this crashes. We mock vllm._C before importing since we use SGLang, not vLLM.
+# Unsloth + unsloth_zoo deeply import vLLM internals at load time.
+# If vLLM's C extension has an ABI mismatch with PyTorch (common on cloud
+# GPU images), we mock vllm._C and unsloth_zoo.vllm_utils before importing.
+# This is safe because our Unsloth backend uses SGLang, not vLLM.
 info "Verifying Unsloth import..."
 if python3 -c "
 import sys, types
+
+# Check if vLLM's C extension works
+vllm_ok = False
 try:
     import vllm._C
-except (ImportError, OSError):
+    vllm_ok = True
+except (ImportError, OSError, AttributeError):
+    pass
+
+if not vllm_ok:
+    # Mock vllm._C (shallow imports)
     sys.modules['vllm._C'] = types.ModuleType('vllm._C')
+    # Mock unsloth_zoo.vllm_utils (prevents deep vllm.model_executor imports)
+    class _Stub(types.ModuleType):
+        def __getattr__(self, name):
+            return lambda *a, **kw: None
+    sys.modules['unsloth_zoo.vllm_utils'] = _Stub('unsloth_zoo.vllm_utils')
+    print('  (mocked vllm internals — ABI mismatch with PyTorch, using SGLang)')
+
 import unsloth
 print(f'Unsloth {unsloth.__version__}')
 "; then
