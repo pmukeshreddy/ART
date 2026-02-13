@@ -36,6 +36,20 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 # =============================================================================
+# Helper: uv pip install that works with or without a venv
+# =============================================================================
+# If VIRTUAL_ENV is set or a .venv exists, uv picks it up automatically.
+# Otherwise (bare system python) we need --system so uv doesn't refuse.
+
+uv_pip_install() {
+    if [ -n "${VIRTUAL_ENV:-}" ] || [ -d "$PROJECT_ROOT/.venv" ]; then
+        uv pip install "$@"
+    else
+        uv pip install --system "$@"
+    fi
+}
+
+# =============================================================================
 # 1. Validate prerequisites
 # =============================================================================
 
@@ -83,7 +97,7 @@ if python3 -c "import vllm; print(f'vLLM {vllm.__version__}')" 2>/dev/null; then
     success "vLLM $VLLM_VERSION is already installed in ART environment"
 else
     info "vLLM not found. Installing with ART backend extras..."
-    uv pip install vllm
+    uv_pip_install vllm
     success "vLLM installed"
 fi
 
@@ -117,8 +131,7 @@ else
 
     info "Installing SGLang and dependencies..."
 
-    # uv venv doesn't include pip — use "uv pip install --python <path>"
-    # Install PyTorch first (matching CUDA version)
+    # SGLang gets its own venv — use --python to target it explicitly
     uv pip install --python "$SGLANG_ENV/bin/python" \
         torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
@@ -157,7 +170,7 @@ if python3 -c "import unsloth; print(f'Unsloth {unsloth.__version__}')" 2>/dev/n
     success "Unsloth $UNSLOTH_VERSION is already installed"
 else
     info "Unsloth not found. Installing (includes transformers>=5.0.0, trl>=0.27.1)..."
-    uv pip install --upgrade unsloth unsloth_zoo
+    uv_pip_install --upgrade unsloth unsloth_zoo
     if python3 -c "import unsloth; print(f'Unsloth {unsloth.__version__}')" 2>/dev/null; then
         UNSLOTH_VERSION=$(python3 -c "import unsloth; print(unsloth.__version__)")
         success "Unsloth $UNSLOTH_VERSION installed"
@@ -203,7 +216,7 @@ info ""
 info "=== Installing benchmark dependencies in ART environment ==="
 
 cd "$PROJECT_ROOT"
-uv pip install aiohttp 2>/dev/null || pip install aiohttp
+uv_pip_install aiohttp 2>/dev/null || pip install aiohttp
 
 success "Benchmark dependencies installed"
 
@@ -214,17 +227,26 @@ success "Benchmark dependencies installed"
 info ""
 info "=== Verification ==="
 
-# vLLM check — use uv run to pick up the ART .venv
-VLLM_PYTHON=$(cd "$PROJECT_ROOT" && uv run python -c "import sys; print(sys.executable)" 2>/dev/null || echo "python3")
+# vLLM check — find the right python (venv or system)
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+    VLLM_PYTHON="$VIRTUAL_ENV/bin/python"
+elif [ -d "$PROJECT_ROOT/.venv" ]; then
+    VLLM_PYTHON="$PROJECT_ROOT/.venv/bin/python"
+else
+    VLLM_PYTHON="python3"
+fi
 info "vLLM Python: $VLLM_PYTHON"
-cd "$PROJECT_ROOT" && uv run python -c "
+"$VLLM_PYTHON" -c "
 import torch
 print(f'  PyTorch: {torch.__version__}')
 print(f'  CUDA available: {torch.cuda.is_available()}')
 print(f'  GPU count: {torch.cuda.device_count()}')
-import vllm
-print(f'  vLLM: {vllm.__version__}')
-"
+try:
+    import vllm
+    print(f'  vLLM: {vllm.__version__}')
+except ImportError:
+    print('  vLLM: not installed (install separately or skip --backends vllm)')
+" 2>/dev/null || warn "vLLM verification failed (non-fatal)"
 
 # SGLang check
 SGLANG_PYTHON="$SGLANG_ENV/bin/python"
@@ -236,7 +258,7 @@ print(f'  CUDA available: {torch.cuda.is_available()}')
 print(f'  GPU count: {torch.cuda.device_count()}')
 import sglang
 print(f'  SGLang: {sglang.__version__}')
-"
+" 2>/dev/null || warn "SGLang verification failed (non-fatal)"
 
 # =============================================================================
 # 7. Print usage instructions
@@ -249,10 +271,10 @@ echo "Environment paths:"
 echo "  vLLM Python:   $VLLM_PYTHON"
 echo "  SGLang Python: $SGLANG_PYTHON"
 echo ""
-echo "Run the benchmark (use 'uv run python' so the ART .venv is used):"
+echo "Run the benchmark:"
 echo ""
 echo "  # vLLM + SGLang comparison (original)"
-echo "  uv run python benchmarks/sglang_vs_vllm/run_benchmark.py \\"
+echo "  python benchmarks/sglang_vs_vllm/run_benchmark.py \\"
 echo "    --sglang-python $SGLANG_PYTHON \\"
 echo "    --model Qwen/Qwen2.5-7B-Instruct \\"
 echo "    --dataset gsm8k \\"
@@ -262,7 +284,7 @@ echo "    --concurrency 8 \\"
 echo "    --tp 2"
 echo ""
 echo "  # Unsloth MoE + SGLang (new)"
-echo "  uv run python benchmarks/sglang_vs_vllm/run_benchmark.py \\"
+echo "  python benchmarks/sglang_vs_vllm/run_benchmark.py \\"
 echo "    --sglang-python $SGLANG_PYTHON \\"
 echo "    --model Qwen/Qwen3-30B-A3B-Instruct-2507 \\"
 echo "    --backends unsloth \\"
@@ -272,7 +294,7 @@ echo "    --unsloth-lora-rank 16 \\"
 echo "    --tp 2"
 echo ""
 echo "  # All three backends"
-echo "  uv run python benchmarks/sglang_vs_vllm/run_benchmark.py \\"
+echo "  python benchmarks/sglang_vs_vllm/run_benchmark.py \\"
 echo "    --sglang-python $SGLANG_PYTHON \\"
 echo "    --model Qwen/Qwen3-30B-A3B-Instruct-2507 \\"
 echo "    --backends vllm sglang unsloth \\"
