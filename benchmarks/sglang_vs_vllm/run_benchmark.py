@@ -665,19 +665,41 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 # ===================================================================
 
 def cleanup_gpus() -> None:
-    for pat in ["model-service", "megatron-service", "sglang.launch_server",
-                "vllm.entrypoints", "vllm.v1", "torchrun", "unsloth"]:
-        subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=10)
-    # Kill any remaining GPU-holding processes (except this one)
+    # Patterns must be specific enough to NOT match the orchestrator process.
+    # The orchestrator cmdline contains "--backends unsloth" so a bare "unsloth"
+    # pattern would kill it.  Use "_worker unsloth" to only match worker subs.
+    my_pid = os.getpid()
+    my_ppid = os.getppid()
+    safe_pids = {my_pid, my_ppid}
+
+    kill_patterns = [
+        "model-service", "megatron-service", "sglang.launch_server",
+        "vllm.entrypoints", "vllm.v1", "torchrun",
+        "_worker unsloth",   # only the Unsloth worker subprocess
+        "_worker vllm",      # only the vLLM worker subprocess
+        "_worker sglang",    # only the SGLang worker subprocess
+    ]
+    for pat in kill_patterns:
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", pat], capture_output=True, text=True, timeout=10,
+            )
+            for pid_str in r.stdout.strip().split("\n"):
+                pid_str = pid_str.strip()
+                if pid_str and int(pid_str) not in safe_pids:
+                    subprocess.run(["kill", "-9", pid_str], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    # Kill any remaining GPU-holding processes (except this one and parent)
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         )
-        my_pid = str(os.getpid())
         for pid in r.stdout.strip().split("\n"):
             pid = pid.strip()
-            if pid and pid != my_pid:
+            if pid and int(pid) not in safe_pids:
                 subprocess.run(["kill", "-9", pid], capture_output=True, timeout=5)
     except Exception:
         pass
