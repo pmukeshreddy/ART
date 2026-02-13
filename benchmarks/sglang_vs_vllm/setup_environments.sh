@@ -214,23 +214,31 @@ if [ "$NEED_DS_DOWNGRADE" = "yes" ]; then
 fi
 
 # torchvision must match PyTorch — if torch was upgraded (e.g. 2.10.0) but
-# torchvision wasn't, torch.library registration crashes on import.
-info "Ensuring torchvision matches PyTorch..."
+# torchvision wasn't, torch.library registration crashes on import with:
+#   AttributeError: 'function' object has no attribute 'endswith'
+# Check version compatibility by comparing major.minor numbers.
+TORCH_VER=$(python3 -c "import torch; print(torch.__version__.split('+')[0])" 2>/dev/null || echo "0.0.0")
+TV_VER=$(python3 -c "import torchvision; print(torchvision.__version__.split('+')[0])" 2>/dev/null || echo "0.0.0")
+info "torch=$TORCH_VER  torchvision=$TV_VER"
+
+# torch 2.10.x needs torchvision 0.22.x; torch 2.9.x needs 0.21.x; etc.
+# The simplest reliable check: torch major.minor should match torchvision's expected pair.
 NEED_TV_UPGRADE=$(python3 -c "
-import torch, torchvision
-tv = torchvision.__version__.split('+')[0]  # strip +cu128
-t  = torch.__version__.split('+')[0]
-# torchvision 0.2x matches torch 2.x — major version should be compatible
-# Simple check: try the meta_registrations import that crashes if mismatched
-try:
-    from torchvision import _meta_registrations
-    print('no')
-except Exception:
+import importlib.metadata as meta
+t = meta.version('torch').split('+')[0]
+tv = meta.version('torchvision').split('+')[0]
+t_major, t_minor = int(t.split('.')[0]), int(t.split('.')[1])
+tv_major, tv_minor = int(tv.split('.')[0]), int(tv.split('.')[1])
+# torchvision 0.Y matches torch 2.(Y-12), e.g. tv 0.22 = torch 2.10
+expected_tv_minor = t_minor + 12  # torch 2.10 -> tv 0.22
+if tv_major == 0 and tv_minor < expected_tv_minor:
     print('yes')
+else:
+    print('no')
 " 2>/dev/null || echo "yes")
 
 if [ "$NEED_TV_UPGRADE" = "yes" ]; then
-    info "Upgrading torchvision to match PyTorch $(python3 -c 'import torch; print(torch.__version__)')..."
+    info "Upgrading torchvision to match PyTorch $TORCH_VER..."
     uv_pip_install --upgrade torchvision
 fi
 
