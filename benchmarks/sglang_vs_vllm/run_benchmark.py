@@ -710,11 +710,18 @@ def spawn_worker(backend: str, cfg: dict, results_path: str) -> int:
     with open(cfg_file, "w") as f:
         json.dump(cfg, f)
 
-    # Use system python3 instead of "uv run python" — the benchmark needs
-    # torch, unsloth, vllm, etc. which are installed system-wide but NOT in
-    # the uv-managed .venv (they're optional deps in pyproject.toml).
+    # Use the SAME Python interpreter as the orchestrator (sys.executable).
+    # This ensures the subprocess has access to torch, unsloth, vllm, etc.
+    # which are installed in the user's activated environment.
+    #
+    # IMPORTANT: Don't use "uv run python" — that creates an isolated .venv
+    # with only core deps (no torch). Don't use bare "python3" — inside
+    # uv run, it resolves to the .venv python. sys.executable is the actual
+    # interpreter running right now.
+    #
     # PYTHONPATH includes project root (for benchmarks.*) and src/ (for art.*).
-    cmd = ["python3", script,
+    python = sys.executable
+    cmd = [python, script,
            "--_worker", backend, "--_config", cfg_file, "--_results", results_path]
     logger.info(f"Spawning {backend}: {' '.join(cmd)}")
 
