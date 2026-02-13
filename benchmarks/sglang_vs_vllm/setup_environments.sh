@@ -162,34 +162,58 @@ info "=== Checking Unsloth (MoE training) environment ==="
 
 cd "$PROJECT_ROOT"
 
-# Unsloth runs in the same ART environment (uses unsloth + unsloth-zoo packages)
-# Requires: transformers>=5.0.0, trl>=0.27.1 (installed as Unsloth dependencies)
+# Unsloth runs in the same ART/system environment (uses unsloth + unsloth-zoo packages)
 # Note: MoE nn.Parameter doesn't support bitsandbytes 4-bit yet → BF16/FP16 LoRA
-if python3 -c "import unsloth; print(f'Unsloth {unsloth.__version__}')" 2>/dev/null; then
-    UNSLOTH_VERSION=$(python3 -c "import unsloth; print(unsloth.__version__)")
+
+# Step 1: Install Unsloth packages
+if python3 -c "import unsloth" 2>/dev/null; then
+    UNSLOTH_VERSION=$(python3 -c "import unsloth; print(unsloth.__version__)" 2>/dev/null || echo "unknown")
     success "Unsloth $UNSLOTH_VERSION is already installed"
 else
-    info "Unsloth not found. Installing (includes transformers>=5.0.0, trl>=0.27.1)..."
+    info "Unsloth not found. Installing..."
     uv_pip_install --upgrade unsloth unsloth_zoo
-    if python3 -c "import unsloth; print(f'Unsloth {unsloth.__version__}')" 2>/dev/null; then
-        UNSLOTH_VERSION=$(python3 -c "import unsloth; print(unsloth.__version__)")
-        success "Unsloth $UNSLOTH_VERSION installed"
-    else
-        warn "Unsloth installation failed. Unsloth backend will not be available."
-        warn "  Install manually: pip install --upgrade unsloth unsloth_zoo"
-    fi
 fi
 
-# Verify transformers v5+ (required for MoE fused gate_up_proj / torch._grouped_mm)
+# Step 2: Force-upgrade transformers and trl to versions required for MoE
+# Unsloth may pull in older versions (e.g. transformers 4.x) but MoE fused
+# gate_up_proj layers and torch._grouped_mm require transformers>=5.0.0.
+# trl>=0.27.1 is needed for compatibility with transformers v5.
+info "Ensuring transformers>=5.0.0 and trl>=0.27.1 for MoE support..."
+NEED_TF_UPGRADE=$(python3 -c "
+import importlib.metadata as meta
+v = meta.version('transformers')
+print('yes' if tuple(int(x) for x in v.split('.')[:2]) < (5, 0) else 'no')
+" 2>/dev/null || echo "yes")
+
+NEED_TRL_UPGRADE=$(python3 -c "
+import importlib.metadata as meta
+v = meta.version('trl')
+parts = v.split('.')
+print('yes' if (int(parts[0]), int(parts[1])) < (0, 27) else 'no')
+" 2>/dev/null || echo "yes")
+
+if [ "$NEED_TF_UPGRADE" = "yes" ] || [ "$NEED_TRL_UPGRADE" = "yes" ]; then
+    info "Upgrading: transformers>=5.0.0 trl>=0.27.1 ..."
+    uv_pip_install --upgrade "transformers>=5.0.0" "trl>=0.27.1"
+fi
+
+# Step 3: Verify Unsloth import (show errors, don't swallow them)
+info "Verifying Unsloth import..."
+if python3 -c "import unsloth; print(f'Unsloth {unsloth.__version__}')"; then
+    success "Unsloth ready"
+else
+    warn "Unsloth import failed (see error above). Unsloth backend may not work."
+    warn "  Try: pip install --upgrade unsloth unsloth_zoo transformers>=5.0.0 trl>=0.27.1"
+fi
+
+# Show final versions
 python3 -c "
 import importlib.metadata as meta
-tf_ver = meta.version('transformers')
-trl_ver = meta.version('trl')
-print(f'  transformers: {tf_ver}')
-print(f'  trl: {trl_ver}')
-if tuple(int(x) for x in tf_ver.split('.')[:2]) < (5, 0):
-    print('  ⚠️  transformers < 5.0 — MoE gate_up_proj fused layers require v5+')
-    print('     Run: pip install --upgrade transformers>=5.0.0')
+for pkg in ['unsloth', 'unsloth-zoo', 'transformers', 'trl', 'torch', 'triton']:
+    try:
+        print(f'  {pkg}: {meta.version(pkg)}')
+    except meta.PackageNotFoundError:
+        print(f'  {pkg}: not installed')
 " 2>/dev/null || true
 
 # Check MoE backend support
