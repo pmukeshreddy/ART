@@ -213,6 +213,27 @@ if [ "$NEED_DS_DOWNGRADE" = "yes" ]; then
     uv_pip_install "datasets==4.3.0"
 fi
 
+# torchvision must match PyTorch — if torch was upgraded (e.g. 2.10.0) but
+# torchvision wasn't, torch.library registration crashes on import.
+info "Ensuring torchvision matches PyTorch..."
+NEED_TV_UPGRADE=$(python3 -c "
+import torch, torchvision
+tv = torchvision.__version__.split('+')[0]  # strip +cu128
+t  = torch.__version__.split('+')[0]
+# torchvision 0.2x matches torch 2.x — major version should be compatible
+# Simple check: try the meta_registrations import that crashes if mismatched
+try:
+    from torchvision import _meta_registrations
+    print('no')
+except Exception:
+    print('yes')
+" 2>/dev/null || echo "yes")
+
+if [ "$NEED_TV_UPGRADE" = "yes" ]; then
+    info "Upgrading torchvision to match PyTorch $(python3 -c 'import torch; print(torch.__version__)')..."
+    uv_pip_install --upgrade torchvision
+fi
+
 # Step 3: Verify Unsloth import (show errors, don't swallow them)
 # Unsloth + unsloth_zoo deeply import vLLM internals at load time.
 # If vLLM's C extension has an ABI mismatch with PyTorch (common on cloud
