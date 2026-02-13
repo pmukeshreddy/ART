@@ -199,6 +199,20 @@ if [ "$NEED_TF_UPGRADE" = "yes" ] || [ "$NEED_TRL_UPGRADE" = "yes" ]; then
     uv_pip_install --upgrade "transformers>=5.0.0" "trl>=0.27.1"
 fi
 
+# Unsloth 2026.2.x blocks datasets>=4.5.0 (causes recursion errors).
+# The transformers v5 upgrade may have pulled in a newer datasets version.
+NEED_DS_DOWNGRADE=$(python3 -c "
+import importlib.metadata as meta
+v = meta.version('datasets')
+parts = [int(x) for x in v.split('.')[:2]]
+print('yes' if parts[0] > 4 or (parts[0] == 4 and parts[1] >= 5) else 'no')
+" 2>/dev/null || echo "no")
+
+if [ "$NEED_DS_DOWNGRADE" = "yes" ]; then
+    info "Downgrading datasets to 4.3.0 (Unsloth requires <4.5.0)..."
+    uv_pip_install "datasets==4.3.0"
+fi
+
 # Step 3: Verify Unsloth import (show errors, don't swallow them)
 # Note: Unsloth's __init__ calls fix_vllm_guided_decoding_params() which tries
 # to import vllm._C. If vLLM's C extension has an ABI mismatch with PyTorch,
