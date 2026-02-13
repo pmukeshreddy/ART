@@ -55,14 +55,25 @@ def _is_vllm_healthy() -> bool:
 
 
 class _StubModule(types.ModuleType):
-    """A module whose every attribute is a no-op callable returning None.
+    """A module whose public attributes are no-op callables returning None.
 
     Used to mock ``unsloth_zoo.vllm_utils`` when vLLM's C extension is broken.
     Any function imported from the mock (e.g. ``_get_torchao_fp8_config``)
     will be a harmless no-op.
+
+    Dunder attributes (``__file__``, ``__path__``, ``__spec__``, …) are NOT
+    mocked — Python's ``inspect`` module iterates ``sys.modules`` and accesses
+    ``__file__`` on every module.  If ``__file__`` returns a callable instead
+    of a string, ``inspect.getsourcefile()`` crashes with
+    ``AttributeError: 'function' object has no attribute 'endswith'``.
     """
 
     def __getattr__(self, name: str):
+        # Let dunder lookups raise AttributeError so inspect/importlib
+        # treat this module as one without source (like builtins).
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+
         def _noop(*args, **kwargs):
             return None
         return _noop

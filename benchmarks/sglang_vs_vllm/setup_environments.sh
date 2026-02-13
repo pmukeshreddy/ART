@@ -263,8 +263,14 @@ if not vllm_ok:
     # Mock vllm._C (shallow imports)
     sys.modules['vllm._C'] = types.ModuleType('vllm._C')
     # Mock unsloth_zoo.vllm_utils (prevents deep vllm.model_executor imports)
+    # IMPORTANT: dunder attrs (__file__, __path__, etc.) must NOT be mocked —
+    # inspect.getsourcefile iterates sys.modules and accesses __file__ on every
+    # module; if __file__ returns a callable instead of a string it crashes with
+    # AttributeError: 'function' object has no attribute 'endswith'
     class _Stub(types.ModuleType):
         def __getattr__(self, name):
+            if name.startswith('__') and name.endswith('__'):
+                raise AttributeError(name)
             return lambda *a, **kw: None
     sys.modules['unsloth_zoo.vllm_utils'] = _Stub('unsloth_zoo.vllm_utils')
     print('  (mocked vllm internals — ABI mismatch with PyTorch, using SGLang)')
