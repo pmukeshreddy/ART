@@ -710,12 +710,21 @@ def spawn_worker(backend: str, cfg: dict, results_path: str) -> int:
     with open(cfg_file, "w") as f:
         json.dump(cfg, f)
 
-    cmd = ["uv", "run", "python", script,
+    # Use system python3 instead of "uv run python" — the benchmark needs
+    # torch, unsloth, vllm, etc. which are installed system-wide but NOT in
+    # the uv-managed .venv (they're optional deps in pyproject.toml).
+    # PYTHONPATH includes project root (for benchmarks.*) and src/ (for art.*).
+    cmd = ["python3", script,
            "--_worker", backend, "--_config", cfg_file, "--_results", results_path]
     logger.info(f"Spawning {backend}: {' '.join(cmd)}")
 
     env = os.environ.copy()
     env.pop("CUDA_LAUNCH_BLOCKING", None)
+    # Ensure project root + src/ are on PYTHONPATH so benchmarks.* and art.* import
+    extra_paths = [PROJECT_ROOT, os.path.join(PROJECT_ROOT, "src")]
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(extra_paths + ([existing] if existing else []))
+
     # Suppress NCCL/TCPStore noise from Megatron shutdown — send stderr to log file
     stderr_log = results_path.replace("_metrics.json", "_stderr.log")
     with open(stderr_log, "w") as stderr_file:
