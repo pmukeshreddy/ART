@@ -704,23 +704,68 @@ def cleanup_gpus() -> None:
     except Exception:
         pass
 
+def _find_python_with_torch() -> str:
+    """Find a Python interpreter that can import torch.
+
+    Checks (in order):
+      1. sys.executable (current interpreter — works if user activated the right env)
+      2. System python3 (works if torch was installed with --system / pip install)
+      3. Common venv locations (~/.venvs/*/bin/python, /opt/conda/bin/python)
+
+    Falls back to sys.executable with a warning if nothing found.
+    """
+    candidates = [
+        sys.executable,
+        "/usr/bin/python3",
+        os.path.expanduser("~/.venvs/art/bin/python"),
+        "/opt/conda/bin/python",
+    ]
+    # Also check unqualified python3 (may differ from sys.executable inside uv venv)
+    # Use 'which' to resolve it outside the venv PATH
+    try:
+        r = subprocess.run(
+            ["which", "-a", "python3"], capture_output=True, text=True, timeout=5,
+        )
+        for line in r.stdout.strip().split("\n"):
+            p = line.strip()
+            if p and p not in candidates and ".venv" not in p:
+                candidates.append(p)
+    except Exception:
+        pass
+
+    for python in candidates:
+        if not os.path.isfile(python):
+            continue
+        try:
+            r = subprocess.run(
+                [python, "-c", "import torch; print(torch.__version__)"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0:
+                ver = r.stdout.strip()
+                logger.info(f"Worker python: {python} (torch {ver})")
+                return python
+        except Exception:
+            continue
+
+    logger.warning(
+        f"No Python with torch found! Falling back to {sys.executable}. "
+        f"Install torch: pip install torch"
+    )
+    return sys.executable
+
+
 def spawn_worker(backend: str, cfg: dict, results_path: str) -> int:
     script = os.path.abspath(__file__)
     cfg_file = results_path.replace("_metrics.json", "_config.json")
     with open(cfg_file, "w") as f:
         json.dump(cfg, f)
 
-    # Use the SAME Python interpreter as the orchestrator (sys.executable).
-    # This ensures the subprocess has access to torch, unsloth, vllm, etc.
-    # which are installed in the user's activated environment.
-    #
-    # IMPORTANT: Don't use "uv run python" — that creates an isolated .venv
-    # with only core deps (no torch). Don't use bare "python3" — inside
-    # uv run, it resolves to the .venv python. sys.executable is the actual
-    # interpreter running right now.
-    #
+    # Find a Python interpreter that has torch installed.
+    # The uv-managed .venv only has core ART deps (no torch/unsloth/vllm).
+    # We check sys.executable first, then fall back to system python3.
     # PYTHONPATH includes project root (for benchmarks.*) and src/ (for art.*).
-    python = sys.executable
+    python = _find_python_with_torch()
     cmd = [python, script,
            "--_worker", backend, "--_config", cfg_file, "--_results", results_path]
     logger.info(f"Spawning {backend}: {' '.join(cmd)}")
