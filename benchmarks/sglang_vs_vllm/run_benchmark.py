@@ -442,6 +442,84 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
     # ---- Unsloth + SGLang (MoE-optimized, self-contained) -----------
 
+    async def _collect_completions(
+        base_url: str, model_name: str, prompts: list,
+        max_tokens: int = 256, conc: int = 8,
+    ) -> list[dict]:
+        """Collect completions for training — mirrors do_rollout_for_training.
+
+        Same flow as vLLM/SGLang: generate completions, compute rewards.
+        Uses aiohttp directly (no ART dependency) but identical semantics.
+        """
+        sem = asyncio.Semaphore(conc)
+
+        async def _one(idx, msgs):
+            async with sem:
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        async with s.post(
+                            f"{base_url}/chat/completions",
+                            json={
+                                "model": model_name,
+                                "messages": msgs,
+                                "max_tokens": max_tokens,
+                                "temperature": 1.0,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=300),
+                        ) as r:
+                            if r.status != 200:
+                                return {"prompt": msgs, "completion": "",
+                                        "reward": 0.0, "advantage": 0.0, "error": True}
+                            data = await r.json()
+                            content = data["choices"][0]["message"]["content"] or ""
+                            # Same reward function as do_rollout_for_training
+                            reward = min(len(content) / 200.0, 1.0)
+                            return {"prompt": msgs, "completion": content,
+                                    "reward": reward, "advantage": 0.0, "error": False}
+                except Exception as e:
+                    logger.warning(f"  train-completion {idx}: {e}")
+                    return {"prompt": msgs, "completion": "",
+                            "reward": 0.0, "advantage": 0.0, "error": True}
+
+        results = await asyncio.gather(*[_one(i, m) for i, m in enumerate(prompts)])
+        return list(results)
+
+    def _compute_grpo_advantages(train_data: list[dict], group_size: int = 4) -> None:
+        """Compute group-relative advantages (GRPO-style).
+
+        Same grouping as do_rollout_for_training: batches of 4, normalize
+        rewards within each group to get advantages. Mirrors the Megatron
+        GRPO on_policy_correction behaviour.
+        """
+        for i in range(0, len(train_data), group_size):
+            group = train_data[i:i + group_size]
+            valid = [d for d in group if not d.get("error")]
+            if len(valid) < 2:
+                for d in group:
+                    d["advantage"] = 1.0 if not d.get("error") else 0.0
+                continue
+            rewards = [d["reward"] for d in valid]
+            mean_r = sum(rewards) / len(rewards)
+            std_r = max(
+                (sum((r - mean_r) ** 2 for r in rewards) / len(rewards)) ** 0.5,
+                1e-4,
+            )
+            # Same tie-breaking as do_rollout_for_training
+            if len(set(rewards)) == 1:
+                for j, d in enumerate(valid):
+                    d["reward"] = d["reward"] + (j + 1) * 0.01
+                rewards = [d["reward"] for d in valid]
+                mean_r = sum(rewards) / len(rewards)
+                std_r = max(
+                    (sum((r - mean_r) ** 2 for r in rewards) / len(rewards)) ** 0.5,
+                    1e-4,
+                )
+            for d in group:
+                if d.get("error"):
+                    d["advantage"] = 0.0
+                else:
+                    d["advantage"] = (d["reward"] - mean_r) / std_r
+
     async def _run_unsloth() -> BenchmarkRun:
         """Unsloth + SGLang benchmark — fully self-contained.
 
@@ -452,11 +530,14 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
         Unsloth auto-selects MoE backend (grouped_mm / unsloth_triton / native_torch).
         MoE nn.Parameter doesn't support bnb 4bit — uses BF16/FP16 LoRA.
 
-        Architecture:
+        Architecture (IDENTICAL to vLLM/SGLang, fair comparison):
           1. SGLang server starts ONCE (persistent, verl-style)
-          2. Rollout via IDENTICAL streaming as vLLM/SGLang
-          3. sleep() → Unsloth trains on completions → wake() → load_lora()
-          4. Full memory recovery every step
+          2. Rollout via IDENTICAL streaming as vLLM/SGLang (timed)
+          3. Collect completions (same as do_rollout_for_training)
+          4. Compute GRPO-style group-relative advantages
+          5. sleep() → Unsloth trains on completions with advantage-weighted
+             loss → wake() → load_lora()
+          6. Full memory recovery every step
 
         Reference: https://unsloth.ai/docs/new/faster-moe
         """
@@ -525,27 +606,26 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 for i, e in enumerate(unique_errs):
                     logger.error(f"  rollout error [{i+1}]: {e}")
 
-            # ---- Collect completions from rollout for training ----
-            completions = []
-            for req in sm.request_metrics:
-                if not req.error and req.completion_tokens > 0:
-                    # Use prompts as training texts (completions aren't stored
-                    # in RequestMetrics, so we use the prompt text + a simple
-                    # continuation as training signal)
-                    pass
-            # Build training texts from prompts (system + user messages)
-            train_texts = []
-            for msgs in prompts:
-                text = " ".join(m["content"] for m in msgs)
-                train_texts.append(text)
-
-            # ---- Training (sleep → Unsloth → wake → load_lora) ----
+            # ---- Collect completions for training (same as vLLM/SGLang) ----
+            # This mirrors do_rollout_for_training: generate completions,
+            # compute rewards, group into batches of 4.
             sm.training_start = time.perf_counter()
+
+            train_data = await _collect_completions(
+                base_url, mname, prompts, max_tokens=256, conc=8,
+            )
+            _compute_grpo_advantages(train_data, group_size=4)
+
+            ok = sum(1 for d in train_data if not d.get("error"))
+            logger.info(f"  collected {ok}/{len(train_data)} completions for GRPO training")
+
+            # ---- Training (sleep → Unsloth GRPO → wake → load_lora) ----
             try:
-                train_result = await svc.train_step(train_texts, lr=lr)
+                train_result = await svc.train_step(train_data, lr=lr)
                 logger.info(
                     f"  train loss={train_result.get('loss', '?'):.4f}  "
-                    f"overhead={train_result.get('total_overhead_s', 0):.1f}s"
+                    f"overhead={train_result.get('total_overhead_s', 0):.1f}s  "
+                    f"(GRPO-style, advantage-weighted)"
                 )
             except Exception as e:
                 logger.error(f"  train failed: {e}", exc_info=True)

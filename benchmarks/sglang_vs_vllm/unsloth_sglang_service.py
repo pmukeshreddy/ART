@@ -367,16 +367,29 @@ class UnslothSGLangService:
     # Training step — self-contained, no ART
     # ------------------------------------------------------------------
 
-    def _train_on_texts(
+    def _train_on_completions(
         self,
-        texts: list[str],
+        train_data: list[dict],
         lr: float | None = None,
     ) -> dict[str, float]:
-        """Run one training step on a list of text completions.
+        """GRPO-style training on completions with advantage-weighted loss.
 
-        This is the actual forward+backward pass that exercises Unsloth's
-        MoE Triton kernels (grouped-GEMM) and Split LoRA optimization.
-        The texts come from the rollout completions.
+        This mirrors what Megatron GRPO does for vLLM/SGLang backends:
+          1. Loss only on completion tokens (prompt tokens masked with -100)
+          2. Per-sample loss weighted by group-relative advantage
+          3. Same gradient accumulation + clipping
+
+        The forward/backward exercises Unsloth's MoE Triton kernels
+        (grouped-GEMM) and Split LoRA optimization on real completions.
+
+        Args:
+            train_data: List of dicts with keys:
+                - prompt: list of message dicts (chat format)
+                - completion: str (model-generated text)
+                - reward: float
+                - advantage: float (group-relative, computed by caller)
+                - error: bool
+            lr: Learning rate override.
         """
         state = self._training_state
         assert state is not None
@@ -388,42 +401,130 @@ class UnslothSGLangService:
             for pg in state.optimizer.param_groups:
                 pg["lr"] = lr
 
-        # Tokenize
-        encodings = state.tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_seq_length,
-        ).to(device)
-        input_ids = encodings["input_ids"]
-        attention_mask = encodings["attention_mask"]
+        # ---- Tokenize: prompt + completion, mask prompt tokens ----
+        input_ids_list: list[list[int]] = []
+        labels_list: list[list[int]] = []
+        advantages_list: list[float] = []
+
+        for item in train_data:
+            if item.get("error") or not item.get("completion"):
+                continue
+
+            msgs = item["prompt"]
+            completion = item["completion"]
+            advantage = item.get("advantage", 1.0)
+
+            # Tokenize prompt only (to know where completion starts)
+            prompt_text = state.tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+            )
+            prompt_ids = state.tokenizer.encode(
+                prompt_text, add_special_tokens=False,
+            )
+
+            # Tokenize full conversation (prompt + assistant completion)
+            full_msgs = msgs + [{"role": "assistant", "content": completion}]
+            full_text = state.tokenizer.apply_chat_template(
+                full_msgs, tokenize=False, add_generation_prompt=False,
+            )
+            full_ids = state.tokenizer.encode(
+                full_text, add_special_tokens=False,
+            )
+
+            # Truncate to max_seq_length
+            full_ids = full_ids[: self.max_seq_length]
+
+            # Labels: -100 for prompt tokens, actual ids for completion tokens
+            n_prompt = min(len(prompt_ids), len(full_ids))
+            labels = [-100] * n_prompt + full_ids[n_prompt:]
+            labels = labels[: self.max_seq_length]
+
+            # Skip if no completion tokens survived truncation
+            if len(full_ids) <= n_prompt:
+                continue
+
+            input_ids_list.append(full_ids)
+            labels_list.append(labels)
+            advantages_list.append(advantage)
+
+        if not input_ids_list:
+            logger.warning("  no valid completions to train on")
+            return {
+                "loss": 0.0, "training_time_s": 0.0, "tokens_per_sec": 0.0,
+                "gpu_memory_gb": 0.0, "total_tokens": 0, "batch_size": 0, "seq_len": 0,
+            }
+
+        # ---- Pad to uniform length ----
+        max_len = max(len(ids) for ids in input_ids_list)
+        pad_id = state.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = state.tokenizer.eos_token_id or 0
+
+        padded_ids, padded_labels, attn_masks = [], [], []
+        for ids, labs in zip(input_ids_list, labels_list):
+            pad_len = max_len - len(ids)
+            padded_ids.append(ids + [pad_id] * pad_len)
+            padded_labels.append(labs + [-100] * pad_len)
+            attn_masks.append([1] * len(ids) + [0] * pad_len)
+
+        input_ids = torch.tensor(padded_ids, device=device)
+        labels = torch.tensor(padded_labels, device=device)
+        attention_mask = torch.tensor(attn_masks, device=device)
+        advantages = torch.tensor(advantages_list, device=device, dtype=torch.float32)
+
         batch_size, seq_len = input_ids.shape
+        completion_tokens = int((labels != -100).sum().item())
+        logger.info(
+            f"  training: {batch_size} seqs, max_len={seq_len}, "
+            f"completion_tokens={completion_tokens} (GRPO-style)"
+        )
 
-        logger.info(f"  training: {batch_size} seqs, max_len={seq_len}")
-
+        # ---- Forward/backward with advantage-weighted loss ----
         t0 = time.perf_counter()
         total_loss = 0.0
         n_micro = 0
 
-        # Microbatch to fit in memory
         mb = max(1, min(batch_size, 4))
         accum_steps = max(1, batch_size // mb)
+
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
 
         state.optimizer.zero_grad()
         for i in range(0, batch_size, mb):
             mb_ids = input_ids[i:i + mb]
             mb_mask = attention_mask[i:i + mb]
+            mb_labels = labels[i:i + mb]
+            mb_adv = advantages[i:i + mb]
 
-            outputs = state.model(
-                input_ids=mb_ids,
-                attention_mask=mb_mask,
-                labels=mb_ids,
+            # Forward
+            logits = state.model(
+                input_ids=mb_ids, attention_mask=mb_mask,
+            ).logits
+
+            # Next-token prediction: shift by one
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = mb_labels[..., 1:].contiguous()
+
+            # Per-token cross-entropy (no reduction)
+            per_token_loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            ).view(shift_labels.shape)
+
+            # Mask: only completion tokens (labels != -100)
+            mask = (shift_labels != -100).float()
+
+            # Per-sample mean loss over completion tokens
+            per_sample_loss = (
+                (per_token_loss * mask).sum(dim=-1)
+                / mask.sum(dim=-1).clamp(min=1)
             )
-            loss = outputs.loss / accum_steps
-            loss.backward()
 
-            total_loss += outputs.loss.item()
+            # Weight by GRPO advantage and accumulate
+            weighted_loss = (per_sample_loss * mb_adv).mean() / accum_steps
+            weighted_loss.backward()
+
+            total_loss += per_sample_loss.mean().item()
             n_micro += 1
 
         torch.nn.utils.clip_grad_norm_(
@@ -435,21 +536,20 @@ class UnslothSGLangService:
 
         elapsed = time.perf_counter() - t0
         avg_loss = total_loss / max(n_micro, 1)
-        total_tokens = int(attention_mask.sum().item())
         gpu_mem_gb = torch.cuda.max_memory_allocated() / 1e9
         torch.cuda.reset_peak_memory_stats()
 
         logger.info(
-            f"  trained: loss={avg_loss:.4f}  {total_tokens / elapsed:.0f} tok/s  "
-            f"VRAM={gpu_mem_gb:.1f}GB  {elapsed:.2f}s"
+            f"  trained: loss={avg_loss:.4f}  {completion_tokens / elapsed:.0f} tok/s  "
+            f"VRAM={gpu_mem_gb:.1f}GB  {elapsed:.2f}s (GRPO advantage-weighted)"
         )
 
         return {
             "loss": avg_loss,
             "training_time_s": elapsed,
-            "tokens_per_sec": total_tokens / elapsed,
+            "tokens_per_sec": completion_tokens / elapsed,
             "gpu_memory_gb": gpu_mem_gb,
-            "total_tokens": total_tokens,
+            "total_tokens": completion_tokens,
             "batch_size": batch_size,
             "seq_len": seq_len,
         }
@@ -505,13 +605,21 @@ class UnslothSGLangService:
 
     async def train_step(
         self,
-        texts: list[str],
+        train_data: list[dict],
         lr: float | None = None,
     ) -> dict[str, float]:
         """One complete training step with full memory recovery.
 
+        GRPO-style: trains on completions with advantage-weighted loss,
+        matching the Megatron GRPO training done by vLLM/SGLang backends.
+
         Args:
-            texts: Rollout completion texts to train on.
+            train_data: List of dicts from _collect_completions, each with:
+                - prompt: list of message dicts
+                - completion: str (model-generated)
+                - reward: float
+                - advantage: float (group-relative)
+                - error: bool
             lr: Learning rate override (optional).
 
         Returns:
@@ -531,8 +639,8 @@ class UnslothSGLangService:
             self._training_state.reload_to_gpu()
         timings["model_load_s"] = time.perf_counter() - t
 
-        # 3. Train
-        train_metrics = self._train_on_texts(texts, lr=lr)
+        # 3. Train (GRPO-style: advantage-weighted loss on completions)
+        train_metrics = self._train_on_completions(train_data, lr=lr)
 
         # 4. Save LoRA
         t = time.perf_counter()
