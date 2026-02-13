@@ -353,6 +353,11 @@ class UnslothSGLangService:
             random_state=3407,
         )
 
+        # REQUIRED: Prepare model for training — Unsloth patches dtype handling,
+        # gradient checkpointing hooks, and MoE router dispatch. Without this,
+        # the MoE router gate gets float32 hidden_states but BF16 weights.
+        FastLanguageModel.for_training(model)
+
         trainable = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             trainable, lr=self.learning_rate, betas=(0.9, 0.99), weight_decay=0.1,
@@ -496,32 +501,37 @@ class UnslothSGLangService:
             mb_labels = labels[i:i + mb]
             mb_adv = advantages[i:i + mb]
 
-            # Forward
-            logits = state.model(
-                input_ids=mb_ids, attention_mask=mb_mask,
-            ).logits
+            # autocast keeps intermediate activations in BF16 — prevents
+            # dtype mismatch in MoE router (float32 hidden_states vs BF16 gate).
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                # Forward
+                logits = state.model(
+                    input_ids=mb_ids, attention_mask=mb_mask,
+                ).logits
 
-            # Next-token prediction: shift by one
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = mb_labels[..., 1:].contiguous()
+                # Next-token prediction: shift by one
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = mb_labels[..., 1:].contiguous()
 
-            # Per-token cross-entropy (no reduction)
-            per_token_loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            ).view(shift_labels.shape)
+                # Per-token cross-entropy (no reduction)
+                per_token_loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                ).view(shift_labels.shape)
 
-            # Mask: only completion tokens (labels != -100)
-            mask = (shift_labels != -100).float()
+                # Mask: only completion tokens (labels != -100)
+                mask = (shift_labels != -100).float()
 
-            # Per-sample mean loss over completion tokens
-            per_sample_loss = (
-                (per_token_loss * mask).sum(dim=-1)
-                / mask.sum(dim=-1).clamp(min=1)
-            )
+                # Per-sample mean loss over completion tokens
+                per_sample_loss = (
+                    (per_token_loss * mask).sum(dim=-1)
+                    / mask.sum(dim=-1).clamp(min=1)
+                )
 
-            # Weight by GRPO advantage and accumulate
-            weighted_loss = (per_sample_loss * mb_adv).mean() / accum_steps
+                # Weight by GRPO advantage and accumulate
+                weighted_loss = (per_sample_loss * mb_adv).mean() / accum_steps
+
+            # backward outside autocast (GradScaler not needed for BF16)
             weighted_loss.backward()
 
             total_loss += per_sample_loss.mean().item()
