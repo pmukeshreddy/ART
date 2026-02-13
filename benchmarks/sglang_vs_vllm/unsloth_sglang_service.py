@@ -338,14 +338,21 @@ class UnslothSGLangService:
             load_in_4bit=self.load_in_4bit,
         )
 
-        # LoRA on MoE layers — gate_up_proj (fused in Transformers v5) and
-        # down_proj are the expert layers. Attention modules also included.
+        # LoRA on ATTENTION modules only — SGLang's LoRA hot-reload does not
+        # support MoE expert layers (gate_up_proj, down_proj).  PEFT warns
+        # "Unsupported layer type 'Qwen3MoeExperts'" and SGLang crashes when
+        # trying to serve inference with the loaded adapter.
+        #
+        # Unsloth's MoE Triton kernels (grouped_mm on H100, unsloth_triton on
+        # A100) still optimize the forward/backward pass through expert layers
+        # at the COMPUTATION level — that benefit is independent of LoRA.
+        # Split LoRA on experts is a training-memory optimization that we skip
+        # here to keep SGLang LoRA hot-reload working (<0.1s per step).
         model = FastLanguageModel.get_peft_model(
             model,
             r=self.lora_rank,
             target_modules=[
                 "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_up_proj", "down_proj",  # MoE expert layers (fused in TF v5)
             ],
             lora_alpha=self.lora_rank,  # alpha = rank per Unsloth MoE docs
             lora_dropout=0,  # Unsloth default: no dropout
@@ -666,6 +673,21 @@ class UnslothSGLangService:
 
         # 7. Hot-reload LoRA
         timings["lora_reload_s"] = await self._load_lora(ckpt, self._latest_step)
+
+        # 8. Health check — if SGLang crashed (e.g. LoRA incompatibility),
+        #    restart it so the next rollout doesn't fail.
+        if self._server is not None and not self._server.is_running:
+            logger.warning("SGLang server died after LoRA load — restarting...")
+            t = time.perf_counter()
+            try:
+                await self._server.stop()
+            except Exception:
+                pass
+            self._server = self._create_server()
+            await self._server.start()
+            self._active_lora_name = None  # adapter lost on restart
+            timings["restart_s"] = time.perf_counter() - t
+            logger.warning(f"SGLang restarted in {timings['restart_s']:.1f}s (no LoRA)")
 
         timings["total_overhead_s"] = time.perf_counter() - t_total
 
