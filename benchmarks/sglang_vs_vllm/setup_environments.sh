@@ -166,9 +166,11 @@ cd "$PROJECT_ROOT"
 # Note: MoE nn.Parameter doesn't support bitsandbytes 4-bit yet → BF16/FP16 LoRA
 
 # Step 1: Install Unsloth packages
-if python3 -c "import unsloth" 2>/dev/null; then
-    UNSLOTH_VERSION=$(python3 -c "import unsloth; print(unsloth.__version__)" 2>/dev/null || echo "unknown")
-    success "Unsloth $UNSLOTH_VERSION is already installed"
+# Check if unsloth package files exist (don't try import — it may crash on
+# vllm._C ABI mismatch before we've had a chance to mock it)
+if python3 -c "import importlib.metadata; print(importlib.metadata.version('unsloth'))" 2>/dev/null; then
+    UNSLOTH_VERSION=$(python3 -c "import importlib.metadata; print(importlib.metadata.version('unsloth'))")
+    success "Unsloth $UNSLOTH_VERSION package is installed"
 else
     info "Unsloth not found. Installing..."
     uv_pip_install --upgrade unsloth unsloth_zoo
@@ -198,8 +200,19 @@ if [ "$NEED_TF_UPGRADE" = "yes" ] || [ "$NEED_TRL_UPGRADE" = "yes" ]; then
 fi
 
 # Step 3: Verify Unsloth import (show errors, don't swallow them)
+# Note: Unsloth's __init__ calls fix_vllm_guided_decoding_params() which tries
+# to import vllm._C. If vLLM's C extension has an ABI mismatch with PyTorch,
+# this crashes. We mock vllm._C before importing since we use SGLang, not vLLM.
 info "Verifying Unsloth import..."
-if python3 -c "import unsloth; print(f'Unsloth {unsloth.__version__}')"; then
+if python3 -c "
+import sys, types
+try:
+    import vllm._C
+except (ImportError, OSError):
+    sys.modules['vllm._C'] = types.ModuleType('vllm._C')
+import unsloth
+print(f'Unsloth {unsloth.__version__}')
+"; then
     success "Unsloth ready"
 else
     warn "Unsloth import failed (see error above). Unsloth backend may not work."

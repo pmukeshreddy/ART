@@ -32,7 +32,9 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import sys
 import time
+import types
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
@@ -41,6 +43,27 @@ import torch
 from .sglang_server import SGLangServer, SGLangServerConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_vllm_c_importable() -> None:
+    """Ensure ``import vllm._C`` won't crash before Unsloth is imported.
+
+    Unsloth's ``__init__`` calls ``fix_vllm_guided_decoding_params()`` which
+    chains into ``vllm._C``.  On systems where vLLM's C extension was compiled
+    against a different PyTorch ABI (common on cloud GPU images), this import
+    raises ``ImportError: undefined symbol …``.
+
+    Since we use SGLang (not vLLM) for inference, we create a harmless dummy
+    module so Unsloth's init completes without error.  vLLM itself is
+    unaffected — it runs in a separate subprocess with its own import state.
+    """
+    if "vllm._C" in sys.modules:
+        return  # already loaded successfully
+    try:
+        import vllm._C  # noqa: F401 — just a presence check
+    except (ImportError, OSError) as exc:
+        logger.info(f"Mocking vllm._C to avoid ABI crash: {exc}")
+        sys.modules["vllm._C"] = types.ModuleType("vllm._C")
 
 
 def _gc_and_empty_cuda_cache(n: int = 3) -> None:
@@ -248,6 +271,8 @@ class UnslothSGLangService:
           - unsloth_triton: A100, older PyTorch (custom Triton kernels)
           - native_torch: fallback (12x slower but VRAM savings still apply)
         """
+        # Ensure vllm._C is importable before Unsloth touches it
+        _ensure_vllm_c_importable()
         from unsloth import FastLanguageModel
 
         logger.info(f"Loading model: {self.base_model}")
