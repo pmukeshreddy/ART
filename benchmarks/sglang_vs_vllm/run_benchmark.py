@@ -448,8 +448,11 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
     ) -> list[dict]:
         """Collect completions for training — mirrors do_rollout_for_training.
 
-        Same flow as vLLM/SGLang: generate completions, compute rewards.
-        Uses aiohttp directly (no ART dependency) but identical semantics.
+        IDENTICAL to vLLM/SGLang path:
+          - Same max_tokens (256), temperature (1.0), logprobs (True)
+          - Same reward function: min(len(content) / 200.0, 1.0)
+          - Same concurrency (8)
+        Uses aiohttp directly (no ART dependency) but same server-side work.
         """
         sem = asyncio.Semaphore(conc)
 
@@ -464,6 +467,12 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                                 "messages": msgs,
                                 "max_tokens": max_tokens,
                                 "temperature": 1.0,
+                                # logprobs=True matches do_rollout_for_training —
+                                # same server-side overhead (log-prob computation).
+                                # With on_policy_correction=True the old logprobs
+                                # aren't used in training, but requesting them
+                                # ensures fair server-side cost comparison.
+                                "logprobs": True,
                             },
                             timeout=aiohttp.ClientTimeout(total=300),
                         ) as r:

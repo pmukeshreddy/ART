@@ -384,15 +384,23 @@ class UnslothSGLangService:
         train_data: list[dict],
         lr: float | None = None,
     ) -> dict[str, float]:
-        """GRPO-style training on completions with advantage-weighted loss.
+        """GRPO training on completions — mirrors src/art/loss.py exactly.
 
-        This mirrors what Megatron GRPO does for vLLM/SGLang backends:
-          1. Loss only on completion tokens (prompt tokens masked with -100)
-          2. Per-sample loss weighted by group-relative advantage
-          3. Same gradient accumulation + clipping
+        This implements the IDENTICAL loss formula as Megatron GRPO
+        (src/art/loss.py) with on_policy_correction=True, ref_logprobs=None:
+
+          1. Compute new_logprobs via log_softmax + gather (per token)
+          2. On-policy correction: old_logprobs = new_logprobs.detach()
+             → prob_ratio = exp(new - old) = 1.0
+          3. Clip ratio to [1-epsilon, 1+epsilon_high] = [0.0, 5.0]
+             (no-op since ratio=1.0, but matches Megatron code path)
+          4. policy_loss = -(clipped_ratio * advantage * new_logprobs)
+          5. No KL penalty (ref_logprobs=None → kl_div=0, beta=0)
+          6. Mask to completion tokens only (assistant_mask)
 
         The forward/backward exercises Unsloth's MoE Triton kernels
-        (grouped-GEMM) and Split LoRA optimization on real completions.
+        (grouped-GEMM) on real completions, same computational work
+        as Megatron minus the distributed overhead.
 
         Args:
             train_data: List of dicts with keys:
@@ -412,6 +420,13 @@ class UnslothSGLangService:
         if lr is not None:
             for pg in state.optimizer.param_groups:
                 pg["lr"] = lr
+
+        # ---- GRPO parameters (matching src/art/loss.py defaults) ----
+        # ppo=False → epsilon=1.0, epsilon_high=4.0
+        epsilon = 1.0       # clip lower: 1 - 1.0 = 0.0
+        epsilon_high = 4.0  # clip upper: 1 + 4.0 = 5.0
+        # beta = 0.0 (no KL penalty, ref_logprobs=None)
+        # on_policy_correction = True
 
         # ---- Tokenize: prompt + completion, mask prompt tokens ----
         input_ids_list: list[list[int]] = []
@@ -488,18 +503,16 @@ class UnslothSGLangService:
         completion_tokens = int((labels != -100).sum().item())
         logger.info(
             f"  training: {batch_size} seqs, max_len={seq_len}, "
-            f"completion_tokens={completion_tokens} (GRPO-style)"
+            f"completion_tokens={completion_tokens} (GRPO, mirrors art/loss.py)"
         )
 
-        # ---- Forward/backward with advantage-weighted loss ----
+        # ---- Forward/backward: Megatron GRPO loss formula ----
         t0 = time.perf_counter()
-        total_loss = 0.0
+        total_policy_loss = 0.0
         n_micro = 0
 
         mb = max(1, min(batch_size, 4))
         accum_steps = max(1, batch_size // mb)
-
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
 
         state.optimizer.zero_grad()
         for i in range(0, batch_size, mb):
@@ -508,40 +521,63 @@ class UnslothSGLangService:
             mb_labels = labels[i:i + mb]
             mb_adv = advantages[i:i + mb]
 
-            # autocast keeps intermediate activations in BF16 — prevents
-            # dtype mismatch in MoE router (float32 hidden_states vs BF16 gate).
+            # autocast keeps activations in BF16 — prevents dtype mismatch
+            # in MoE router (float32 hidden_states vs BF16 gate weights).
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                # Forward
+                # Forward pass
                 logits = state.model(
                     input_ids=mb_ids, attention_mask=mb_mask,
                 ).logits
 
-                # Next-token prediction: shift by one
+                # ---- Megatron GRPO loss (src/art/loss.py) ----
+                # Shift for next-token prediction
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = mb_labels[..., 1:].contiguous()
 
-                # Per-token cross-entropy (no reduction)
-                per_token_loss = loss_fct(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                ).view(shift_labels.shape)
+                # Step 1: Compute new_logprobs (per-token log probability)
+                # Matches: new_logprobs = -model(input_ids, labels=shifted)
+                log_probs = torch.nn.functional.log_softmax(
+                    shift_logits, dim=-1,
+                )
+                # Gather log-prob of the actual token at each position
+                token_ids = shift_labels.clamp(min=0)  # -100 → 0 (masked later)
+                new_logprobs = log_probs.gather(
+                    dim=-1, index=token_ids.unsqueeze(-1),
+                ).squeeze(-1)
 
-                # Mask: only completion tokens (labels != -100)
-                mask = (shift_labels != -100).float()
+                # Step 2: On-policy correction (on_policy_correction=True)
+                # old_logprobs = new_logprobs.detach()
+                old_logprobs = new_logprobs.detach()
 
-                # Per-sample mean loss over completion tokens
-                per_sample_loss = (
-                    (per_token_loss * mask).sum(dim=-1)
-                    / mask.sum(dim=-1).clamp(min=1)
+                # Step 3: Probability ratio + clipping
+                # prob_ratio = exp(new - old) = exp(0) = 1.0
+                logprob_diff = new_logprobs - old_logprobs
+                prob_ratio = torch.exp(logprob_diff)
+                clipped_ratio = torch.clip(
+                    prob_ratio.detach(),
+                    1.0 - epsilon,      # 0.0
+                    1.0 + epsilon_high,  # 5.0
                 )
 
-                # Weight by GRPO advantage and accumulate
-                weighted_loss = (per_sample_loss * mb_adv).mean() / accum_steps
+                # Step 4: Policy loss (same formula as src/art/loss.py)
+                # policy_loss = -(clipped_ratio * advantages * new_logprobs)
+                # Expand advantages from [B] to [B, T] for per-token multiplication
+                per_token_advantages = mb_adv.unsqueeze(-1).expand_as(new_logprobs)
+                policy_loss = -(clipped_ratio * per_token_advantages * new_logprobs)
+
+                # Step 5: Mask to completion tokens only (assistant_mask)
+                assistant_mask = (shift_labels != -100).float()
+
+                # Step 6: Mean over completion tokens, then over batch
+                # (No KL penalty: ref_logprobs=None, beta=0)
+                masked_loss = (policy_loss * assistant_mask).sum(dim=-1)
+                per_sample_loss = masked_loss / assistant_mask.sum(dim=-1).clamp(min=1)
+                batch_loss = per_sample_loss.mean() / accum_steps
 
             # backward outside autocast (GradScaler not needed for BF16)
-            weighted_loss.backward()
+            batch_loss.backward()
 
-            total_loss += per_sample_loss.mean().item()
+            total_policy_loss += per_sample_loss.mean().item()
             n_micro += 1
 
         torch.nn.utils.clip_grad_norm_(
@@ -552,13 +588,13 @@ class UnslothSGLangService:
         state.optimizer.zero_grad()
 
         elapsed = time.perf_counter() - t0
-        avg_loss = total_loss / max(n_micro, 1)
+        avg_loss = total_policy_loss / max(n_micro, 1)
         gpu_mem_gb = torch.cuda.max_memory_allocated() / 1e9
         torch.cuda.reset_peak_memory_stats()
 
         logger.info(
             f"  trained: loss={avg_loss:.4f}  {completion_tokens / elapsed:.0f} tok/s  "
-            f"VRAM={gpu_mem_gb:.1f}GB  {elapsed:.2f}s (GRPO advantage-weighted)"
+            f"VRAM={gpu_mem_gb:.1f}GB  {elapsed:.2f}s (GRPO, mirrors art/loss.py)"
         )
 
         return {
