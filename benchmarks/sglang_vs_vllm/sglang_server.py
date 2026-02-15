@@ -422,7 +422,7 @@ class SGLangServer:
                     if r.status != 200:
                         body = await r.text()
                         logger.warning(
-                            f"load_lora_adapter failed: {r.status} {body[:200]}"
+                            f"load_lora_adapter failed: {r.status} {body}"
                         )
                         return -1.0
 
