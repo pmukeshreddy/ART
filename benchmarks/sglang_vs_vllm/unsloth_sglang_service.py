@@ -8,19 +8,20 @@ Unsloth is fully self-contained:
   - Auto-selects best backend (grouped_mm / unsloth_triton / native_torch)
   - load_in_4bit=False required (MoE nn.Parameter doesn't support bnb 4bit yet)
 
-Architecture:
+Architecture (verl-style, same GPUs via sleep/wake — matches SGLang+Megatron):
   - SGLang server starts ONCE and NEVER restarts
-  - Unsloth training runs in a PERSISTENT SUBPROCESS (model stays on GPU)
-  - sleep/wake for memory management between inference and training
+  - Unsloth training runs in a PERSISTENT SUBPROCESS
+  - Training and inference time-share the same GPUs via sleep/wake
   - LoRA hot-reload for weight sync (<2s)
-  - No CPU offload — model loaded once, stays on GPU permanently
 
 Training loop (per step):
-  1. generate()     — SGLang active, KV cache + weights on GPU
-  2. sleep()        — release KV cache AND weights
-  3. Unsloth train  — model already on GPU in subprocess (no reload!)
-  4. wake_up()      — restore base weights + KV cache
-  5. load_lora()    — hot-reload ~2MB adapter
+  1. generate()       — SGLang active, KV cache + weights on GPU
+  2. sleep()          — SGLang releases KV cache AND weights
+  3. reload_to_gpu()  — Unsloth model back to GPU from CPU
+  4. Unsloth train    — GRPO training on completions
+  5. offload_to_cpu() — Unsloth model to CPU, free GPU
+  6. wake_up()        — SGLang restores base weights + KV cache
+  7. load_lora()      — hot-reload ~2MB adapter
 
 Reference:
   - https://unsloth.ai/docs/new/faster-moe
@@ -126,7 +127,7 @@ def _gc_and_empty_cuda_cache(n: int = 3) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Unsloth Training State — model persists across steps, offloads between
+# Unsloth Training State — model persists across steps, offloads to CPU between
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -181,11 +182,11 @@ class UnslothTrainingState:
 # ---------------------------------------------------------------------------
 
 class UnslothTrainingWorker:
-    """Persistent training worker — model stays on GPU permanently.
+    """Training worker — runs in a persistent subprocess via mp_actors.
 
-    Runs in a subprocess via mp_actors.move_to_child_process(). The model is
-    loaded to GPU once at init_model() and NEVER offloaded to CPU, eliminating
-    the ~50s per-step CPU<->GPU transfer overhead.
+    Matches the SGLang+Megatron pattern: training and inference time-share
+    the same GPUs. Between steps, the model is offloaded to CPU so SGLang
+    can reclaim GPU memory for inference.
 
     Communication with the parent process is via mp_actors proxy (pickle over
     multiprocessing queues). Only lightweight data crosses the boundary:
@@ -203,7 +204,6 @@ class UnslothTrainingWorker:
         learning_rate: float = 5e-6,
         moe_backend: str = "auto",
         load_in_4bit: bool = False,
-        cuda_devices: str = "",
     ):
         self.base_model = base_model
         self.output_dir = output_dir
@@ -212,15 +212,10 @@ class UnslothTrainingWorker:
         self.learning_rate = learning_rate
         self.moe_backend = moe_backend
         self.load_in_4bit = load_in_4bit
-        self.cuda_devices = cuda_devices
         self._state: UnslothTrainingState | None = None
 
     async def init_model(self) -> dict[str, Any]:
-        """Load model to GPU. Called once in subprocess. Model stays permanently."""
-        if self.cuda_devices:
-            os.environ["CUDA_VISIBLE_DEVICES"] = self.cuda_devices
-            logger.info(f"CUDA_VISIBLE_DEVICES={self.cuda_devices}")
-
+        """Load model to GPU. Called once in subprocess."""
         if self.moe_backend != "auto":
             os.environ["UNSLOTH_MOE_BACKEND"] = self.moe_backend
 
@@ -268,7 +263,7 @@ class UnslothTrainingWorker:
         """GRPO training on completions — mirrors src/art/loss.py exactly.
 
         Same loss formula as Megatron GRPO with on_policy_correction=True.
-        Model is already on GPU (loaded once at init_model), so no reload needed.
+        Model must be on GPU (via init_model or reload_to_gpu) before calling.
         """
         state = self._state
         assert state is not None
@@ -439,6 +434,28 @@ class UnslothTrainingWorker:
             "seq_len": seq_len,
         }
 
+    async def offload_to_cpu(self) -> dict[str, float]:
+        """Offload model + optimizer to CPU, freeing GPU for SGLang wake_up.
+
+        Matches the SGLang+Megatron pattern: training and inference time-share
+        the same GPUs via sleep/wake. After training, offload frees GPU memory
+        so SGLang can restore its weights + KV cache.
+        """
+        assert self._state is not None, "init_model() must be called first"
+        t0 = time.perf_counter()
+        self._state.offload_to_cpu()
+        return {"offload_time_s": time.perf_counter() - t0}
+
+    async def reload_to_gpu(self) -> dict[str, float]:
+        """Reload model + optimizer to GPU for training.
+
+        Called after SGLang sleeps and frees GPU memory.
+        """
+        assert self._state is not None, "init_model() must be called first"
+        t0 = time.perf_counter()
+        self._state.reload_to_gpu()
+        return {"reload_time_s": time.perf_counter() - t0}
+
     async def save_lora(self, step: int) -> str:
         """Save LoRA adapter via PEFT save_pretrained (standard format)."""
         assert self._state is not None
@@ -561,18 +578,6 @@ class UnslothSGLangService:
         # Model loading happens later in init_model() after SGLang sleeps.
         from mp_actors import move_to_child_process
 
-        # Assign training GPUs that don't overlap with SGLang's TP ranks.
-        # SGLang uses GPUs 0..tp-1; training uses the remaining GPUs.
-        num_gpus = torch.cuda.device_count()
-        tp = self.tensor_parallel_size
-        if num_gpus > tp:
-            train_gpus = ",".join(str(i) for i in range(tp, num_gpus))
-        else:
-            # Fallback: share GPUs (sleep/wake handles memory)
-            train_gpus = ""
-        if train_gpus:
-            logger.info(f"Training GPUs: {train_gpus} (SGLang uses 0..{tp-1})")
-
         worker = UnslothTrainingWorker(
             base_model=self.base_model,
             output_dir=self.output_dir,
@@ -581,7 +586,6 @@ class UnslothSGLangService:
             learning_rate=self.learning_rate,
             moe_backend=self.moe_backend,
             load_in_4bit=self.load_in_4bit,
-            cuda_devices=train_gpus,
         )
         self._worker = move_to_child_process(
             worker,
@@ -672,14 +676,20 @@ class UnslothSGLangService:
         train_data: list[dict],
         lr: float | None = None,
     ) -> dict[str, float]:
-        """One complete training step — model stays on GPU in subprocess.
+        """One complete training step — verl-style, same GPUs via sleep/wake.
 
-        Unlike the old approach (load from CPU → train → offload to CPU),
-        the model is loaded ONCE on the first call and stays on GPU in
-        the persistent subprocess. Subsequent steps skip the ~50s offload.
+        Matches the SGLang+Megatron pattern: training and inference time-share
+        the same GPUs. SGLang sleeps (frees GPU), Unsloth trains, Unsloth
+        offloads to CPU, SGLang wakes up (restores GPU).
 
-        GRPO-style: trains on completions with advantage-weighted loss,
-        matching the Megatron GRPO training done by vLLM/SGLang backends.
+        Loop:
+          1. sleep()          — SGLang releases KV cache + weights
+          2. reload_to_gpu()  — Unsloth model back to GPU (skip on first call)
+          3. train             — GRPO training on completions
+          4. save_lora()      — save adapter to disk
+          5. offload_to_cpu() — Unsloth model to CPU, free GPU
+          6. wake_up()        — SGLang restores KV cache + weights
+          7. load_lora()      — hot-reload adapter (<2s)
 
         Args:
             train_data: List of dicts from _collect_completions, each with:
@@ -706,11 +716,15 @@ class UnslothSGLangService:
         if not self._worker_initialized:
             init_result = await self._worker.init_model()
             n_params = init_result.get("trainable_params", "?")
-            logger.info(f"Unsloth worker model loaded — {n_params:,} trainable params (persistent)")
+            logger.info(f"Unsloth worker model loaded — {n_params:,} trainable params")
             self._worker_initialized = True
+        else:
+            # Reload from CPU — model was offloaded after previous step
+            reload_result = await self._worker.reload_to_gpu()
+            timings["reload_s"] = reload_result.get("reload_time_s", 0)
         timings["model_load_s"] = time.perf_counter() - t
 
-        # 3. Train — model already on GPU in subprocess, no reload needed!
+        # 3. Train — model on GPU, SGLang asleep
         train_metrics = await self._worker.train_on_completions(train_data, lr)
 
         # 4. Save LoRA
@@ -719,14 +733,18 @@ class UnslothSGLangService:
         ckpt = await self._worker.save_lora(self._latest_step)
         timings["save_s"] = time.perf_counter() - t
 
-        # 5. Wake SGLang — NO offload needed! Model stays on GPU in subprocess.
+        # 5. Offload Unsloth model to CPU — free GPU for SGLang
+        t = time.perf_counter()
+        offload_result = await self._worker.offload_to_cpu()
+        timings["offload_s"] = offload_result.get("offload_time_s", 0)
+
+        # 6. Wake SGLang — GPU is now free, restore weights + KV cache
         timings["wake_s"] = await self.wake_up()
 
-        # 6. Hot-reload LoRA
+        # 7. Hot-reload LoRA
         timings["lora_reload_s"] = await self._load_lora(ckpt, self._latest_step)
 
-        # 7. Health check — if SGLang crashed (e.g. LoRA incompatibility),
-        #    restart it so the next rollout doesn't fail.
+        # 8. Health check — if SGLang crashed, restart
         if self._server is not None and not self._server.is_running:
             logger.warning("SGLang server died after LoRA load — restarting...")
             t = time.perf_counter()
@@ -736,7 +754,7 @@ class UnslothSGLangService:
                 pass
             self._server = self._create_server()
             await self._server.start()
-            self._active_lora_name = None  # adapter lost on restart
+            self._active_lora_name = None
             timings["restart_s"] = time.perf_counter() - t
             logger.warning(f"SGLang restarted in {timings['restart_s']:.1f}s (no LoRA)")
 
