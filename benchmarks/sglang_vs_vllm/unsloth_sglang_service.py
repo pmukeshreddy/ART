@@ -552,10 +552,11 @@ class UnslothSGLangService:
             enable_memory_saver=True,
             enable_lora=True,
             max_lora_rank=max(8, self.lora_rank),
-            # Use the default lora_target_modules (q/k/v/o/gate/up/down_proj)
-            # — same as the SGLang+Megatron backend. Don't use "all" as it
-            # pre-allocates LoRA memory for every linear layer including MoE
-            # experts, which is too large at rank 16.
+            # Must match EXACTLY the modules Unsloth trains. The default
+            # includes gate/up/down_proj which exist in every MoE expert —
+            # at rank 16 that makes the LoRA pool too large. The Megatron
+            # backend gets away with the default because it uses rank=1.
+            lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         ))
 
     async def start(self) -> float:
