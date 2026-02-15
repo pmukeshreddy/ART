@@ -464,11 +464,14 @@ class UnslothTrainingWorker:
         os.makedirs(ckpt, exist_ok=True)
 
         self._state.model.save_pretrained(ckpt)
-        self._state.tokenizer.save_pretrained(ckpt)
-
-        # NOTE: do NOT rewrite target_modules here — let raw PEFT names
-        # (q_proj, k_proj, …) pass through to SGLang.  The Megatron backend
-        # also uses raw names in its adapter_config.json and it works.
+        # NOTE: do NOT save tokenizer here.  tokenizer.save_pretrained()
+        # writes added_tokens.json to the same directory.  SGLang's
+        # LoRAConfig reads that file and treats it as LoRA vocabulary
+        # additions, making can_support() fail because the memory pool
+        # has lora_added_tokens_size=0.  The Megatron backend also does
+        # NOT save the tokenizer alongside the adapter.
+        # SGLang uses its own tokenizer — the adapter only needs
+        # adapter_config.json + adapter_model.safetensors.
 
         adapter = os.path.join(ckpt, "adapter_model.safetensors")
         if os.path.exists(adapter):
