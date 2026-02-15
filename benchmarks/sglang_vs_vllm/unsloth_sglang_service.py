@@ -203,6 +203,7 @@ class UnslothTrainingWorker:
         learning_rate: float = 5e-6,
         moe_backend: str = "auto",
         load_in_4bit: bool = False,
+        cuda_devices: str = "",
     ):
         self.base_model = base_model
         self.output_dir = output_dir
@@ -211,10 +212,15 @@ class UnslothTrainingWorker:
         self.learning_rate = learning_rate
         self.moe_backend = moe_backend
         self.load_in_4bit = load_in_4bit
+        self.cuda_devices = cuda_devices
         self._state: UnslothTrainingState | None = None
 
     async def init_model(self) -> dict[str, Any]:
         """Load model to GPU. Called once in subprocess. Model stays permanently."""
+        if self.cuda_devices:
+            os.environ["CUDA_VISIBLE_DEVICES"] = self.cuda_devices
+            logger.info(f"CUDA_VISIBLE_DEVICES={self.cuda_devices}")
+
         if self.moe_backend != "auto":
             os.environ["UNSLOTH_MOE_BACKEND"] = self.moe_backend
 
@@ -555,6 +561,18 @@ class UnslothSGLangService:
         # Model loading happens later in init_model() after SGLang sleeps.
         from mp_actors import move_to_child_process
 
+        # Assign training GPUs that don't overlap with SGLang's TP ranks.
+        # SGLang uses GPUs 0..tp-1; training uses the remaining GPUs.
+        num_gpus = torch.cuda.device_count()
+        tp = self.tensor_parallel_size
+        if num_gpus > tp:
+            train_gpus = ",".join(str(i) for i in range(tp, num_gpus))
+        else:
+            # Fallback: share GPUs (sleep/wake handles memory)
+            train_gpus = ""
+        if train_gpus:
+            logger.info(f"Training GPUs: {train_gpus} (SGLang uses 0..{tp-1})")
+
         worker = UnslothTrainingWorker(
             base_model=self.base_model,
             output_dir=self.output_dir,
@@ -563,6 +581,7 @@ class UnslothSGLangService:
             learning_rate=self.learning_rate,
             moe_backend=self.moe_backend,
             load_in_4bit=self.load_in_4bit,
+            cuda_devices=train_gpus,
         )
         self._worker = move_to_child_process(
             worker,
