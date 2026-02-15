@@ -466,6 +466,17 @@ class UnslothTrainingWorker:
         self._state.model.save_pretrained(ckpt)
         self._state.tokenizer.save_pretrained(ckpt)
 
+        # Patch adapter_config.json for SGLang compatibility.
+        # SGLang internally fuses q/k/v_proj → qkv_proj and gate/up_proj →
+        # gate_up_proj.  The LoRA memory pool stores these *normalized* names.
+        # Some SGLang versions don't normalize the adapter's target_modules
+        # during can_support() validation, causing "incompatible memory pool"
+        # errors.  Rewriting the config to use normalized names fixes this.
+        # Weight loading is unaffected — SGLang's LoRAAdapter._normalize_weights()
+        # stacks the raw q/k/v_proj weight keys into qkv_proj regardless of
+        # what adapter_config.json says.
+        self._patch_adapter_config_for_sglang(ckpt)
+
         adapter = os.path.join(ckpt, "adapter_model.safetensors")
         if os.path.exists(adapter):
             mb = os.path.getsize(adapter) / 1e6
@@ -474,6 +485,38 @@ class UnslothTrainingWorker:
             logger.warning(f"adapter_model.safetensors not found in {ckpt}")
 
         return ckpt
+
+    @staticmethod
+    def _patch_adapter_config_for_sglang(ckpt_dir: str) -> None:
+        """Rewrite target_modules in adapter_config.json to SGLang-normalized names."""
+        import json
+
+        config_path = os.path.join(ckpt_dir, "adapter_config.json")
+        if not os.path.exists(config_path):
+            return
+
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+
+        # SGLang's get_normalized_target_modules() mapping (sglang/srt/lora/utils.py)
+        sglang_mapping = {
+            "q_proj": "qkv_proj",
+            "k_proj": "qkv_proj",
+            "v_proj": "qkv_proj",
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+        }
+
+        raw_modules = cfg.get("target_modules", [])
+        normalized = sorted(set(sglang_mapping.get(m, m) for m in raw_modules))
+
+        if normalized != sorted(raw_modules):
+            cfg["target_modules"] = normalized
+            with open(config_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+            logger.info(
+                f"Patched adapter_config.json for SGLang: {sorted(raw_modules)} → {normalized}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -551,12 +594,15 @@ class UnslothSGLangService:
             chunked_prefill_size=32768,
             enable_memory_saver=True,
             enable_lora=True,
-            max_lora_rank=max(8, self.lora_rank),
-            # Must match EXACTLY the modules Unsloth trains. The default
-            # includes gate/up/down_proj which exist in every MoE expert —
-            # at rank 16 that makes the LoRA pool too large. The Megatron
-            # backend gets away with the default because it uses rank=1.
-            lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            # Use 2x adapter rank as safety margin — some SGLang versions
+            # may have edge cases with rank == max_lora_rank.
+            max_lora_rank=max(8, self.lora_rank * 2),
+            # Use SGLang-normalized module names directly. SGLang fuses
+            # q/k/v_proj → qkv_proj internally. Passing normalized names
+            # avoids can_support() mismatches in older SGLang versions.
+            # Excludes MoE expert FFN modules (gate/up/down_proj) which
+            # would make the LoRA pool too large at rank 16.
+            lora_target_modules=["qkv_proj", "o_proj"],
         ))
 
     async def start(self) -> float:
