@@ -552,11 +552,10 @@ class UnslothSGLangService:
             enable_memory_saver=True,
             enable_lora=True,
             max_lora_rank=max(8, self.lora_rank),
-            # MoE models in Transformers v5 use fused "gate_up_proj" instead of
-            # separate "gate_proj"/"up_proj". Use "all" so SGLang accepts any
-            # module the Unsloth adapter targets (including gate_up_proj).
-            # SGLang auto-drops unsupported modules (e.g. embed_tokens for csgmv).
-            lora_target_modules=["all"],
+            # Match the exact modules Unsloth trains. Using "all" makes SGLang
+            # pre-allocate a LoRA memory pool for EVERY linear layer (including
+            # all MoE experts), which is huge at rank 16 and fails to load.
+            lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         ))
 
     async def start(self) -> float:
