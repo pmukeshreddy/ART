@@ -213,7 +213,7 @@ class UnslothTrainingWorker:
         self.load_in_4bit = load_in_4bit
         self._state: UnslothTrainingState | None = None
 
-    def init_model(self) -> dict[str, Any]:
+    async def init_model(self) -> dict[str, Any]:
         """Load model to GPU. Called once in subprocess. Model stays permanently."""
         if self.moe_backend != "auto":
             os.environ["UNSLOTH_MOE_BACKEND"] = self.moe_backend
@@ -254,7 +254,7 @@ class UnslothTrainingWorker:
         self._state = UnslothTrainingState(model=model, tokenizer=tokenizer, optimizer=optimizer)
         return {"trainable_params": n_params}
 
-    def train_on_completions(
+    async def train_on_completions(
         self,
         train_data: list[dict],
         lr: float | None = None,
@@ -433,7 +433,7 @@ class UnslothTrainingWorker:
             "seq_len": seq_len,
         }
 
-    def save_lora(self, step: int) -> str:
+    async def save_lora(self, step: int) -> str:
         """Save LoRA adapter via PEFT save_pretrained (standard format)."""
         assert self._state is not None
 
