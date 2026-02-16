@@ -175,8 +175,10 @@ def main():
         trainable, lr=lr, betas=(0.9, 0.99), weight_decay=0.1,
     )
 
-    # Wrap with DDP — only LoRA params have requires_grad=True
-    model = DDP(model, device_ids=[0], find_unused_parameters=True)
+    # Wrap with DDP — only LoRA params have requires_grad=True.
+    # static_graph=True is required because Unsloth uses gradient
+    # checkpointing which causes reentrant backward passes.
+    model = DDP(model, device_ids=[0], static_graph=True)
 
     if rank == 0:
         logger.info(f"DDP ready — {n_params:,} trainable params, {world_size} GPUs")
