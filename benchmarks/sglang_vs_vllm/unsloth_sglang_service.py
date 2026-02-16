@@ -777,7 +777,13 @@ class UnslothSGLangService:
           - Single dedicated GPU   → mp_actors subprocess
           - No dedicated GPU       → shared mode (sleep/wake)
         """
-        if self._dedicated_gpus and self.training_gpus and len(self.training_gpus) > 1:
+        use_ddp = (
+            self._dedicated_gpus
+            and self.training_gpus
+            and len(self.training_gpus) > 1
+            and num_sequences >= len(self.training_gpus)
+        )
+        if use_ddp:
             return await self._train_step_ddp(
                 packed_tensors_dir, num_sequences, sequence_length, lr,
             )

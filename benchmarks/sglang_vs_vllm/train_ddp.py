@@ -197,22 +197,33 @@ def main():
     )
 
     # Split sequences across ranks: rank i gets sequences [start:end]
-    seqs_per_rank = num_sequences // world_size
-    remainder = num_sequences % world_size
-    # Distribute remainder evenly: first `remainder` ranks get one extra
-    if rank < remainder:
-        start_idx = rank * (seqs_per_rank + 1)
-        end_idx = start_idx + seqs_per_rank + 1
+    if num_sequences < world_size:
+        # Fewer sequences than ranks — all ranks process all data.
+        # Each rank divides its loss by world_size to compensate for
+        # DDP's gradient averaging, keeping the effective LR the same.
+        start_idx = 0
+        end_idx = num_sequences
+        my_num_sequences = num_sequences
+        if rank == 0:
+            logger.info(
+                f"Sequence split: {num_sequences} total < {world_size} ranks, "
+                "all ranks process all data (replicated)"
+            )
     else:
-        start_idx = rank * seqs_per_rank + remainder
-        end_idx = start_idx + seqs_per_rank
-
-    my_num_sequences = end_idx - start_idx
-    if rank == 0:
-        logger.info(
-            f"Sequence split: {num_sequences} total, "
-            f"{my_num_sequences} per rank (rank 0: [{start_idx}:{end_idx}])"
-        )
+        seqs_per_rank = num_sequences // world_size
+        remainder = num_sequences % world_size
+        if rank < remainder:
+            start_idx = rank * (seqs_per_rank + 1)
+            end_idx = start_idx + seqs_per_rank + 1
+        else:
+            start_idx = rank * seqs_per_rank + remainder
+            end_idx = start_idx + seqs_per_rank
+        my_num_sequences = end_idx - start_idx
+        if rank == 0:
+            logger.info(
+                f"Sequence split: {num_sequences} total, "
+                f"{my_num_sequences} per rank (rank 0: [{start_idx}:{end_idx}])"
+            )
 
     # Training loop — same as UnslothTrainingWorker.train_on_packed_tensors
     model.train()
