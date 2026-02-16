@@ -30,6 +30,7 @@ Reference:
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
 import os
@@ -148,14 +149,39 @@ class UnslothTrainingState:
         if self._is_offloaded:
             return
         t0 = time.perf_counter()
-        self.model.to("cpu")
+
+        # Disable gradient checkpointing first — Unsloth's custom
+        # checkpointing may pin activations in CUDA memory.
+        try:
+            self.model.gradient_checkpointing_disable()
+        except Exception:
+            pass
+
+        # Move every parameter and buffer explicitly (handles cases where
+        # model.to("cpu") misses sub-modules or distributed shards).
+        for p in self.model.parameters():
+            if p.device.type == "cuda":
+                p.data = p.data.cpu()
+                if p.grad is not None:
+                    p.grad = p.grad.cpu()
+        for b in self.model.buffers():
+            if b.device.type == "cuda":
+                b.data = b.data.cpu()
+
+        # Move optimizer state
         for state in self.optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor) and v.device.type == "cuda":
                     state[k] = v.cpu()
+
         torch.cuda.synchronize()
         self._is_offloaded = True
-        _gc_and_empty_cuda_cache()
+
+        # Aggressive cleanup — repeat to catch reference cycles
+        for _ in range(3):
+            gc.collect()
+            torch.cuda.empty_cache()
+
         free_gb = torch.cuda.mem_get_info()[0] / 1e9
         logger.info(
             f"Unsloth offloaded to CPU in {time.perf_counter() - t0:.2f}s "
@@ -174,6 +200,16 @@ class UnslothTrainingState:
                     state[k] = v.to(device)
         torch.cuda.synchronize()
         self._is_offloaded = False
+
+        # Re-enable gradient checkpointing (disabled during offload)
+        try:
+            from unsloth import FastLanguageModel
+            FastLanguageModel.for_training(self.model)
+        except Exception:
+            try:
+                self.model.gradient_checkpointing_enable()
+            except Exception:
+                pass
         logger.info(f"Unsloth reloaded to GPU in {time.perf_counter() - t0:.2f}s")
 
 
@@ -219,6 +255,13 @@ class UnslothTrainingWorker:
 
     async def init_model(self) -> dict[str, Any]:
         """Load model to GPU. Called once in subprocess."""
+        # Pin training to a single GPU.  With multiple visible GPUs,
+        # Unsloth/HF may auto-distribute the model, making
+        # model.to("cpu") unable to free all GPU memory.  Setting
+        # CUDA_VISIBLE_DEVICES before any CUDA call ensures the model
+        # stays on one device — matching Megatron's single-device training.
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
         if self.moe_backend != "auto":
             os.environ["UNSLOTH_MOE_BACKEND"] = self.moe_backend
 
@@ -503,10 +546,9 @@ class UnslothSGLangService:
             enable_memory_saver=True,
             enable_lora=True,
             max_lora_rank=8,  # Megatron trains rank=1, headroom for future
-            # Match Megatron backend: use DEFAULT lora_target_modules
-            # (q/k/v/o_proj + gate/up/down_proj). Don't override — the
-            # Megatron backend also uses the default and it works.
-            # The adapter now targets all 7 modules (matches Megatron).
+            # Must match TRAINING target_modules (attention-only for MoE).
+            # gate/up/down_proj explode memory on MoE because of per-expert layers.
+            lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         ))
 
     async def start(self) -> float:
@@ -582,15 +624,29 @@ class UnslothSGLangService:
         return elapsed
 
     async def wake_up(self) -> float:
-        """Restore GPU memory after training."""
+        """Restore GPU memory after training (with retry)."""
         if self._server is None or not self._server.is_running:
             return 0.0
         t0 = time.perf_counter()
-        await self._server.wake_up(tags=["kv_cache", "weights"])
-        self._is_sleeping = False
-        elapsed = time.perf_counter() - t0
-        logger.info(f"SGLang awake (kv_cache + weights restored) — {elapsed:.2f}s")
-        return elapsed
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self._server.wake_up(tags=["kv_cache", "weights"])
+                self._is_sleeping = False
+                elapsed = time.perf_counter() - t0
+                logger.info(f"SGLang awake (kv_cache + weights restored) — {elapsed:.2f}s")
+                return elapsed
+            except Exception as e:
+                if attempt < max_attempts:
+                    wait = 5 * attempt
+                    logger.warning(
+                        f"wake_up() attempt {attempt}/{max_attempts} failed: {e}  "
+                        f"— waiting {wait}s before retry"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"wake_up() failed after {max_attempts} attempts: {e}")
+                    return 0.0
 
     # ------------------------------------------------------------------
     # LoRA hot-reload (save is now in UnslothTrainingWorker)
