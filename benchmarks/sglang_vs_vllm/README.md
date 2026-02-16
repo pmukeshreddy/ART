@@ -7,36 +7,39 @@ Benchmark for the Unsloth + SGLang backend that combines SGLang for inference wi
 ## Architecture — Dedicated GPU Split (Default)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  4-GPU Setup (Recommended Default)                              │
-│                                                                 │
-│  ┌─ GPUs 0, 2, 3 ────────────────┐  ┌─ GPU 1 ──────────────┐  │
-│  │  SGLang Server  (TP=3)         │  │  Unsloth Training     │  │
-│  │  • Always active (no sleep)    │  │  • Dedicated GPU      │  │
-│  │  • 3x inference throughput     │  │  • Fresh subprocess   │  │
-│  │                                │  │    per step           │  │
-│  │  ┌──────────┐  ┌────────────┐  │  │  • LoRA + Optimizer   │  │
-│  │  │  TP=3    │  │  LoRA      │  │  │  • ART loss function  │  │
-│  │  │  Model   │  │  Hot-reload│  │  │                       │  │
-│  │  │  Shards  │  │  < 2s      │  │  └───────────────────────┘  │
-│  │  └──────────┘  └────────────┘  │                              │
-│  └────────────────────────────────┘                              │
+┌──────────────────────────────────────────────────────────────────┐
+│  4-GPU Setup (Recommended Default)                               │
 │                                                                  │
-│  ✓ No sleep/wake overhead                                        │
-│  ✓ SGLang stays active during training                           │
-│  ✓ Higher inference throughput (TP=3 vs TP=2)                    │
-│  ✓ Generation is 70-90% of RL time → more inference GPUs = win   │
-└──────────────────────────────────────────────────────────────────┘
+│  ┌─ GPUs 0, 2 (TP=2) ────────────┐  ┌─ GPU 1 ──────────────┐   │
+│  │  SGLang Server                  │  │  Unsloth Training     │   │
+│  │  • Always active (no sleep)     │  │  • Dedicated GPU      │   │
+│  │  • 2x inference throughput      │  │  • Fresh subprocess   │   │
+│  │                                 │  │    per step           │   │
+│  │  ┌──────────┐  ┌────────────┐   │  │  • LoRA + Optimizer   │   │
+│  │  │  TP=2    │  │  LoRA      │   │  │  • ART loss function  │   │
+│  │  │  Model   │  │  Hot-reload│   │  │                       │   │
+│  │  │  Shards  │  │  < 2s      │   │  └───────────────────────┘   │
+│  │  └──────────┘  └────────────┘   │          GPU 3: spare        │
+│  └─────────────────────────────────┘                              │
+│                                                                   │
+│  ✓ No sleep/wake overhead                                         │
+│  ✓ SGLang stays active during training                            │
+│  ✓ TP must be power of 2 (vocab size constraint)                  │
+│  ✓ Generation is 70-90% of RL time → more inference GPUs = win    │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ### Auto-Detected GPU Splits
 
-| GPUs Available | Inference GPUs | TP Size | Training GPU | Mode |
-|:-:|:-:|:-:|:-:|:-:|
-| 4 | 0, 2, 3 | 3 | 1 | **Dedicated** |
-| 3 | 0, 2 | 2 | 1 | **Dedicated** |
-| 2 | 0 | 1 | 1 | **Dedicated** |
-| 1 | 0 | 1 | 0 | Shared (sleep/wake) |
+TP must be a power of 2 (model vocab sizes like Qwen3's 151936 are divisible by 1,2,4,8 but NOT 3).
+
+| GPUs Available | Inference GPUs | TP Size | Training GPU | Spare GPUs | Mode |
+|:-:|:-:|:-:|:-:|:-:|:-:|
+| 8 | 0, 2, 3, 4 | 4 | 1 | 5, 6, 7 | **Dedicated** |
+| 4 | 0, 2 | 2 | 1 | 3 | **Dedicated** |
+| 3 | 0, 2 | 2 | 1 | — | **Dedicated** |
+| 2 | 0 | 1 | 1 | — | **Dedicated** |
+| 1 | 0 | 1 | 0 | — | Shared (sleep/wake) |
 
 GPU 1 is chosen for training to keep GPU 0 as the primary SGLang rank.
 

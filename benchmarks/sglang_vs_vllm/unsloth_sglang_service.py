@@ -494,25 +494,45 @@ class UnslothSGLangService:
     def _auto_detect_gpu_split(self) -> None:
         """Auto-detect optimal inference/training GPU split.
 
+        TP size must be a power of 2 — most models have vocab sizes that
+        are multiples of powers of 2, but NOT arbitrary numbers like 3.
+        (e.g. Qwen3's vocab_size=151936 is divisible by 1,2,4,8 but NOT 3)
+
         Strategy for N GPUs:
-          N >= 2: inference = all GPUs except GPU 1, training = GPU 1
-                  This gives TP=N-1 for inference (the bottleneck in RL).
-                  GPU 1 is chosen for training to keep GPU 0 as primary
-                  SGLang rank (many tools/dashboards assume GPU 0 is primary).
+          N >= 2: training = GPU 1, inference = remaining GPUs
+                  TP = largest power of 2 that fits in (N-1) GPUs
+                  Extra GPUs beyond TP are left idle.
           N == 1: shared mode (training_gpu=-1, sleep/wake fallback)
+
+        Examples:
+          8 GPUs: TP=4, inference=[0,2,3,4], training=1, spare=[5,6,7]
+          4 GPUs: TP=2, inference=[0,2],      training=1, spare=[3]
+          3 GPUs: TP=2, inference=[0,2],      training=1
+          2 GPUs: TP=1, inference=[0],        training=1
+          1 GPU:  shared mode (sleep/wake)
         """
         num_gpus = torch.cuda.device_count()
 
         if num_gpus >= 2:
-            # Dedicate GPU 1 for training, rest for inference
             self.training_gpu = 1
-            self.inference_gpus = [i for i in range(num_gpus) if i != self.training_gpu]
-            # Override tensor_parallel_size to match inference GPU count
-            self.tensor_parallel_size = len(self.inference_gpus)
+            available_for_inference = num_gpus - 1  # reserve 1 for training
+
+            # Largest power of 2 that fits
+            tp = 1
+            while tp * 2 <= available_for_inference:
+                tp *= 2
+
+            # Pick `tp` GPUs from [0, 2, 3, 4, ...] (skip GPU 1 = training)
+            all_inference = [i for i in range(num_gpus) if i != self.training_gpu]
+            self.inference_gpus = all_inference[:tp]
+            self.tensor_parallel_size = tp
+
+            spare = all_inference[tp:]
+            spare_msg = f", spare={spare}" if spare else ""
             logger.info(
                 f"GPU split auto-detected ({num_gpus} GPUs): "
-                f"inference={self.inference_gpus} (TP={self.tensor_parallel_size}), "
-                f"training=GPU {self.training_gpu}"
+                f"inference={self.inference_gpus} (TP={tp}), "
+                f"training=GPU {self.training_gpu}{spare_msg}"
             )
         else:
             # Single GPU — shared mode

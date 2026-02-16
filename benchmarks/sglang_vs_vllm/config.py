@@ -119,19 +119,32 @@ def compute_gpu_split(num_gpus: int) -> tuple[list[int], int]:
     Returns (inference_gpu_ids, training_gpu_id).
     training_gpu_id == -1 means shared mode (single GPU, sleep/wake).
 
+    TP size must be a power of 2 — most model vocab sizes are divisible
+    by powers of 2 but NOT arbitrary numbers (e.g. Qwen3 vocab=151936
+    is divisible by 1,2,4,8 but NOT 3).
+
     Strategy — maximize inference throughput since generation is 70-90% of
     RL wall time:
-      4 GPUs: inference=[0,2,3] TP=3, training=GPU 1
-      3 GPUs: inference=[0,2]   TP=2, training=GPU 1
-      2 GPUs: inference=[0]     TP=1, training=GPU 1
-      1 GPU:  shared mode       (training_gpu=-1)
+      8 GPUs: inference=[0,2,3,4] TP=4, training=GPU 1, spare=[5,6,7]
+      4 GPUs: inference=[0,2]     TP=2, training=GPU 1, spare=[3]
+      3 GPUs: inference=[0,2]     TP=2, training=GPU 1
+      2 GPUs: inference=[0]       TP=1, training=GPU 1
+      1 GPU:  shared mode         (training_gpu=-1)
 
     GPU 1 is chosen for training to keep GPU 0 as the primary SGLang
     rank (many monitoring tools assume GPU 0 is primary).
     """
     if num_gpus >= 2:
         training_gpu = 1
-        inference_gpus = [i for i in range(num_gpus) if i != training_gpu]
+        available = num_gpus - 1
+
+        # Largest power of 2 that fits
+        tp = 1
+        while tp * 2 <= available:
+            tp *= 2
+
+        all_inference = [i for i in range(num_gpus) if i != training_gpu]
+        inference_gpus = all_inference[:tp]
         return inference_gpus, training_gpu
     else:
         return [], -1
