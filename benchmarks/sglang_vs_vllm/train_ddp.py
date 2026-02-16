@@ -74,20 +74,8 @@ def main():
         cfg = json.load(f)
 
     import torch
-    import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
 
-    # Initialize process group
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-
-    if rank == 0:
-        logger.info(f"DDP training: world_size={world_size}, config={cfg['base_model']}")
-
-    # Extract config
+    # Extract config BEFORE any heavy imports
     base_model = cfg["base_model"]
     output_dir = cfg["output_dir"]
     lora_rank = cfg.get("lora_rank", 1)
@@ -104,27 +92,40 @@ def main():
     step_number = cfg["step_number"]
     results_file = cfg["results_file"]
 
-    # Patch vLLM before importing Unsloth
-    if moe_backend != "auto":
-        os.environ["UNSLOTH_MOE_BACKEND"] = moe_backend
-    _patch_vllm_for_unsloth_import()
+    # Save LOCAL_RANK for CUDA device selection, then hide ALL distributed
+    # env vars during Unsloth import. unsloth_zoo/utils.py has a bug:
+    # distributed_function() references `dist` (torch.distributed) without
+    # importing it, which crashes when it detects a distributed environment
+    # (via env vars OR torch.distributed.is_initialized()). So we must:
+    #   1. NOT call dist.init_process_group() before import
+    #   2. Hide RANK/WORLD_SIZE/LOCAL_RANK env vars during import
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
 
-    # Hide distributed env vars during Unsloth import.
-    # unsloth_zoo/utils.py has a bug: distributed_function() references `dist`
-    # (torch.distributed) without importing it, which crashes when torchrun
-    # sets RANK/WORLD_SIZE env vars. We temporarily remove these so Unsloth
-    # doesn't detect the distributed environment during import.
     _dist_env_keys = ["RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE",
                       "MASTER_ADDR", "MASTER_PORT", "GROUP_RANK",
                       "ROLE_RANK", "ROLE_WORLD_SIZE", "TORCHELASTIC_RUN_ID"]
     _saved_dist_env = {k: os.environ.pop(k) for k in _dist_env_keys if k in os.environ}
 
+    # Patch vLLM before importing Unsloth
+    if moe_backend != "auto":
+        os.environ["UNSLOTH_MOE_BACKEND"] = moe_backend
+    _patch_vllm_for_unsloth_import()
+
     from unsloth import FastLanguageModel
 
-    # Restore distributed env vars after import
+    # Restore distributed env vars and NOW initialize process group
     os.environ.update(_saved_dist_env)
 
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
     if rank == 0:
+        logger.info(f"DDP training: world_size={world_size}, config={base_model}")
         logger.info(f"Loading model: {base_model} (rank 0)")
 
     model, tokenizer = FastLanguageModel.from_pretrained(
