@@ -616,9 +616,11 @@ def main():
         logger.info(f"\n{'='*60}\n  {backend.upper()} subprocess\n{'='*60}")
         cleanup_gpus()
         rc = spawn_worker(backend, cfg, results_file)
-        if rc == 0 and os.path.exists(results_file):
+        if os.path.exists(results_file):
             with open(results_file) as f:
                 results[backend] = json.load(f)
+            if rc != 0:
+                logger.warning(f"  {backend} exited with code {rc} but results file exists — using it")
             logger.info(f"  {backend} results collected")
         cleanup_gpus()
 
