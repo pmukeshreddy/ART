@@ -1,12 +1,12 @@
 """
-Unsloth + SGLang service — self-contained MoE training with verl-style inference.
+Unsloth + SGLang service — MoE training matching Megatron exactly.
 
-Unsloth is fully self-contained:
-  - pip install --upgrade unsloth unsloth_zoo
-  - transformers>=5.0.0 and trl>=0.27.1 (handled as Unsloth dependencies)
-  - MoE Triton kernels, torch._grouped_mm, Split LoRA all baked in
-  - Auto-selects best backend (grouped_mm / unsloth_triton / native_torch)
-  - load_in_4bit=False required (MoE nn.Parameter doesn't support bnb 4bit yet)
+Uses the SAME pipeline as the Megatron backend:
+  - LoRA config: rank=1, alpha=32, targets 7 modules (q/k/v/o/gate/up/down_proj)
+  - Loss function: art.loss.loss_fn with on_policy_correction=True
+  - Data pipeline: ART's packed tensors (tokenize_trajectory_groups +
+    packed_tensors_from_tokenized_results), saved to disk
+  - Optimizer: AdamW(lr=5e-6, betas=(0.9, 0.99), weight_decay=0.1, clip_grad=0.1)
 
 Architecture (verl-style, same GPUs via sleep/wake — matches SGLang+Megatron):
   - SGLang server starts ONCE and NEVER restarts
@@ -18,10 +18,10 @@ Training loop (per step):
   1. generate()       — SGLang active, KV cache + weights on GPU
   2. sleep()          — SGLang releases KV cache AND weights
   3. reload_to_gpu()  — Unsloth model back to GPU from CPU
-  4. Unsloth train    — GRPO training on completions
+  4. train            — ART loss on packed tensors (same as Megatron)
   5. offload_to_cpu() — Unsloth model to CPU, free GPU
   6. wake_up()        — SGLang restores base weights + KV cache
-  7. load_lora()      — hot-reload ~2MB adapter
+  7. load_lora()      — hot-reload adapter
 
 Reference:
   - https://unsloth.ai/docs/new/faster-moe
@@ -184,13 +184,14 @@ class UnslothTrainingState:
 class UnslothTrainingWorker:
     """Training worker — runs in a persistent subprocess via mp_actors.
 
-    Matches the SGLang+Megatron pattern: training and inference time-share
-    the same GPUs. Between steps, the model is offloaded to CPU so SGLang
-    can reclaim GPU memory for inference.
+    Uses the SAME training pipeline as the Megatron backend:
+      - LoRA config: rank=1, alpha=32, targets all 7 modules
+      - Loss: art.loss.loss_fn with on_policy_correction=True
+      - Data: ART packed tensors loaded from disk
 
     Communication with the parent process is via mp_actors proxy (pickle over
     multiprocessing queues). Only lightweight data crosses the boundary:
-      - train_data: list[dict] of prompts/completions/rewards (~100KB-1MB)
+      - packed_tensors_dir: str (path to packed tensors on disk)
       - metrics: dict[str, float] (~1KB)
       - checkpoint paths: str
     """
@@ -199,7 +200,8 @@ class UnslothTrainingWorker:
         self,
         base_model: str,
         output_dir: str,
-        lora_rank: int = 16,
+        lora_rank: int = 1,
+        lora_alpha: int = 32,
         max_seq_length: int = 8192,
         learning_rate: float = 5e-6,
         moe_backend: str = "auto",
@@ -208,6 +210,7 @@ class UnslothTrainingWorker:
         self.base_model = base_model
         self.output_dir = output_dir
         self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
         self.max_seq_length = max_seq_length
         self.learning_rate = learning_rate
         self.moe_backend = moe_backend
@@ -235,8 +238,11 @@ class UnslothTrainingWorker:
         model = FastLanguageModel.get_peft_model(
             model,
             r=self.lora_rank,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-            lora_alpha=self.lora_rank,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            lora_alpha=self.lora_alpha,
             lora_dropout=0,
             use_gradient_checkpointing="unsloth",
             random_state=3407,
@@ -255,16 +261,28 @@ class UnslothTrainingWorker:
         self._state = UnslothTrainingState(model=model, tokenizer=tokenizer, optimizer=optimizer)
         return {"trainable_params": n_params}
 
-    async def train_on_completions(
+    async def train_on_packed_tensors(
         self,
-        train_data: list[dict],
+        packed_tensors_dir: str,
+        num_sequences: int,
+        sequence_length: int,
         lr: float | None = None,
     ) -> dict[str, float]:
-        """GRPO training on completions — mirrors src/art/loss.py exactly.
+        """Train using ART's packed tensors and loss function.
 
-        Same loss formula as Megatron GRPO with on_policy_correction=True.
-        Model must be on GPU (via init_model or reload_to_gpu) before calling.
+        Matches Megatron's training loop exactly:
+          - Same packed tensor format (tokens, logprobs, advantages, etc.)
+          - Same loss function (art.loss.loss_fn with on_policy_correction=True)
+          - Same optimizer (AdamW, clip_grad=0.1)
+
+        The packed tensors are created by ART's preprocessing pipeline
+        (tokenize_trajectory_groups + packed_tensors_from_tokenized_results)
+        in the benchmark runner, then saved to disk. This method loads them
+        and runs the training loop.
         """
+        from art.preprocessing.pack import packed_tensors_from_dir
+        from art.loss import loss_fn, shift_tensor
+
         state = self._state
         assert state is not None
 
@@ -275,137 +293,58 @@ class UnslothTrainingWorker:
             for pg in state.optimizer.param_groups:
                 pg["lr"] = lr
 
-        # GRPO parameters (matching src/art/loss.py defaults)
-        epsilon = 1.0
-        epsilon_high = 4.0
-
-        # Tokenize: prompt + completion, mask prompt tokens
-        input_ids_list: list[list[int]] = []
-        labels_list: list[list[int]] = []
-        advantages_list: list[float] = []
-
-        for item in train_data:
-            if item.get("error") or not item.get("completion"):
-                continue
-
-            msgs = item["prompt"]
-            completion = item["completion"]
-            advantage = item.get("advantage", 1.0)
-
-            prompt_text = state.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True,
-            )
-            prompt_ids = state.tokenizer.encode(
-                prompt_text, add_special_tokens=False,
-            )
-
-            full_msgs = msgs + [{"role": "assistant", "content": completion}]
-            full_text = state.tokenizer.apply_chat_template(
-                full_msgs, tokenize=False, add_generation_prompt=False,
-            )
-            full_ids = state.tokenizer.encode(
-                full_text, add_special_tokens=False,
-            )
-
-            full_ids = full_ids[: self.max_seq_length]
-
-            n_prompt = min(len(prompt_ids), len(full_ids))
-            labels = [-100] * n_prompt + full_ids[n_prompt:]
-            labels = labels[: self.max_seq_length]
-
-            if len(full_ids) <= n_prompt:
-                continue
-
-            input_ids_list.append(full_ids)
-            labels_list.append(labels)
-            advantages_list.append(advantage)
-
-        if not input_ids_list:
-            logger.warning("  no valid completions to train on")
-            return {
-                "loss": 0.0, "training_time_s": 0.0, "tokens_per_sec": 0.0,
-                "gpu_memory_gb": 0.0, "total_tokens": 0, "batch_size": 0, "seq_len": 0,
-            }
-
-        # Pad to uniform length
-        max_len = max(len(ids) for ids in input_ids_list)
-        pad_id = state.tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = state.tokenizer.eos_token_id or 0
-
-        padded_ids, padded_labels, attn_masks = [], [], []
-        for ids, labs in zip(input_ids_list, labels_list):
-            pad_len = max_len - len(ids)
-            padded_ids.append(ids + [pad_id] * pad_len)
-            padded_labels.append(labs + [-100] * pad_len)
-            attn_masks.append([1] * len(ids) + [0] * pad_len)
-
-        input_ids = torch.tensor(padded_ids, device=device)
-        labels_t = torch.tensor(padded_labels, device=device)
-        attention_mask = torch.tensor(attn_masks, device=device)
-        advantages = torch.tensor(advantages_list, device=device, dtype=torch.float32)
-
-        batch_size, seq_len = input_ids.shape
-        completion_tokens = int((labels_t != -100).sum().item())
-        logger.info(
-            f"  training: {batch_size} seqs, max_len={seq_len}, "
-            f"completion_tokens={completion_tokens} (GRPO, mirrors art/loss.py)"
+        packed = packed_tensors_from_dir(
+            dir=packed_tensors_dir,
+            num_sequences=num_sequences,
+            sequence_length=sequence_length,
         )
 
-        # Forward/backward: Megatron GRPO loss formula
-        t0 = time.perf_counter()
-        total_policy_loss = 0.0
-        n_micro = 0
-
-        mb = max(1, min(batch_size, 4))
-        accum_steps = max(1, batch_size // mb)
+        total_loss = 0.0
+        n_seqs = 0
+        completion_tokens = 0
 
         state.optimizer.zero_grad()
-        for i in range(0, batch_size, mb):
-            mb_ids = input_ids[i:i + mb]
-            mb_mask = attention_mask[i:i + mb]
-            mb_labels = labels_t[i:i + mb]
-            mb_adv = advantages[i:i + mb]
+        t0 = time.perf_counter()
+
+        for idx in range(num_sequences):
+            inputs = {
+                key: value[idx:idx + 1].to(device)
+                for key, value in packed.items()
+                if isinstance(value, torch.Tensor)
+            }
+
+            tokens = inputs["tokens"]
+            batch_size, seq_len = tokens.shape
+            completion_tokens += int(inputs["assistant_mask"].sum().item())
+
+            attn_mask = (inputs["group_ids"] != -1).long()
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = state.model(
-                    input_ids=mb_ids, attention_mask=mb_mask,
-                ).logits
-
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = mb_labels[..., 1:].contiguous()
-
-                log_probs = torch.nn.functional.log_softmax(
-                    shift_logits, dim=-1,
+                outputs = state.model(
+                    input_ids=tokens,
+                    position_ids=inputs["input_pos"],
+                    attention_mask=attn_mask,
                 )
-                token_ids = shift_labels.clamp(min=0)
+                logits = outputs.logits
+
+                labels = shift_tensor(tokens, 0)
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                 new_logprobs = log_probs.gather(
-                    dim=-1, index=token_ids.unsqueeze(-1),
+                    dim=-1, index=labels.unsqueeze(-1),
                 ).squeeze(-1)
 
-                old_logprobs = new_logprobs.detach()
-
-                logprob_diff = new_logprobs - old_logprobs
-                prob_ratio = torch.exp(logprob_diff)
-                clipped_ratio = torch.clip(
-                    prob_ratio.detach(),
-                    1.0 - epsilon,
-                    1.0 + epsilon_high,
+                experimental_config = {"on_policy_correction": True}
+                loss_result = loss_fn(
+                    inputs, new_logprobs, ref_logprobs=None, entropies=None,
+                    experimental_config=experimental_config,
                 )
 
-                per_token_advantages = mb_adv.unsqueeze(-1).expand_as(new_logprobs)
-                policy_loss = -(clipped_ratio * per_token_advantages * new_logprobs)
+                loss = loss_result.mean_policy_loss / num_sequences
 
-                assistant_mask = (shift_labels != -100).float()
+            loss.backward()
 
-                masked_loss = (policy_loss * assistant_mask).sum(dim=-1)
-                per_sample_loss = masked_loss / assistant_mask.sum(dim=-1).clamp(min=1)
-                batch_loss = per_sample_loss.mean() / accum_steps
-
-            batch_loss.backward()
-
-            total_policy_loss += per_sample_loss.mean().item()
-            n_micro += 1
+            total_loss += loss_result.mean_policy_loss.item()
+            n_seqs += 1
 
         torch.nn.utils.clip_grad_norm_(
             [p for p in state.model.parameters() if p.requires_grad],
@@ -415,13 +354,13 @@ class UnslothTrainingWorker:
         state.optimizer.zero_grad()
 
         elapsed = time.perf_counter() - t0
-        avg_loss = total_policy_loss / max(n_micro, 1)
+        avg_loss = total_loss / max(n_seqs, 1)
         gpu_mem_gb = torch.cuda.max_memory_allocated() / 1e9
         torch.cuda.reset_peak_memory_stats()
 
         logger.info(
             f"  trained: loss={avg_loss:.4f}  {completion_tokens / elapsed:.0f} tok/s  "
-            f"VRAM={gpu_mem_gb:.1f}GB  {elapsed:.2f}s (GRPO, mirrors art/loss.py)"
+            f"VRAM={gpu_mem_gb:.1f}GB  {elapsed:.2f}s (ART loss, packed tensors)"
         )
 
         return {
@@ -430,8 +369,8 @@ class UnslothTrainingWorker:
             "tokens_per_sec": completion_tokens / elapsed,
             "gpu_memory_gb": gpu_mem_gb,
             "total_tokens": completion_tokens,
-            "batch_size": batch_size,
-            "seq_len": seq_len,
+            "batch_size": n_seqs,
+            "seq_len": sequence_length,
         }
 
     async def offload_to_cpu(self) -> dict[str, float]:
@@ -490,17 +429,18 @@ class UnslothTrainingWorker:
 
 @dataclass
 class UnslothSGLangService:
-    """Self-contained Unsloth MoE training + SGLang inference.
+    """Unsloth MoE training + SGLang inference — matches Megatron pipeline.
 
-    No ART dependency for training — just Unsloth + SGLang.
+    Uses ART's data pipeline and loss function for identical training behavior.
 
     Lifecycle per RL step:
       1. SGLang serves rollouts (inference)
-      2. sleep()  — SGLang releases GPU memory
-      3. Unsloth trains on rollout data (MoE Triton kernels)
-      4. Save LoRA adapter
-      5. wake_up()  — SGLang restores GPU memory
-      6. load_lora()  — SGLang loads new adapter (<2s)
+      2. Benchmark runner tokenizes/packs data via ART preprocessing
+      3. sleep()  — SGLang releases GPU memory
+      4. Unsloth trains on packed tensors using art.loss.loss_fn
+      5. Save LoRA adapter
+      6. wake_up()  — SGLang restores GPU memory
+      7. load_lora()  — SGLang loads new adapter (<2s)
     """
 
     model_name: str
@@ -513,8 +453,9 @@ class UnslothSGLangService:
     max_running_requests: int = 256
     log_dir: str = ""
 
-    # Unsloth config — all handled internally by Unsloth
-    lora_rank: int = 16
+    # Unsloth config — matches Megatron (rank=1, alpha=32, 7 modules)
+    lora_rank: int = 1
+    lora_alpha: int = 32
     max_seq_length: int = 8192
     learning_rate: float = 5e-6
     # "auto" lets Unsloth pick: grouped_mm (H100+), unsloth_triton (A100), native_torch
@@ -559,13 +500,11 @@ class UnslothSGLangService:
             chunked_prefill_size=32768,
             enable_memory_saver=True,
             enable_lora=True,
-            # 2x adapter rank as safety margin for can_support() check.
-            max_lora_rank=max(8, self.lora_rank * 2),
+            max_lora_rank=8,  # Megatron trains rank=1, headroom for future
             # Match Megatron backend: use DEFAULT lora_target_modules
             # (q/k/v/o_proj + gate/up/down_proj). Don't override — the
             # Megatron backend also uses the default and it works.
-            # The adapter only targets attention modules (4 of 7) which
-            # is a valid subset.
+            # The adapter now targets all 7 modules (matches Megatron).
         ))
 
     async def start(self) -> float:
@@ -591,6 +530,7 @@ class UnslothSGLangService:
             base_model=self.base_model,
             output_dir=self.output_dir,
             lora_rank=self.lora_rank,
+            lora_alpha=self.lora_alpha,
             max_seq_length=self.max_seq_length,
             learning_rate=self.learning_rate,
             moe_backend=self.moe_backend,
@@ -682,31 +622,34 @@ class UnslothSGLangService:
 
     async def train_step(
         self,
-        train_data: list[dict],
+        packed_tensors_dir: str,
+        num_sequences: int,
+        sequence_length: int,
         lr: float | None = None,
     ) -> dict[str, float]:
         """One complete training step — verl-style, same GPUs via sleep/wake.
 
-        Matches the SGLang+Megatron pattern: training and inference time-share
-        the same GPUs. SGLang sleeps (frees GPU), Unsloth trains, Unsloth
-        offloads to CPU, SGLang wakes up (restores GPU).
+        Matches the SGLang+Megatron pattern exactly:
+          - Same data pipeline: ART's packed tensors (tokenized + packed by
+            the benchmark runner using tokenize_trajectory_groups +
+            packed_tensors_from_tokenized_results)
+          - Same loss function: art.loss.loss_fn with on_policy_correction=True
+          - Same GPU time-sharing: sleep/wake cycle
 
         Loop:
           1. sleep()          — SGLang releases KV cache + weights
           2. reload_to_gpu()  — Unsloth model back to GPU (skip on first call)
-          3. train             — GRPO training on completions
+          3. train             — ART loss on packed tensors
           4. save_lora()      — save adapter to disk
           5. offload_to_cpu() — Unsloth model to CPU, free GPU
           6. wake_up()        — SGLang restores KV cache + weights
           7. load_lora()      — hot-reload adapter (<2s)
 
         Args:
-            train_data: List of dicts from _collect_completions, each with:
-                - prompt: list of message dicts
-                - completion: str (model-generated)
-                - reward: float
-                - advantage: float (group-relative)
-                - error: bool
+            packed_tensors_dir: Path to directory with ART packed tensors
+                (tokens.pt, logprobs.pt, advantages.pt, etc.)
+            num_sequences: Number of packed sequences on disk.
+            sequence_length: Sequence length of each packed sequence.
             lr: Learning rate override (optional).
 
         Returns:
@@ -728,13 +671,14 @@ class UnslothSGLangService:
             logger.info(f"Unsloth worker model loaded — {n_params:,} trainable params")
             self._worker_initialized = True
         else:
-            # Reload from CPU — model was offloaded after previous step
             reload_result = await self._worker.reload_to_gpu()
             timings["reload_s"] = reload_result.get("reload_time_s", 0)
         timings["model_load_s"] = time.perf_counter() - t
 
-        # 3. Train — model on GPU, SGLang asleep
-        train_metrics = await self._worker.train_on_completions(train_data, lr)
+        # 3. Train on packed tensors — uses art.loss.loss_fn (same as Megatron)
+        train_metrics = await self._worker.train_on_packed_tensors(
+            packed_tensors_dir, num_sequences, sequence_length, lr,
+        )
 
         # 4. Save LoRA
         t = time.perf_counter()

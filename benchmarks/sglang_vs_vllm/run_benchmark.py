@@ -530,30 +530,39 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                     d["advantage"] = (d["reward"] - mean_r) / std_r
 
     async def _run_unsloth() -> BenchmarkRun:
-        """Unsloth + SGLang benchmark — fully self-contained.
+        """Unsloth + SGLang benchmark — matching Megatron pipeline exactly.
 
-        No ART dependency for training. Just:
-          - pip install --upgrade unsloth unsloth_zoo
-          - transformers>=5.0.0, trl>=0.27.1 (Unsloth deps)
+        Uses the SAME data pipeline as vLLM/SGLang+Megatron:
+          - do_rollout_for_training() creates real art.Trajectory /
+            art.TrajectoryGroup objects with logprobs from the server
+          - ART's tokenize_trajectory_groups + packed_tensors_from_tokenized_results
+            creates packed tensors saved to disk
+          - Worker loads packed tensors and trains with art.loss.loss_fn
 
-        Unsloth auto-selects MoE backend (grouped_mm / unsloth_triton / native_torch).
-        MoE nn.Parameter doesn't support bnb 4bit — uses BF16/FP16 LoRA.
+        LoRA config matches Megatron: rank=1, alpha=32, 7 target modules.
 
         Architecture (IDENTICAL to vLLM/SGLang, fair comparison):
           1. SGLang server starts ONCE (persistent, verl-style)
           2. Rollout via IDENTICAL streaming as vLLM/SGLang (timed)
-          3. Collect completions (same as do_rollout_for_training)
-          4. Compute GRPO-style group-relative advantages
-          5. sleep() → Unsloth trains on completions with advantage-weighted
-             loss → wake() → load_lora()
+          3. do_rollout_for_training creates TrajectoryGroups (same as Megatron)
+          4. ART preprocessing tokenizes/packs into packed tensors
+          5. sleep() → Unsloth trains on packed tensors with ART loss →
+             wake() → load_lora()
           6. Full memory recovery every step
 
         Reference: https://unsloth.ai/docs/new/faster-moe
         """
+        import math as _math
+        from transformers import AutoTokenizer
+        from art.preprocessing.tokenize import tokenize_trajectory_groups
+        from art.preprocessing.pack import (
+            packed_tensors_from_tokenized_results,
+            packed_tensors_to_dir,
+        )
         from benchmarks.sglang_vs_vllm.unsloth_sglang_service import UnslothSGLangService
 
         unsloth_port = cfg.get("unsloth_port", 8300)
-        unsloth_lora_rank = cfg.get("unsloth_lora_rank", 16)
+        unsloth_lora_rank = cfg.get("unsloth_lora_rank", 1)
         unsloth_moe_backend = cfg.get("unsloth_moe_backend", "auto")
 
         svc = UnslothSGLangService(
@@ -590,6 +599,19 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
         prompts = generate_benchmark_prompts(num_rollouts, dataset=dataset, seed=seed)
 
+        # Load tokenizer once for ART preprocessing (same as Megatron backend)
+        _tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+        # Simple adapter so do_rollout_for_training can use the SGLang server
+        class _ModelAdapter:
+            def openai_client(self_):
+                from openai import AsyncOpenAI
+                return AsyncOpenAI(base_url=base_url, api_key="none")
+            def get_inference_name(self_):
+                return svc.inference_model_name
+
+        _adapter = _ModelAdapter()
+
         for step in range(num_steps):
             logger.info(f"[unsloth] step {step+1}/{num_steps}")
             sm = StepMetrics(step=step + 1)
@@ -615,26 +637,61 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
                 for i, e in enumerate(unique_errs):
                     logger.error(f"  rollout error [{i+1}]: {e}")
 
-            # ---- Collect completions for training (same as vLLM/SGLang) ----
-            # This mirrors do_rollout_for_training: generate completions,
-            # compute rewards, group into batches of 4.
+            # ---- Data pipeline (IDENTICAL to Megatron backend) ----
+            # 1. do_rollout_for_training creates real TrajectoryGroups
+            #    with logprobs from the server (same as vLLM/SGLang path)
             sm.training_start = time.perf_counter()
 
-            train_data = await _collect_completions(
-                base_url, mname, prompts, max_tokens=256, conc=8,
+            tgroups = await do_rollout_for_training(_adapter, prompts)
+            n_trajs = sum(len(g.trajectories) for g in tgroups)
+            logger.info(f"  collected {n_trajs}/{len(prompts)} trajectories for GRPO training")
+
+            # 2. ART tokenize + pack (same as LocalBackend._get_packed_tensors)
+            tokenized = list(tokenize_trajectory_groups(
+                _tokenizer, tgroups,
+                allow_training_without_logprobs=True,
+                scale_rewards=True,
+            ))
+
+            if not tokenized:
+                logger.warning("  no valid tokenized results — skipping training")
+                sm.training_end = time.perf_counter()
+                run.steps.append(sm)
+                continue
+
+            max_tokens = max(len(r.token_ids) for r in tokenized)
+            seq_len = min(
+                _math.ceil(max_tokens / 2048) * 2048,
+                max_seq_length,
             )
-            _compute_grpo_advantages(train_data, group_size=4)
 
-            ok = sum(1 for d in train_data if not d.get("error"))
-            logger.info(f"  collected {ok}/{len(train_data)} completions for GRPO training")
+            packed = packed_tensors_from_tokenized_results(
+                tokenized, seq_len,
+                pad_token_id=_tokenizer.eos_token_id or 0,
+            )
 
-            # ---- Training (sleep → Unsloth GRPO → wake → load_lora) ----
+            # 3. Save to disk (same as packed_tensors_to_dir in Megatron)
+            pt_dir = os.path.join(
+                output_dir, "unsloth_workdir", "packed_tensors", f"step{step+1:04d}",
+            )
+            disk_info = packed_tensors_to_dir(packed, pt_dir)
+            logger.info(
+                f"  packed: {disk_info['num_sequences']} seqs × "
+                f"{disk_info['sequence_length']} tokens → {pt_dir}"
+            )
+
+            # ---- Training (sleep → ART loss on packed tensors → wake → load_lora) ----
             try:
-                train_result = await svc.train_step(train_data, lr=lr)
+                train_result = await svc.train_step(
+                    packed_tensors_dir=pt_dir,
+                    num_sequences=disk_info["num_sequences"],
+                    sequence_length=disk_info["sequence_length"],
+                    lr=lr,
+                )
                 logger.info(
                     f"  train loss={train_result.get('loss', '?'):.4f}  "
                     f"overhead={train_result.get('total_overhead_s', 0):.1f}s  "
-                    f"(GRPO-style, advantage-weighted)"
+                    f"(ART loss, packed tensors)"
                 )
             except Exception as e:
                 logger.error(f"  train failed: {e}", exc_info=True)
@@ -833,8 +890,8 @@ def parse_args():
     # Unsloth-specific options
     p.add_argument("--unsloth-port", type=int, default=8300,
                    help="Port for Unsloth+SGLang inference server")
-    p.add_argument("--unsloth-lora-rank", type=int, default=16,
-                   help="LoRA rank for Unsloth MoE training (higher=better for MoE)")
+    p.add_argument("--unsloth-lora-rank", type=int, default=1,
+                   help="LoRA rank for Unsloth training (default=1 matches Megatron)")
     p.add_argument("--unsloth-moe-backend", default="auto",
                    choices=["auto", "grouped_mm", "unsloth_triton", "native_torch"],
                    help="Unsloth MoE backend: grouped_mm (H100+), unsloth_triton (A100), native_torch (fallback)")
