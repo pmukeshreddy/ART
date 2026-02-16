@@ -109,8 +109,20 @@ def main():
         os.environ["UNSLOTH_MOE_BACKEND"] = moe_backend
     _patch_vllm_for_unsloth_import()
 
-    # Load model
+    # Hide distributed env vars during Unsloth import.
+    # unsloth_zoo/utils.py has a bug: distributed_function() references `dist`
+    # (torch.distributed) without importing it, which crashes when torchrun
+    # sets RANK/WORLD_SIZE env vars. We temporarily remove these so Unsloth
+    # doesn't detect the distributed environment during import.
+    _dist_env_keys = ["RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE",
+                      "MASTER_ADDR", "MASTER_PORT", "GROUP_RANK",
+                      "ROLE_RANK", "ROLE_WORLD_SIZE", "TORCHELASTIC_RUN_ID"]
+    _saved_dist_env = {k: os.environ.pop(k) for k in _dist_env_keys if k in os.environ}
+
     from unsloth import FastLanguageModel
+
+    # Restore distributed env vars after import
+    os.environ.update(_saved_dist_env)
 
     if rank == 0:
         logger.info(f"Loading model: {base_model} (rank 0)")
