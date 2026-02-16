@@ -120,6 +120,11 @@ def main():
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
+    # Fix unsloth_zoo bug: distributed_function() uses `dist` without
+    # importing torch.distributed. Inject it into the module globals.
+    import unsloth_zoo.utils
+    unsloth_zoo.utils.dist = dist
+
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
