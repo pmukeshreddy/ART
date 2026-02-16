@@ -10,20 +10,23 @@ Uses the SAME pipeline as the Megatron backend:
 
 Architecture (verl-style, same GPUs via sleep/wake — matches SGLang+Megatron):
   - SGLang server starts ONCE and NEVER restarts
-  - Unsloth training runs in a PERSISTENT SUBPROCESS
+  - Unsloth training runs in a FRESH SUBPROCESS per step (killed after)
   - Training and inference time-share the same GPUs via sleep/wake
-  - Model is DESTROYED after each step (Unsloth monkey-patches prevent
-    reliable offload to CPU), reloaded from base + LoRA checkpoint next step
+  - Subprocess death guarantees ALL GPU memory is freed (Unsloth's
+    monkey-patching holds module-level tensor caches that survive
+    del + gc + empty_cache — only process exit frees them)
   - LoRA hot-reload for weight sync (<2s)
 
 Training loop (per step):
   1. generate()       — SGLang active, KV cache + weights on GPU
   2. sleep()          — SGLang releases KV cache AND weights
-  3. init_model()     — load base model + previous LoRA checkpoint
-  4. train            — ART loss on packed tensors (same as Megatron)
-  5. destroy_model()  — delete model entirely, free ALL GPU memory
-  6. wake_up()        — SGLang restores base weights + KV cache
-  7. load_lora()      — hot-reload adapter
+  3. spawn subprocess — fresh CUDA context, no stale references
+  4. init_model()     — load base model + previous LoRA checkpoint
+  5. train            — ART loss on packed tensors (same as Megatron)
+  6. save_lora()      — save adapter to disk
+  7. KILL subprocess  — process death frees ALL GPU memory
+  8. wake_up()        — SGLang restores base weights + KV cache
+  9. load_lora()      — hot-reload adapter
 
 Reference:
   - https://unsloth.ai/docs/new/faster-moe
@@ -130,20 +133,16 @@ def _gc_and_empty_cuda_cache(n: int = 3) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Unsloth Training State — destroyed + recreated each step (like Megatron)
+# Unsloth Training State — lives for one step in a short-lived subprocess
 # ---------------------------------------------------------------------------
 
 @dataclass
 class UnslothTrainingState:
-    """Holds the Unsloth model, tokenizer, and optimizer for one training step.
+    """Holds model, tokenizer, and optimizer for one training step.
 
-    Unlike the old offload/reload approach, this is created fresh each step
-    and destroyed after training. Unsloth's monkey-patching holds hidden
-    references to GPU tensors that prevent model.to("cpu") from actually
-    releasing GPU memory. Destroying the entire state and letting Python's
-    garbage collector + torch.cuda.empty_cache() reclaim memory is the only
-    reliable approach — same pattern as Megatron (whose training subprocess
-    exits after each step, releasing everything).
+    Created fresh each step in a new subprocess. The subprocess is killed
+    after training, which is the only reliable way to free GPU memory
+    (Unsloth's monkey-patching holds module-level tensor caches).
     """
 
     model: Any  # PeftModelForCausalLM after FastLanguageModel.get_peft_model()
@@ -264,52 +263,6 @@ class UnslothTrainingWorker:
 
         self._state = UnslothTrainingState(model=model, tokenizer=tokenizer, optimizer=optimizer)
         return {"trainable_params": n_params}
-
-    async def destroy_model(self) -> dict[str, float]:
-        """Destroy model + optimizer entirely, freeing ALL GPU memory.
-
-        Unsloth's monkey-patching holds hidden references to GPU tensors
-        that prevent model.to("cpu") from releasing memory.  The only
-        reliable approach is to delete everything and let Python's GC +
-        torch.cuda.empty_cache() reclaim the memory.
-
-        This matches Megatron's pattern: its training subprocess exits
-        after each step, which releases all GPU memory via process death.
-        """
-        t0 = time.perf_counter()
-
-        if self._state is not None:
-            # Break circular references as much as possible
-            try:
-                self._state.model.gradient_checkpointing_disable()
-            except Exception:
-                pass
-            try:
-                self._state.optimizer.zero_grad(set_to_none=True)
-            except Exception:
-                pass
-
-            # Delete in order: optimizer (refs model params) → model → state
-            del self._state.optimizer
-            del self._state.model
-            del self._state.tokenizer
-            del self._state
-            self._state = None
-
-        # Aggressive GC — multiple rounds to catch reference cycles
-        for _ in range(5):
-            gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        free_gb = torch.cuda.mem_get_info()[0] / 1e9
-        elapsed = time.perf_counter() - t0
-        logger.info(
-            f"Model destroyed in {elapsed:.2f}s (GPU free: {free_gb:.1f} GB)"
-        )
-        return {"destroy_time_s": elapsed, "gpu_free_gb": free_gb}
 
     async def train_on_packed_tensors(
         self,
@@ -467,12 +420,13 @@ class UnslothSGLangService:
       1. SGLang serves rollouts (inference)
       2. Benchmark runner tokenizes/packs data via ART preprocessing
       3. sleep()  — SGLang releases GPU memory
-      4. init_model()  — load base model + resume LoRA from previous checkpoint
-      5. Unsloth trains on packed tensors using art.loss.loss_fn
-      6. Save LoRA adapter
-      7. destroy_model()  — delete model entirely, free ALL GPU memory
-      8. wake_up()  — SGLang restores GPU memory
-      9. load_lora()  — SGLang loads new adapter (<2s)
+      4. Spawn fresh training subprocess
+      5. init_model()  — load base model + resume LoRA from previous checkpoint
+      6. Unsloth trains on packed tensors using art.loss.loss_fn
+      7. Save LoRA adapter
+      8. KILL subprocess  — process death frees ALL GPU memory
+      9. wake_up()  — SGLang restores GPU memory
+     10. load_lora()  — SGLang loads new adapter (<2s)
     """
 
     model_name: str
@@ -500,6 +454,7 @@ class UnslothSGLangService:
     _latest_step: int = 0
     _is_sleeping: bool = False
     _active_lora_name: str | None = None
+    _last_checkpoint: str | None = None  # LoRA checkpoint from previous step
 
     def __post_init__(self) -> None:
         if not self.log_dir:
@@ -537,23 +492,18 @@ class UnslothSGLangService:
             lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         ))
 
-    async def start(self) -> float:
-        """Start SGLang server and persistent training subprocess.
+    def _spawn_worker(self, last_checkpoint: str | None = None) -> Any:
+        """Spawn a FRESH training subprocess.
 
-        The training subprocess is created here but the model is loaded
-        lazily on the first train_step() (after SGLang sleeps and frees
-        GPU memory). This matches the Megatron pattern.
+        Each training step gets a brand new process. When that process is
+        killed after training, ALL GPU memory is released — guaranteed by
+        the OS. This is the same pattern Megatron uses (its training
+        process exits after each step).
+
+        Unsloth's monkey-patching holds module-level caches that reference
+        GPU tensors, so neither model.to("cpu"), explicit param offload,
+        nor del model + gc can free GPU memory within a living process.
         """
-        self._server = self._create_server()
-        startup = await self._server.start()
-        logger.info(
-            f"SGLang ready — {self.base_model} on :{self.port} "
-            f"(startup {startup:.1f}s, will NOT restart)"
-        )
-
-        # Create persistent training subprocess via mp_actors.
-        # The worker object is lightweight at creation (just config strings/ints).
-        # Model loading happens later in init_model() after SGLang sleeps.
         from mp_actors import move_to_child_process
 
         worker = UnslothTrainingWorker(
@@ -566,27 +516,47 @@ class UnslothSGLangService:
             moe_backend=self.moe_backend,
             load_in_4bit=self.load_in_4bit,
         )
-        self._worker = move_to_child_process(
+        # Set the checkpoint to resume from (if any)
+        worker._last_checkpoint = last_checkpoint
+        proxy = move_to_child_process(
             worker,
             log_file=os.path.join(self.log_dir, "unsloth_worker.log"),
             process_name="unsloth-trainer",
         )
-        logger.info("Unsloth training subprocess started (model will load on first train_step)")
+        return proxy
 
-        return startup
-
-    async def stop(self) -> None:
-        """Stop everything. Called once at benchmark end."""
-        # Terminate the persistent training subprocess
+    def _kill_worker(self) -> None:
+        """Kill the training subprocess, releasing ALL GPU memory."""
         if self._worker is not None:
             from mp_actors import close_proxy
+            t0 = time.perf_counter()
             try:
                 close_proxy(self._worker)
             except Exception:
                 pass
             self._worker = None
-            logger.info("Unsloth training subprocess terminated")
+            elapsed = time.perf_counter() - t0
+            logger.info(f"Training subprocess killed in {elapsed:.2f}s (GPU memory released)")
 
+    async def start(self) -> float:
+        """Start SGLang server.
+
+        The training subprocess is created fresh for each train_step()
+        and killed afterwards — the only reliable way to free GPU memory
+        when Unsloth holds module-level tensor caches.
+        """
+        self._server = self._create_server()
+        startup = await self._server.start()
+        logger.info(
+            f"SGLang ready — {self.base_model} on :{self.port} "
+            f"(startup {startup:.1f}s, will NOT restart)"
+        )
+        logger.info("Unsloth training subprocess will be spawned fresh per step")
+        return startup
+
+    async def stop(self) -> None:
+        """Stop everything. Called once at benchmark end."""
+        self._kill_worker()
         if self._server is not None:
             await self._server.stop()
             self._server = None
@@ -675,73 +645,64 @@ class UnslothSGLangService:
           - Same data pipeline: ART's packed tensors
           - Same loss function: art.loss.loss_fn with on_policy_correction=True
           - Same GPU time-sharing: sleep/wake cycle
-          - Same model lifecycle: load fresh each step, destroy after training
-            (Megatron's training subprocess exits; we destroy + gc instead)
+          - Same model lifecycle: fresh subprocess per step, killed after
 
         Loop:
           1. sleep()          — SGLang releases KV cache + weights
-          2. init_model()     — load base model + previous LoRA checkpoint
-          3. train            — ART loss on packed tensors
-          4. save_lora()      — save adapter to disk
-          5. destroy_model()  — delete model entirely, free ALL GPU memory
-          6. wake_up()        — SGLang restores KV cache + weights
-          7. load_lora()      — hot-reload adapter (<2s)
-
-        Args:
-            packed_tensors_dir: Path to directory with ART packed tensors
-                (tokens.pt, logprobs.pt, advantages.pt, etc.)
-            num_sequences: Number of packed sequences on disk.
-            sequence_length: Sequence length of each packed sequence.
-            lr: Learning rate override (optional).
-
-        Returns:
-            Dict of training + overhead metrics.
+          2. spawn worker     — new subprocess (fresh CUDA context)
+          3. init_model()     — load base model + previous LoRA checkpoint
+          4. train            — ART loss on packed tensors
+          5. save_lora()      — save adapter to disk
+          6. KILL worker      — subprocess dies, ALL GPU memory freed
+          7. wake_up()        — SGLang restores KV cache + weights
+          8. load_lora()      — hot-reload adapter (<2s)
         """
-        assert self._worker is not None, "call start() before train_step()"
-
         timings: dict[str, float] = {}
         t_total = time.perf_counter()
 
         # 1. Sleep SGLang — free GPU for training
         timings["sleep_s"] = await self.sleep()
 
-        # 2. Load model fresh (base + previous LoRA checkpoint if any)
-        # This replaces the old offload/reload approach. Unsloth's
-        # monkey-patching prevents reliable GPU memory release via
-        # model.to("cpu"), so we destroy + reload each step instead.
+        # 2. Spawn a FRESH training subprocess.
+        # This is the key insight: Unsloth holds module-level GPU tensor
+        # caches that survive del + gc + empty_cache. The ONLY way to
+        # free that memory is to kill the process (same as Megatron).
         t = time.perf_counter()
+        self._worker = self._spawn_worker(last_checkpoint=self._last_checkpoint)
+
+        # 3. Load model (base + previous LoRA if any)
         init_result = await self._worker.init_model()
         n_params = init_result.get("trainable_params", "?")
         logger.info(f"Unsloth worker model loaded — {n_params:,} trainable params")
         timings["model_load_s"] = time.perf_counter() - t
 
-        # 3. Train on packed tensors — uses art.loss.loss_fn (same as Megatron)
+        # 4. Train on packed tensors — uses art.loss.loss_fn (same as Megatron)
         train_metrics = await self._worker.train_on_packed_tensors(
             packed_tensors_dir, num_sequences, sequence_length, lr,
         )
 
-        # 4. Save LoRA
+        # 5. Save LoRA
         t = time.perf_counter()
         self._latest_step += 1
         ckpt = await self._worker.save_lora(self._latest_step)
+        self._last_checkpoint = ckpt  # track for next step's resume
         timings["save_s"] = time.perf_counter() - t
 
-        # 5. DESTROY model entirely — free ALL GPU memory for SGLang
-        # This is the key difference from the broken offload approach.
-        # Unsloth keeps hidden references to GPU tensors; only full
-        # deletion + gc reliably frees memory.
+        # 6. KILL the subprocess — ALL GPU memory freed (guaranteed by OS)
         t = time.perf_counter()
-        destroy_result = await self._worker.destroy_model()
-        timings["destroy_s"] = destroy_result.get("destroy_time_s", 0)
-        gpu_free = destroy_result.get("gpu_free_gb", 0)
+        self._kill_worker()
+        timings["kill_s"] = time.perf_counter() - t
 
-        # 6. Wake SGLang — GPU is now free, restore weights + KV cache
+        # Small wait for CUDA driver to fully reclaim memory
+        await asyncio.sleep(2)
+
+        # 7. Wake SGLang — GPU is now truly free
         timings["wake_s"] = await self.wake_up()
 
-        # 7. Hot-reload LoRA
+        # 8. Hot-reload LoRA
         timings["lora_reload_s"] = await self._load_lora(ckpt, self._latest_step)
 
-        # 8. Health check — if SGLang crashed, restart
+        # 9. Health check — if SGLang crashed, restart
         if self._server is not None and not self._server.is_running:
             logger.warning("SGLang server died after wake — restarting...")
             t = time.perf_counter()
@@ -760,8 +721,7 @@ class UnslothSGLangService:
         logger.info(
             f"Step {self._latest_step} done — "
             f"train={train_metrics['training_time_s']:.1f}s  "
-            f"overhead={timings['total_overhead_s']:.1f}s  "
-            f"GPU free after destroy: {gpu_free:.1f} GB"
+            f"overhead={timings['total_overhead_s']:.1f}s"
         )
 
         return {**train_metrics, **timings}
