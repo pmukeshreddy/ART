@@ -225,7 +225,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
         # GPU split — None means auto-detect in UnslothSGLangService
         inference_gpus = cfg.get("inference_gpus")
-        training_gpu = cfg.get("training_gpu")
+        training_gpus = cfg.get("training_gpus")
 
         svc = UnslothSGLangService(
             model_name="bench-unsloth",
@@ -241,7 +241,7 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
             learning_rate=lr,
             moe_backend=unsloth_moe_backend,
             inference_gpus=inference_gpus,
-            training_gpu=training_gpu,
+            training_gpus=training_gpus,
         )
 
         run = BenchmarkRun(backend="unsloth", model=model_id, dataset=dataset)
@@ -528,9 +528,12 @@ def parse_args():
     p.add_argument("--inference-gpus", type=str, default="",
                    help="Comma-separated GPU IDs for SGLang inference (e.g. '0,2,3'). "
                         "Auto-detected if not set: all GPUs except --training-gpu.")
+    p.add_argument("--training-gpus", type=str, default="",
+                   help="Comma-separated GPU IDs for Unsloth training (e.g. '1,3' for DDP). "
+                        "Auto-detected if not set. Use '-1' to force shared mode (sleep/wake).")
+    # Backward compat alias
     p.add_argument("--training-gpu", type=int, default=None,
-                   help="GPU ID for Unsloth training (e.g. 1). "
-                        "Auto-detected if not set. Use -1 to force shared mode (sleep/wake).")
+                   help=argparse.SUPPRESS)
     return p.parse_args()
 
 
@@ -569,7 +572,13 @@ def main():
     inference_gpus = None
     if args.inference_gpus:
         inference_gpus = [int(g.strip()) for g in args.inference_gpus.split(",")]
-    training_gpu = args.training_gpu  # None = auto-detect, -1 = shared mode
+
+    # training_gpus: new comma-separated arg, or backward-compat single --training-gpu
+    training_gpus = None
+    if args.training_gpus:
+        training_gpus = [int(g.strip()) for g in args.training_gpus.split(",")]
+    elif args.training_gpu is not None:
+        training_gpus = [args.training_gpu]  # backward compat: single int → list
 
     cfg = {
         "model": args.model,
@@ -591,7 +600,7 @@ def main():
         "unsloth_moe_backend": args.unsloth_moe_backend,
         # GPU split (None = auto-detect)
         "inference_gpus": inference_gpus,
-        "training_gpu": training_gpu,
+        "training_gpus": training_gpus,
     }
 
     backends_str = " + ".join(b.upper() for b in args.backends)

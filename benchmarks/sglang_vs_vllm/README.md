@@ -18,13 +18,14 @@ Benchmark for the Unsloth + SGLang backend that combines SGLang for inference wi
 │  │  ┌──────────┐  ┌────────────┐   │  │  • LoRA + Optimizer   │   │
 │  │  │  TP=2    │  │  LoRA      │   │  │  • ART loss function  │   │
 │  │  │  Model   │  │  Hot-reload│   │  │                       │   │
-│  │  │  Shards  │  │  < 2s      │   │  └───────────────────────┘   │
-│  │  └──────────┘  └────────────┘   │          GPU 3: spare        │
+│  │  │  Shards  │  │  < 2s      │   │  │   Unsloth DDP rank 1  │   │
+│  │  └──────────┘  └────────────┘   │  └───────────────────────┘   │
 │  └─────────────────────────────────┘                              │
 │                                                                   │
 │  ✓ No sleep/wake overhead                                         │
 │  ✓ SGLang stays active during training                            │
 │  ✓ TP must be power of 2 (vocab size constraint)                  │
+│  ✓ Spare GPUs used for DDP training (near-linear speedup)         │
 │  ✓ Generation is 70-90% of RL time → more inference GPUs = win    │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -32,16 +33,17 @@ Benchmark for the Unsloth + SGLang backend that combines SGLang for inference wi
 ### Auto-Detected GPU Splits
 
 TP must be a power of 2 (model vocab sizes like Qwen3's 151936 are divisible by 1,2,4,8 but NOT 3).
+Spare GPUs beyond TP are assigned to training for DDP (near-linear training speedup).
 
-| GPUs Available | Inference GPUs | TP Size | Training GPU | Spare GPUs | Mode |
-|:-:|:-:|:-:|:-:|:-:|:-:|
-| 8 | 0, 2, 3, 4 | 4 | 1 | 5, 6, 7 | **Dedicated** |
-| 4 | 0, 2 | 2 | 1 | 3 | **Dedicated** |
-| 3 | 0, 2 | 2 | 1 | — | **Dedicated** |
-| 2 | 0 | 1 | 1 | — | **Dedicated** |
-| 1 | 0 | 1 | 0 | — | Shared (sleep/wake) |
+| GPUs Available | Inference GPUs | TP Size | Training GPUs | Mode |
+|:-:|:-:|:-:|:-:|:-:|
+| 8 | 0, 2, 3, 4 | 4 | 1, 5, 6, 7 (DDP x4) | **Dedicated** |
+| 4 | 0, 2 | 2 | 1, 3 (DDP x2) | **Dedicated** |
+| 3 | 0, 2 | 2 | 1 | **Dedicated** |
+| 2 | 0 | 1 | 1 | **Dedicated** |
+| 1 | 0 | 1 | 0 | Shared (sleep/wake) |
 
-GPU 1 is chosen for training to keep GPU 0 as the primary SGLang rank.
+GPU 1 is chosen as primary training GPU to keep GPU 0 as the primary SGLang rank.
 
 ### Key Features
 
@@ -107,14 +109,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python benchmarks/sglang_vs_vllm/run_benchma
     --sglang-python ~/.venvs/sglang-bench/bin/python \
     --num-steps 10 --num-rollouts 64 --dataset gsm8k
 
-# Explicit GPU split: inference on GPUs 0,2,3 (TP=3), training on GPU 1
+# Explicit GPU split: inference on GPUs 0,2 (TP=2), DDP training on GPUs 1,3
 uv run python benchmarks/sglang_vs_vllm/run_benchmark.py \
-    --inference-gpus 0,2,3 --training-gpu 1 \
+    --inference-gpus 0,2 --training-gpus 1,3 \
     --sglang-python ~/.venvs/sglang-bench/bin/python
 
 # Force shared mode (sleep/wake) even with multiple GPUs
 uv run python benchmarks/sglang_vs_vllm/run_benchmark.py \
-    --training-gpu -1 \
+    --training-gpus -1 \
     --sglang-python ~/.venvs/sglang-bench/bin/python
 ```
 
@@ -127,7 +129,7 @@ uv run python benchmarks/sglang_vs_vllm/run_benchmark.py \
 | `--num-steps` | `3` | Number of RL training steps |
 | `--num-rollouts` | `16` | Rollouts per step |
 | `--inference-gpus` | auto | Comma-separated GPU IDs for SGLang inference (e.g. `0,2,3`) |
-| `--training-gpu` | auto | GPU ID for Unsloth training (e.g. `1`), `-1` for shared mode |
+| `--training-gpus` | auto | Comma-separated GPU IDs for training (e.g. `1,3` for DDP), `-1` for shared mode |
 | `--tp` | `0` (auto) | Tensor parallel size (overridden by `--inference-gpus` count) |
 | `--unsloth-lora-rank` | `1` | LoRA rank for Unsloth training |
 | `--unsloth-moe-backend` | `auto` | MoE backend: auto, grouped_mm (H100+), unsloth_triton (A100) |

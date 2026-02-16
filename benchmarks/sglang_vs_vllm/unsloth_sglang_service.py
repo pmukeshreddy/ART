@@ -13,12 +13,12 @@ GPU allocation modes:
   DEDICATED (multi-GPU, recommended for 2+ GPUs):
     SGLang inference and Unsloth training run on SEPARATE GPUs.
     Example with 4 GPUs:
-      - GPUs 0,2,3: SGLang with TP=3  (fast inference)
-      - GPU 1:      Unsloth training   (dedicated)
+      - GPUs 0,2: SGLang with TP=2   (fast inference)
+      - GPUs 1,3: Unsloth DDP x2     (parallel training)
     Benefits:
       - NO sleep/wake overhead (GPUs never shared)
       - SGLang stays fully active during training
-      - Higher inference throughput (TP=3 vs TP=2)
+      - Spare GPUs used for DDP training (near-linear speedup)
       - Generation is 70-90% of RL time, so more inference GPUs = real speedup
 
   SHARED (single-GPU fallback):
@@ -53,12 +53,16 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import logging
 import os
+import socket
+import subprocess
 import sys
 import time
 import types
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 import torch
@@ -433,14 +437,15 @@ class UnslothSGLangService:
     Uses ART's data pipeline and loss function for identical training behavior.
 
     GPU allocation (auto-detected from num_gpus if not specified):
-      4 GPUs:  inference=[0,2,3] TP=3, training=GPU 1
-      3 GPUs:  inference=[0,2]   TP=2, training=GPU 1
-      2 GPUs:  inference=[0]     TP=1, training=GPU 1
+      8 GPUs:  inference=[0,2,3,4] TP=4, training=[1,5,6,7] (DDP x4)
+      4 GPUs:  inference=[0,2]     TP=2, training=[1,3]     (DDP x2)
+      3 GPUs:  inference=[0,2]     TP=2, training=[1]
+      2 GPUs:  inference=[0]       TP=1, training=[1]
       1 GPU:   shared mode — sleep/wake (no split)
 
     In dedicated mode, SGLang stays fully active during training.
-    No sleep/wake overhead. Generation is 70-90% of RL wall time,
-    so giving more GPUs to inference is a real speedup.
+    No sleep/wake overhead. When multiple training GPUs are available,
+    DDP is used for near-linear training speedup.
     """
 
     model_name: str
@@ -455,10 +460,10 @@ class UnslothSGLangService:
 
     # GPU split — None means auto-detect from available GPUs.
     # inference_gpus: list of physical GPU IDs for SGLang (e.g. [0, 2, 3])
-    # training_gpu: single physical GPU ID for Unsloth (e.g. 1)
-    # When training_gpu is -1, shared mode is used (sleep/wake on same GPUs).
+    # training_gpus: list of physical GPU IDs for Unsloth (e.g. [1] or [1, 3] for DDP)
+    # When training_gpus is [-1], shared mode is used (sleep/wake on same GPUs).
     inference_gpus: list[int] | None = None
-    training_gpu: int | None = None
+    training_gpus: list[int] | None = None
 
     # Unsloth config
     lora_rank: int = 1
@@ -488,7 +493,7 @@ class UnslothSGLangService:
             os.environ["UNSLOTH_MOE_BACKEND"] = self.moe_backend
 
         # Auto-detect GPU split if not specified
-        if self.inference_gpus is None or self.training_gpu is None:
+        if self.inference_gpus is None or self.training_gpus is None:
             self._auto_detect_gpu_split()
 
     def _auto_detect_gpu_split(self) -> None:
@@ -499,44 +504,51 @@ class UnslothSGLangService:
         (e.g. Qwen3's vocab_size=151936 is divisible by 1,2,4,8 but NOT 3)
 
         Strategy for N GPUs:
-          N >= 2: training = GPU 1, inference = remaining GPUs
-                  TP = largest power of 2 that fits in (N-1) GPUs
-                  Extra GPUs beyond TP are left idle.
-          N == 1: shared mode (training_gpu=-1, sleep/wake fallback)
+          N >= 2: GPU 1 = primary training GPU, remaining GPUs for inference.
+                  TP = largest power of 2 that fits in remaining GPUs.
+                  Spare GPUs (beyond TP) are added to training for DDP.
+          N == 1: shared mode (training_gpus=[-1], sleep/wake fallback)
 
         Examples:
-          8 GPUs: TP=4, inference=[0,2,3,4], training=1, spare=[5,6,7]
-          4 GPUs: TP=2, inference=[0,2],      training=1, spare=[3]
-          3 GPUs: TP=2, inference=[0,2],      training=1
-          2 GPUs: TP=1, inference=[0],        training=1
+          8 GPUs: TP=4, inference=[0,2,3,4], training=[1,5,6,7] (DDP x4)
+          4 GPUs: TP=2, inference=[0,2],      training=[1,3]     (DDP x2)
+          3 GPUs: TP=2, inference=[0,2],      training=[1]
+          2 GPUs: TP=1, inference=[0],        training=[1]
           1 GPU:  shared mode (sleep/wake)
         """
         num_gpus = torch.cuda.device_count()
 
         if num_gpus >= 2:
-            self.training_gpu = 1
-            available_for_inference = num_gpus - 1  # reserve 1 for training
+            primary_training_gpu = 1
+            non_training = [i for i in range(num_gpus) if i != primary_training_gpu]
 
             # Largest power of 2 that fits
             tp = 1
-            while tp * 2 <= available_for_inference:
+            while tp * 2 <= len(non_training):
                 tp *= 2
 
-            # Pick `tp` GPUs from [0, 2, 3, 4, ...] (skip GPU 1 = training)
-            all_inference = [i for i in range(num_gpus) if i != self.training_gpu]
-            self.inference_gpus = all_inference[:tp]
+            self.inference_gpus = non_training[:tp]
             self.tensor_parallel_size = tp
 
-            spare = all_inference[tp:]
-            spare_msg = f", spare={spare}" if spare else ""
-            logger.info(
-                f"GPU split auto-detected ({num_gpus} GPUs): "
-                f"inference={self.inference_gpus} (TP={tp}), "
-                f"training=GPU {self.training_gpu}{spare_msg}"
-            )
+            # Spare GPUs become additional training GPUs (DDP)
+            spare = non_training[tp:]
+            self.training_gpus = [primary_training_gpu] + spare
+
+            if len(self.training_gpus) > 1:
+                logger.info(
+                    f"GPU split auto-detected ({num_gpus} GPUs): "
+                    f"inference={self.inference_gpus} (TP={tp}), "
+                    f"training={self.training_gpus} (DDP x{len(self.training_gpus)})"
+                )
+            else:
+                logger.info(
+                    f"GPU split auto-detected ({num_gpus} GPUs): "
+                    f"inference={self.inference_gpus} (TP={tp}), "
+                    f"training=GPU {self.training_gpus[0]}"
+                )
         else:
             # Single GPU — shared mode
-            self.training_gpu = -1
+            self.training_gpus = [-1]
             self.inference_gpus = []
             logger.info("Single GPU detected — using shared mode (sleep/wake)")
 
@@ -544,8 +556,9 @@ class UnslothSGLangService:
     def _dedicated_gpus(self) -> bool:
         """True if inference and training run on separate GPUs (no sleep/wake)."""
         return (
-            self.training_gpu is not None
-            and self.training_gpu >= 0
+            self.training_gpus is not None
+            and len(self.training_gpus) > 0
+            and self.training_gpus[0] >= 0
             and bool(self.inference_gpus)
         )
 
@@ -591,13 +604,17 @@ class UnslothSGLangService:
         training subprocess only sees the training GPU (e.g. GPU 1).
         This ensures Unsloth loads the model on the correct device and
         doesn't interfere with SGLang's inference GPUs.
+
+        NOTE: This path is for single-GPU training only. For multi-GPU DDP,
+        see _train_step_ddp() which uses torchrun instead.
         """
         from mp_actors import move_to_child_process
 
         # Pin training to the dedicated GPU before spawning
         if self._dedicated_gpus:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.training_gpu)
-            logger.info(f"Training subprocess pinned to GPU {self.training_gpu}")
+            gpu_id = self.training_gpus[0]  # type: ignore[index]
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            logger.info(f"Training subprocess pinned to GPU {gpu_id}")
 
         worker = UnslothTrainingWorker(
             base_model=self.base_model,
@@ -652,9 +669,14 @@ class UnslothSGLangService:
                 f"(startup {startup:.1f}s, TP={self.tensor_parallel_size}, "
                 f"inference GPUs={self.inference_gpus})"
             )
+            train_desc = (
+                f"training={self.training_gpus} (DDP x{len(self.training_gpus)})"
+                if len(self.training_gpus) > 1  # type: ignore[arg-type]
+                else f"training=GPU {self.training_gpus[0]}"  # type: ignore[index]
+            )
             logger.info(
                 f"Dedicated GPU split: inference={self.inference_gpus}, "
-                f"training=GPU {self.training_gpu} (NO sleep/wake needed)"
+                f"{train_desc} (NO sleep/wake needed)"
             )
         else:
             logger.info(
@@ -750,10 +772,16 @@ class UnslothSGLangService:
     ) -> dict[str, float]:
         """One complete training step.
 
-        Dispatches to dedicated or shared mode based on GPU configuration.
-        Both modes use identical data pipeline and loss function.
+        Dispatches based on GPU configuration:
+          - Multiple training GPUs → DDP via torchrun
+          - Single dedicated GPU   → mp_actors subprocess
+          - No dedicated GPU       → shared mode (sleep/wake)
         """
-        if self._dedicated_gpus:
+        if self._dedicated_gpus and self.training_gpus and len(self.training_gpus) > 1:
+            return await self._train_step_ddp(
+                packed_tensors_dir, num_sequences, sequence_length, lr,
+            )
+        elif self._dedicated_gpus:
             return await self._train_step_dedicated(
                 packed_tensors_dir, num_sequences, sequence_length, lr,
             )
@@ -796,7 +824,7 @@ class UnslothSGLangService:
         init_result = await self._worker.init_model()
         n_params = init_result.get("trainable_params", "?")
         logger.info(
-            f"Unsloth worker on GPU {self.training_gpu} — "
+            f"Unsloth worker on GPU {self.training_gpus[0]} — "  # type: ignore[index]
             f"{n_params:,} trainable params"
         )
         timings["model_load_s"] = time.perf_counter() - t
@@ -828,6 +856,164 @@ class UnslothSGLangService:
 
         logger.info(
             f"Step {self._latest_step} done (dedicated GPU) — "
+            f"train={train_metrics['training_time_s']:.1f}s  "
+            f"overhead={timings['total_overhead_s']:.1f}s  "
+            f"(no sleep/wake)"
+        )
+
+        return {**train_metrics, **timings}
+
+    @staticmethod
+    def _find_free_port() -> int:
+        """Find a free port for DDP master."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+    async def _train_step_ddp(
+        self,
+        packed_tensors_dir: str,
+        num_sequences: int,
+        sequence_length: int,
+        lr: float | None = None,
+    ) -> dict[str, float]:
+        """Training on multiple GPUs via DDP (torchrun).
+
+        Launches train_ddp.py via torchrun with CUDA_VISIBLE_DEVICES
+        set to the training GPUs. Communication is via files on disk:
+          - Input: packed tensors (already saved by benchmark runner)
+          - Output: LoRA checkpoint + metrics JSON
+
+        Loop:
+          1. Write config JSON for the DDP script
+          2. Launch torchrun subprocess
+          3. Wait for completion, read metrics JSON
+          4. Hot-reload LoRA into SGLang
+        """
+        assert self.training_gpus is not None and len(self.training_gpus) > 1
+
+        timings: dict[str, float] = {}
+        t_total = time.perf_counter()
+        timings["sleep_s"] = 0.0  # No sleep needed — dedicated GPUs
+
+        self._latest_step += 1
+
+        # 1. Write config for the DDP training script
+        ddp_config = {
+            "base_model": self.base_model,
+            "output_dir": self.output_dir,
+            "lora_rank": self.lora_rank,
+            "lora_alpha": self.lora_alpha,
+            "max_seq_length": self.max_seq_length,
+            "learning_rate": self.learning_rate,
+            "moe_backend": self.moe_backend,
+            "load_in_4bit": self.load_in_4bit,
+            "last_checkpoint": self._last_checkpoint,
+            "packed_tensors_dir": packed_tensors_dir,
+            "num_sequences": num_sequences,
+            "sequence_length": sequence_length,
+            "lr": lr,
+            "step_number": self._latest_step,
+            "results_file": os.path.join(
+                self.log_dir, f"ddp_results_step{self._latest_step:04d}.json"
+            ),
+        }
+        config_file = os.path.join(
+            self.log_dir, f"ddp_config_step{self._latest_step:04d}.json"
+        )
+        with open(config_file, "w") as f:
+            json.dump(ddp_config, f, indent=2)
+
+        # 2. Launch torchrun
+        n_gpus = len(self.training_gpus)
+        cuda_vis = ",".join(str(g) for g in self.training_gpus)
+        master_port = self._find_free_port()
+
+        train_script = os.path.join(
+            os.path.dirname(__file__), "train_ddp.py"
+        )
+
+        # Use the same python as the current venv
+        python_exe = sys.executable
+
+        cmd = [
+            python_exe, "-m", "torch.distributed.run",
+            f"--nproc_per_node={n_gpus}",
+            f"--master_port={master_port}",
+            train_script,
+            "--config", config_file,
+        ]
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = cuda_vis
+        # Ensure project root is on PYTHONPATH
+        project_root = str(Path(__file__).parent.parent.parent)
+        extra_paths = [project_root, os.path.join(project_root, "src")]
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(
+            extra_paths + ([existing] if existing else [])
+        )
+
+        logger.info(
+            f"DDP training: {n_gpus} GPUs {self.training_gpus}, "
+            f"master_port={master_port}"
+        )
+
+        t = time.perf_counter()
+        stderr_log = os.path.join(
+            self.log_dir, f"ddp_stderr_step{self._latest_step:04d}.log"
+        )
+
+        # Run torchrun in a thread to avoid blocking the event loop
+        stdout_log = os.path.join(
+            self.log_dir, f"ddp_stdout_step{self._latest_step:04d}.log"
+        )
+
+        def _run_torchrun():
+            with open(stdout_log, "w") as fout, open(stderr_log, "w") as ferr:
+                return subprocess.run(cmd, env=env, stdout=fout, stderr=ferr)
+
+        loop = asyncio.get_event_loop()
+        proc_result = await loop.run_in_executor(None, _run_torchrun)
+
+        timings["torchrun_s"] = time.perf_counter() - t
+
+        if proc_result.returncode != 0:
+            # Read stderr for error details
+            err_msg = ""
+            if os.path.exists(stderr_log):
+                with open(stderr_log) as f:
+                    err_msg = f.read()[-2000:]  # last 2000 chars
+            raise RuntimeError(
+                f"DDP training failed (exit code {proc_result.returncode}). "
+                f"Stderr: {err_msg}"
+            )
+
+        # 3. Read results from DDP script
+        results_file = ddp_config["results_file"]
+        if not os.path.exists(results_file):
+            raise RuntimeError(
+                f"DDP training completed but no results file at {results_file}"
+            )
+
+        with open(results_file) as f:
+            train_metrics = json.load(f)
+
+        ckpt = train_metrics.pop("checkpoint")
+        self._last_checkpoint = ckpt
+        timings["save_s"] = 0.0  # save timing is included in torchrun_s
+
+        # No kill needed — torchrun subprocess already exited
+        timings["kill_s"] = 0.0
+        timings["wake_s"] = 0.0
+
+        # 4. Hot-reload LoRA into SGLang
+        timings["lora_reload_s"] = await self._load_lora(ckpt, self._latest_step)
+        timings["total_overhead_s"] = time.perf_counter() - t_total
+        timings["model_load_s"] = 0.0  # included in torchrun_s
+
+        logger.info(
+            f"Step {self._latest_step} done (DDP x{n_gpus}) — "
             f"train={train_metrics['training_time_s']:.1f}s  "
             f"overhead={timings['total_overhead_s']:.1f}s  "
             f"(no sleep/wake)"

@@ -113,41 +113,42 @@ def _find_sglang_python() -> str:
     return "python"
 
 
-def compute_gpu_split(num_gpus: int) -> tuple[list[int], int]:
+def compute_gpu_split(num_gpus: int) -> tuple[list[int], list[int]]:
     """Compute the recommended inference/training GPU split.
 
-    Returns (inference_gpu_ids, training_gpu_id).
-    training_gpu_id == -1 means shared mode (single GPU, sleep/wake).
+    Returns (inference_gpu_ids, training_gpu_ids).
+    training_gpu_ids == [-1] means shared mode (single GPU, sleep/wake).
 
     TP size must be a power of 2 — most model vocab sizes are divisible
     by powers of 2 but NOT arbitrary numbers (e.g. Qwen3 vocab=151936
     is divisible by 1,2,4,8 but NOT 3).
 
     Strategy — maximize inference throughput since generation is 70-90% of
-    RL wall time:
-      8 GPUs: inference=[0,2,3,4] TP=4, training=GPU 1, spare=[5,6,7]
-      4 GPUs: inference=[0,2]     TP=2, training=GPU 1, spare=[3]
-      3 GPUs: inference=[0,2]     TP=2, training=GPU 1
-      2 GPUs: inference=[0]       TP=1, training=GPU 1
-      1 GPU:  shared mode         (training_gpu=-1)
+    RL wall time. Spare GPUs beyond TP are assigned to training for DDP:
+      8 GPUs: inference=[0,2,3,4] TP=4, training=[1,5,6,7] (DDP x4)
+      4 GPUs: inference=[0,2]     TP=2, training=[1,3]     (DDP x2)
+      3 GPUs: inference=[0,2]     TP=2, training=[1]
+      2 GPUs: inference=[0]       TP=1, training=[1]
+      1 GPU:  shared mode         (training_gpus=[-1])
 
-    GPU 1 is chosen for training to keep GPU 0 as the primary SGLang
-    rank (many monitoring tools assume GPU 0 is primary).
+    GPU 1 is chosen as primary training GPU to keep GPU 0 as the primary
+    SGLang rank (many monitoring tools assume GPU 0 is primary).
     """
     if num_gpus >= 2:
-        training_gpu = 1
-        available = num_gpus - 1
+        primary_training_gpu = 1
+        non_training = [i for i in range(num_gpus) if i != primary_training_gpu]
 
         # Largest power of 2 that fits
         tp = 1
-        while tp * 2 <= available:
+        while tp * 2 <= len(non_training):
             tp *= 2
 
-        all_inference = [i for i in range(num_gpus) if i != training_gpu]
-        inference_gpus = all_inference[:tp]
-        return inference_gpus, training_gpu
+        inference_gpus = non_training[:tp]
+        spare = non_training[tp:]
+        training_gpus = [primary_training_gpu] + spare
+        return inference_gpus, training_gpus
     else:
-        return [], -1
+        return [], [-1]
 
 
 # ---------------------------------------------------------------------------
