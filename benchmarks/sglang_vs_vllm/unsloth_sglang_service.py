@@ -808,13 +808,13 @@ class UnslothSGLangService:
         SGLang stays fully active on inference GPUs while Unsloth trains
         on its own GPU. This eliminates all sleep/wake overhead.
 
-        Loop:
-          1. spawn worker     — on dedicated training GPU
-          2. init_model()     — load base model + previous LoRA
-          3. train            — ART loss on packed tensors
-          4. save_lora()      — save adapter to disk
-          5. KILL worker      — free training GPU memory
-          6. load_lora()      — hot-reload adapter into SGLang (<2s)
+        The worker is kept alive across steps (persistent mode) so the
+        model is loaded only once. Since training GPUs are separate from
+        inference GPUs, there is no need to free training GPU memory
+        between steps.
+
+        Step 1: spawn → init_model → train → save → lora_reload
+        Step N: train → save → lora_reload  (worker reused, ~0s model load)
         """
         timings: dict[str, float] = {}
         t_total = time.perf_counter()
@@ -822,49 +822,54 @@ class UnslothSGLangService:
         # No sleep needed — SGLang runs on separate GPUs
         timings["sleep_s"] = 0.0
 
-        # 1. Spawn worker on dedicated training GPU
-        t = time.perf_counter()
-        self._worker = self._spawn_worker(last_checkpoint=self._last_checkpoint)
+        # 1. Spawn worker + load model (only on first step)
+        if self._worker is None:
+            t = time.perf_counter()
+            self._worker = self._spawn_worker(last_checkpoint=self._last_checkpoint)
 
-        # 2. Load model
-        init_result = await self._worker.init_model()
-        n_params = init_result.get("trainable_params", "?")
-        logger.info(
-            f"Unsloth worker on GPU {self.training_gpus[0]} — "  # type: ignore[index]
-            f"{n_params:,} trainable params"
-        )
-        timings["model_load_s"] = time.perf_counter() - t
+            init_result = await self._worker.init_model()
+            n_params = init_result.get("trainable_params", "?")
+            logger.info(
+                f"Unsloth worker on GPU {self.training_gpus[0]} — "  # type: ignore[index]
+                f"{n_params:,} trainable params (persistent)"
+            )
+            timings["model_load_s"] = time.perf_counter() - t
+        else:
+            logger.info(
+                f"Reusing persistent worker on GPU {self.training_gpus[0]}"  # type: ignore[index]
+            )
+            timings["model_load_s"] = 0.0
 
-        # 3. Train
+        # 2. Train
         train_metrics = await self._worker.train_on_packed_tensors(
             packed_tensors_dir, num_sequences, sequence_length, lr,
         )
 
-        # 4. Save LoRA
+        # 3. Save LoRA
         t = time.perf_counter()
         self._latest_step += 1
         ckpt = await self._worker.save_lora(self._latest_step)
         self._last_checkpoint = ckpt
         timings["save_s"] = time.perf_counter() - t
 
-        # 5. Kill worker — free training GPU memory
-        t = time.perf_counter()
-        self._kill_worker()
-        timings["kill_s"] = time.perf_counter() - t
+        # Worker stays alive — no kill in dedicated mode.
+        # Cleaned up in stop() at benchmark end.
+        timings["kill_s"] = 0.0
 
         # No wake needed — SGLang never slept
         timings["wake_s"] = 0.0
 
-        # 6. Hot-reload LoRA into SGLang
+        # 4. Hot-reload LoRA into SGLang
         timings["lora_reload_s"] = await self._load_lora(ckpt, self._latest_step)
 
         timings["total_overhead_s"] = time.perf_counter() - t_total
 
+        reused = timings["model_load_s"] == 0.0
         logger.info(
             f"Step {self._latest_step} done (dedicated GPU) — "
             f"train={train_metrics['training_time_s']:.1f}s  "
             f"overhead={timings['total_overhead_s']:.1f}s  "
-            f"(no sleep/wake)"
+            f"({'persistent worker' if reused else 'fresh worker'})"
         )
 
         return {**train_metrics, **timings}
