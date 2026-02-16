@@ -187,14 +187,15 @@ def tokenize_trajectory(
             tokenize=False,
         ),
     )
-    original_token_ids = cast(
-        list[int],
-        tokenizer.apply_chat_template(
-            cast(list[dict], messages),
-            tools=tools,
-            continue_final_message=True,
-        ),
+    original_token_ids_raw = tokenizer.apply_chat_template(
+        cast(list[dict], messages),
+        tools=tools,
+        continue_final_message=True,
     )
+    if hasattr(original_token_ids_raw, "input_ids"):
+        original_token_ids = cast(list[int], list(original_token_ids_raw.input_ids))
+    else:
+        original_token_ids = cast(list[int], list(original_token_ids_raw))
     sentinal_token_id = max(
         set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
     )
@@ -222,14 +223,15 @@ def tokenize_trajectory(
             )
         else:
             token_template_messages.append(cast(dict[str, Any], message))
-    token_ids = cast(
-        list[int],
-        tokenizer.apply_chat_template(
-            cast(list[dict], token_template_messages),
-            tools=tools,
-            continue_final_message=True,
-        ),
+    token_ids_raw = tokenizer.apply_chat_template(
+        cast(list[dict], token_template_messages),
+        tools=tools,
+        continue_final_message=True,
     )
+    if hasattr(token_ids_raw, "input_ids"):
+        token_ids = cast(list[int], list(token_ids_raw.input_ids))
+    else:
+        token_ids = cast(list[int], list(token_ids_raw))
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
     for message in messages_and_choices:
@@ -420,15 +422,16 @@ def tokenize_sft_batches(
             tools = trajectory.tools
 
             # Single-step tokenization: apply_chat_template with tokenize=True
-            input_ids = cast(
-                list[int],
-                tokenizer.apply_chat_template(
-                    cast(Any, messages),
-                    tools=cast(Any, tools),
-                    tokenize=True,
-                    add_generation_prompt=False,
-                ),
+            input_ids_raw = tokenizer.apply_chat_template(
+                cast(Any, messages),
+                tools=cast(Any, tools),
+                tokenize=True,
+                add_generation_prompt=False,
             )
+            if hasattr(input_ids_raw, "input_ids"):
+                input_ids = cast(list[int], list(input_ids_raw.input_ids))
+            else:
+                input_ids = cast(list[int], list(input_ids_raw))
 
             # Create attention mask (all 1s - no padding yet)
             attention_mask = [1] * len(input_ids)
