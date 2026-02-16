@@ -196,34 +196,29 @@ def main():
         sequence_length=sequence_length,
     )
 
-    # Split sequences across ranks: rank i gets sequences [start:end]
-    if num_sequences < world_size:
-        # Fewer sequences than ranks — all ranks process all data.
-        # Each rank divides its loss by world_size to compensate for
-        # DDP's gradient averaging, keeping the effective LR the same.
-        start_idx = 0
-        end_idx = num_sequences
-        my_num_sequences = num_sequences
-        if rank == 0:
-            logger.info(
-                f"Sequence split: {num_sequences} total < {world_size} ranks, "
-                "all ranks process all data (replicated)"
-            )
+    # Split sequences across ranks: rank i gets sequences [start:end].
+    # CRITICAL: all ranks MUST call forward+backward the same number of
+    # times, otherwise DDP deadlocks. We use ceil-division so every rank
+    # loops `iters_per_rank` times; ranks with fewer real sequences do a
+    # zero-loss forward on their last real sequence for the extra iters.
+    seqs_per_rank = num_sequences // world_size
+    remainder = num_sequences % world_size
+    if rank < remainder:
+        start_idx = rank * (seqs_per_rank + 1)
+        end_idx = start_idx + seqs_per_rank + 1
     else:
-        seqs_per_rank = num_sequences // world_size
-        remainder = num_sequences % world_size
-        if rank < remainder:
-            start_idx = rank * (seqs_per_rank + 1)
-            end_idx = start_idx + seqs_per_rank + 1
-        else:
-            start_idx = rank * seqs_per_rank + remainder
-            end_idx = start_idx + seqs_per_rank
-        my_num_sequences = end_idx - start_idx
-        if rank == 0:
-            logger.info(
-                f"Sequence split: {num_sequences} total, "
-                f"{my_num_sequences} per rank (rank 0: [{start_idx}:{end_idx}])"
-            )
+        start_idx = rank * seqs_per_rank + remainder
+        end_idx = start_idx + seqs_per_rank
+
+    my_num_sequences = end_idx - start_idx
+    iters_per_rank = -(-num_sequences // world_size)  # ceil division
+
+    if rank == 0:
+        logger.info(
+            f"Sequence split: {num_sequences} total, "
+            f"{my_num_sequences} real seqs for rank 0 [{start_idx}:{end_idx}], "
+            f"{iters_per_rank} iters/rank (padded)"
+        )
 
     # Training loop — same as UnslothTrainingWorker.train_on_packed_tensors
     model.train()
@@ -234,15 +229,21 @@ def main():
     n_seqs = 0
     completion_tokens = 0
 
-    for idx in range(start_idx, end_idx):
+    for local_iter in range(iters_per_rank):
+        real_idx = start_idx + local_iter
+        is_padding = real_idx >= end_idx or my_num_sequences == 0
+        # For padding iters, re-use the last real sequence (or seq 0)
+        data_idx = min(real_idx, max(end_idx - 1, 0)) if not is_padding else 0
+
         inputs = {
-            key: value[idx:idx + 1].to(device)
+            key: value[data_idx:data_idx + 1].to(device)
             for key, value in packed.items()
             if isinstance(value, torch.Tensor)
         }
 
         tokens = inputs["tokens"]
-        completion_tokens += int(inputs["assistant_mask"].sum().item())
+        if not is_padding:
+            completion_tokens += int(inputs["assistant_mask"].sum().item())
 
         attn_mask = (inputs["group_ids"] != -1).long()
 
@@ -266,14 +267,16 @@ def main():
                 experimental_config=experimental_config,
             )
 
-            # Scale loss by total sequences (not just this rank's portion)
-            # DDP averages gradients across ranks, so we scale by per-rank count
-            loss = loss_result.mean_policy_loss / my_num_sequences
+            if is_padding:
+                loss = loss_result.mean_policy_loss * 0.0
+            else:
+                loss = loss_result.mean_policy_loss / max(my_num_sequences, 1)
 
         loss.backward()
 
-        total_loss += loss_result.mean_policy_loss.item()
-        n_seqs += 1
+        if not is_padding:
+            total_loss += loss_result.mean_policy_loss.item()
+            n_seqs += 1
 
     # Gradient clipping and optimizer step (DDP syncs gradients in backward)
     torch.nn.utils.clip_grad_norm_(
