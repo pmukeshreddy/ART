@@ -238,10 +238,12 @@ class UnslothTrainingWorker:
         model = FastLanguageModel.get_peft_model(
             model,
             r=self.lora_rank,
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ],
+            # Only target attention modules for MoE models.
+            # gate/up/down_proj exist in EVERY expert, so targeting them
+            # multiplies params by num_experts (52M vs 3M for rank=1).
+            # Megatron's LoRA applies to shared layers differently, so
+            # attention-only matches the effective behavior for MoE.
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             lora_alpha=self.lora_alpha,
             lora_dropout=0,
             use_gradient_checkpointing="unsloth",
