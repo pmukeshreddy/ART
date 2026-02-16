@@ -125,10 +125,7 @@ def main():
     import unsloth_zoo.utils
     unsloth_zoo.utils.dist = dist
 
-    # Each rank only sees one GPU (CUDA_VISIBLE_DEVICES narrowed above),
-    # so we must explicitly tell NCCL to use cuda:0. Without this, NCCL
-    # guesses device_id=global_rank which fails for rank>0.
-    dist.init_process_group(backend="nccl", device_id=torch.device("cuda:0"))
+    dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
