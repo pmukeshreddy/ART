@@ -92,15 +92,15 @@ def main():
     step_number = cfg["step_number"]
     results_file = cfg["results_file"]
 
-    # Save LOCAL_RANK for CUDA device selection, then hide ALL distributed
-    # env vars during Unsloth import. unsloth_zoo/utils.py has a bug:
-    # distributed_function() references `dist` (torch.distributed) without
-    # importing it, which crashes when it detects a distributed environment
-    # (via env vars OR torch.distributed.is_initialized()). So we must:
-    #   1. NOT call dist.init_process_group() before import
-    #   2. Hide RANK/WORLD_SIZE/LOCAL_RANK env vars during import
+    # Narrow CUDA_VISIBLE_DEVICES so each rank sees exactly ONE GPU.
+    # Parent sets e.g. CUDA_VISIBLE_DEVICES=1,3. We pick the one GPU
+    # that belongs to this local_rank, so Unsloth/transformers can only
+    # load onto cuda:0 (the sole visible device).
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
+    parent_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    if parent_gpus and parent_gpus[0]:
+        os.environ["CUDA_VISIBLE_DEVICES"] = parent_gpus[local_rank]
+    torch.cuda.set_device(0)  # only one GPU visible now
 
     _dist_env_keys = ["RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE",
                       "MASTER_ADDR", "MASTER_PORT", "GROUP_RANK",
@@ -164,7 +164,7 @@ def main():
     # Wrap trainable parameters with DDP
     # DDP needs to wrap the model so gradients are synchronized across ranks.
     # We only wrap after for_training() so Unsloth's patches are applied first.
-    device = torch.device(f"cuda:{local_rank}")
+    device = torch.device("cuda:0")  # only one GPU visible per rank
     model = model.to(device)
 
     # Find trainable params and create optimizer BEFORE wrapping with DDP
@@ -176,7 +176,7 @@ def main():
     )
 
     # Wrap with DDP — only LoRA params have requires_grad=True
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[0], find_unused_parameters=True)
 
     if rank == 0:
         logger.info(f"DDP ready — {n_params:,} trainable params, {world_size} GPUs")
