@@ -358,7 +358,11 @@ def run_worker(backend: str, cfg: dict, results_path: str) -> None:
 
             run.steps.append(sm)
 
-        run.end_time = time.perf_counter()
+            # Write partial results after each step so they survive OOM-kill
+            run.end_time = time.perf_counter()
+            with open(results_path, "w") as f:
+                json.dump(run.summary(), f, indent=2)
+
         try:
             await svc.stop()
         except Exception:

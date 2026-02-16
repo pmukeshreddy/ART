@@ -134,28 +134,23 @@ def main():
 
     if rank == 0:
         logger.info(f"DDP training: world_size={world_size}, config={base_model}")
+        logger.info(f"Loading model: {base_model} (rank 0)")
 
-    # Load model sequentially (one rank at a time) to avoid CPU RAM spike
-    # from multiple processes loading the full model weights simultaneously.
-    for loading_rank in range(world_size):
-        if rank == loading_rank:
-            logger.info(f"Loading model: {base_model} (rank {rank})")
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=base_model,
-                max_seq_length=max_seq_length,
-                load_in_4bit=load_in_4bit,
-            )
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=base_model,
+        max_seq_length=max_seq_length,
+        load_in_4bit=load_in_4bit,
+    )
 
-            model = FastLanguageModel.get_peft_model(
-                model,
-                r=lora_rank,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                lora_alpha=lora_alpha,
-                lora_dropout=0,
-                use_gradient_checkpointing="unsloth",
-                random_state=3407,
-            )
-        dist.barrier()  # wait for this rank to finish before next loads
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=lora_rank,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_alpha=lora_alpha,
+        lora_dropout=0,
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
+    )
 
     # Resume LoRA weights from previous step
     if last_checkpoint:
