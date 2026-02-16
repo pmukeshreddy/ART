@@ -1,6 +1,6 @@
 # Unsloth + SGLang: MoE-Optimized RL Training Benchmark
 
-Benchmark for the Unsloth + SGLang backend that combines SGLang for inference with Unsloth for MoE training. Uses a **dedicated GPU split** where inference and training run on separate GPUs for zero sleep/wake overhead.
+Benchmark for the Unsloth + SGLang backend that combines SGLang for inference with Unsloth for MoE training. Uses a **dedicated GPU split** where inference and training run on separate GPUs for zero sleep/wake overhead, with a **persistent training worker** that keeps the model loaded across steps.
 
 ---
 
@@ -8,24 +8,24 @@ Benchmark for the Unsloth + SGLang backend that combines SGLang for inference wi
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  4-GPU Setup (Recommended Default)                               │
+│  4-GPU Setup (Recommended)                                       │
 │                                                                  │
 │  ┌─ GPUs 0, 2 (TP=2) ────────────┐  ┌─ GPU 1 ──────────────┐   │
 │  │  SGLang Server                  │  │  Unsloth Training     │   │
 │  │  • Always active (no sleep)     │  │  • Dedicated GPU      │   │
-│  │  • 2x inference throughput      │  │  • Fresh subprocess   │   │
-│  │                                 │  │    per step           │   │
+│  │  • TP=2 inference               │  │  • Persistent worker  │   │
+│  │                                 │  │    (model loaded once) │   │
 │  │  ┌──────────┐  ┌────────────┐   │  │  • LoRA + Optimizer   │   │
 │  │  │  TP=2    │  │  LoRA      │   │  │  • ART loss function  │   │
 │  │  │  Model   │  │  Hot-reload│   │  │                       │   │
-│  │  │  Shards  │  │  < 2s      │   │  │   Unsloth DDP rank 1  │   │
+│  │  │  Shards  │  │  < 0.1s    │   │  │  GPU 3: idle          │   │
 │  │  └──────────┘  └────────────┘   │  └───────────────────────┘   │
 │  └─────────────────────────────────┘                              │
 │                                                                   │
 │  ✓ No sleep/wake overhead                                         │
 │  ✓ SGLang stays active during training                            │
+│  ✓ Persistent worker — model loaded once, reused across steps     │
 │  ✓ TP must be power of 2 (vocab size constraint)                  │
-│  ✓ Spare GPUs used for DDP training (near-linear speedup)         │
 │  ✓ Generation is 70-90% of RL time → more inference GPUs = win    │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -33,26 +33,25 @@ Benchmark for the Unsloth + SGLang backend that combines SGLang for inference wi
 ### Auto-Detected GPU Splits
 
 TP must be a power of 2 (model vocab sizes like Qwen3's 151936 are divisible by 1,2,4,8 but NOT 3).
-Spare GPUs beyond TP are assigned to training for DDP (near-linear training speedup).
 
-| GPUs Available | Inference GPUs | TP Size | Training GPUs | Mode |
+| GPUs Available | Inference GPUs | TP Size | Training GPU | Mode |
 |:-:|:-:|:-:|:-:|:-:|
-| 8 | 0, 2, 3, 4 | 4 | 1, 5, 6, 7 (DDP x4) | **Dedicated** |
-| 4 | 0, 2 | 2 | 1, 3 (DDP x2) | **Dedicated** |
+| 8 | 0, 2, 3, 4 | 4 | 1 | **Dedicated** |
+| 4 | 0, 2 | 2 | 1 | **Dedicated** |
 | 3 | 0, 2 | 2 | 1 | **Dedicated** |
 | 2 | 0 | 1 | 1 | **Dedicated** |
-| 1 | 0 | 1 | 0 | Shared (sleep/wake) |
+| 1 | 0 | 1 | — | Shared (sleep/wake) |
 
 GPU 1 is chosen as primary training GPU to keep GPU 0 as the primary SGLang rank.
 
 ### Key Features
 
 - **Dedicated GPU split** — inference and training on separate GPUs, zero sleep/wake overhead
+- **Persistent training worker** — model loaded once at step 1, reused for all subsequent steps (~0s model load overhead on steps 2+)
 - **Auto-detected** — optimal split computed from available GPU count
 - **~12x faster MoE training** via Unsloth Triton kernels
 - **~35% less VRAM** via Split LoRA approach
-- **LoRA hot-reload** for weight sync (<2s)
-- **Full memory recovery** every step (separate process architecture)
+- **LoRA hot-reload** for weight sync (<0.1s)
 
 ### Shared Mode (Single GPU Fallback)
 
@@ -77,15 +76,24 @@ When only 1 GPU is available, falls back to the verl-style sleep/wake pattern wh
 
 ### Dedicated Mode (2+ GPUs, default)
 
-1. **Rollout** — SGLang generates on inference GPUs (always active, TP=N-1)
-2. **Data pipeline** — ART preprocessing tokenizes/packs into packed tensors
-3. **Spawn subprocess** — on dedicated training GPU (`CUDA_VISIBLE_DEVICES`)
-4. **Train** — ART loss on packed tensors
-5. **Save LoRA** — adapter saved to disk
-6. **Kill subprocess** — free training GPU memory
-7. **Load LoRA** — hot-reload adapter into SGLang (<2s)
+**Step 1 (cold start):**
 
-No sleep/wake step. SGLang never stops.
+1. **Rollout** — SGLang generates on inference GPUs (always active, TP=2)
+2. **Data pipeline** — ART preprocessing tokenizes/packs into packed tensors
+3. **Spawn worker** — on dedicated training GPU (`CUDA_VISIBLE_DEVICES`)
+4. **Load model** — base model + LoRA adapter (~50s one-time cost)
+5. **Train** — ART loss on packed tensors
+6. **Save LoRA** — adapter saved to disk
+7. **Load LoRA** — hot-reload adapter into SGLang (<0.1s)
+
+**Steps 2+ (persistent worker):**
+
+1. **Rollout** — SGLang generates (never stops)
+2. **Data pipeline** — tokenize/pack
+3. **Train** — reuse persistent worker (model already loaded, ~0s overhead)
+4. **Save LoRA** + **Load LoRA** — save and hot-reload
+
+No sleep/wake. SGLang never stops. Worker stays alive until benchmark end.
 
 ### Shared Mode (1 GPU fallback)
 
@@ -109,9 +117,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python benchmarks/sglang_vs_vllm/run_benchma
     --sglang-python ~/.venvs/sglang-bench/bin/python \
     --num-steps 10 --num-rollouts 64 --dataset gsm8k
 
-# Explicit GPU split: inference on GPUs 0,2 (TP=2), DDP training on GPUs 1,3
+# Explicit GPU split: inference on GPUs 0,2 (TP=2), training on GPU 1
 uv run python benchmarks/sglang_vs_vllm/run_benchmark.py \
-    --inference-gpus 0,2 --training-gpus 1,3 \
+    --inference-gpus 0,2 --training-gpus 1 \
     --sglang-python ~/.venvs/sglang-bench/bin/python
 
 # Force shared mode (sleep/wake) even with multiple GPUs
@@ -129,7 +137,7 @@ uv run python benchmarks/sglang_vs_vllm/run_benchmark.py \
 | `--num-steps` | `3` | Number of RL training steps |
 | `--num-rollouts` | `16` | Rollouts per step |
 | `--inference-gpus` | auto | Comma-separated GPU IDs for SGLang inference (e.g. `0,2,3`) |
-| `--training-gpus` | auto | Comma-separated GPU IDs for training (e.g. `1,3` for DDP), `-1` for shared mode |
+| `--training-gpus` | auto | Comma-separated GPU IDs for training (e.g. `1`), `-1` for shared mode |
 | `--tp` | `0` (auto) | Tensor parallel size (overridden by `--inference-gpus` count) |
 | `--unsloth-lora-rank` | `1` | LoRA rank for Unsloth training |
 | `--unsloth-moe-backend` | `auto` | MoE backend: auto, grouped_mm (H100+), unsloth_triton (A100) |
@@ -144,15 +152,15 @@ GSM8K test set (1,319 questions) is downloaded automatically on first run and ca
 
 | | Unsloth + SGLang (this) | Distributed (Megatron) |
 |---|---|---|
-| **Inference** | N-1 GPUs (TP=3 on 4 GPUs) | N GPUs (TP=4) |
-| **Training** | 1 GPU | N GPUs (distributed) |
-| **Sleep/wake overhead** | None (dedicated split) | None (same process) |
-| **RL generation** (70-90% of time) | Fast (TP=3) | Fastest (TP=4) |
-| **Training throughput** | Single GPU (bottleneck) | Linear scaling |
+| **Inference** | N-1 GPUs (TP=2 on 4 GPUs) | N GPUs (TP=4) |
+| **Training** | 1 GPU (persistent worker) | N GPUs (tensor parallel) |
+| **Model reload per step** | **0s** (steps 2+) | ~50-80s (sleep/wake + resharding) |
+| **Sleep/wake overhead** | None (dedicated split) | Yes (each step) |
+| **Training throughput** | Single GPU | Linear scaling across N GPUs |
 | **Setup complexity** | Simple | Complex |
 | **Best for** | Rapid prototyping, MoE models | Production, large-scale |
 
-The dedicated GPU split is the best configuration for Unsloth since generation dominates RL wall time. However, single-GPU training remains the fundamental bottleneck compared to fully distributed setups.
+The persistent worker eliminates model reload overhead on steps 2+, which partially compensates for using fewer inference GPUs. Unsloth is single-GPU by design (no tensor parallelism for training), so the dedicated GPU split with persistent worker is the optimal configuration.
 
 ---
 
